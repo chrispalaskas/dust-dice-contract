@@ -24,12 +24,33 @@ Version pairing is load-bearing at rc granularity — see the matrix in the READ
 **Question:** can a Compact contract receive native (unshielded) NIGHT, hold it as a pot, and
 pay it out to a winner + rake address?
 
-**Status: OPEN — probe not yet executed.** Probe plan: throwaway contract with
-`stakeIn()` (receive unshielded NIGHT into contract custody) and `payOut(winner, rake)`
-(send q to winner, r to rake); fund a wallet from devnet genesis, stake in, pay out, confirm
-balances on both recipients by indexer query.
+**Status: ANSWERED — PROVEN, executed twice end to end.** Full evidence in
+[gate0-report.md](gate0-report.md). Two wallets staked native NIGHT into one contract-held
+pot; one `payOut` call paid 99%/1% to two distinct user addresses; the decisive transaction
+spends zero user inputs and creates 10,000,000 of native NIGHT — value that can only have
+come from the contract's balance. All figures read from the indexer's UTXO view (the wallet
+facade's aggregate balances misreported — bugs-found #9).
 
-_Answer, evidence, and consequences to be recorded here from the executed probe._
+The API at language 0.26.0: `nativeToken()` (= 32 zero bytes, no special-casing),
+`receiveUnshielded(color, amount)`, `sendUnshielded(color, amount, Either<ContractAddress,
+UserAddress>)`, `unshieldedBalance(color)`. `receiveUnshielded` names no payer — the ledger's
+transaction-wide balance check forces the caller's wallet to consent by balancing, which is
+exactly right for a stake. Amount/recipient arguments need explicit `disclose()`.
+
+Constraints discovered that the design absorbs:
+
+- **Minimum transaction size ≈ 8 KB** (`OutsideTimeToDismiss`: fixed ~16 ms verification cost
+  vs a 0.002 ms/byte allowance, floor 15 ms, not configurable). Small circuits need
+  fallible-phase ledger padding (post-`checkpoint` writes add size but not dismiss cost);
+  every circuit's transaction size is verified, not assumed. Conversely the proof server's
+  SRS lacks small k (k=5) — circuit size is squeezed from both directions.
+- **A circuit cannot learn its caller.** Payout recipients are public arguments; the Table
+  records each seat's payout address at `join` and `settle` asserts it pays exactly the
+  stored address of the in-circuit-computed winner — no external "who won" assertion exists.
+- **DUST onboarding is a real step**: winnings generate DUST only if the recipient was
+  registered when the payout landed, and registration itself costs DUST
+  (`estimateRegistration` → wait → register). The lobby onboarding flow does this before
+  seating anyone, and the fee-reserve warning stands.
 
 Design consequences either way:
 
@@ -47,12 +68,16 @@ trust boundary documented honestly. We do not fake custody.
 **Question:** what does one state-changing transaction really cost (proof time + wallet
 prompt + inclusion), and what game shape fits inside it?
 
-**Status: OPEN — measurement not yet executed.** Prior data point (neighbouring project,
-ledger 9, local devnet): ~18–25 s per transaction wall clock, one wallet prompt each, no
-batch submission (multi-call transactions inherit the gas under-declaration defect).
+**Status: ANSWERED — measured on this stack** ([gate0-report.md](gate0-report.md)): average
+**20.9 s per transaction** over four distinct circuit calls (proving 1.5 s, balancing 0.4 s,
+**submission→inclusion 18.0 s** — 86% of the budget is waiting for the chain, so optimising
+circuits buys ≤ 9%; only fewer transactions helps). Deploy 26.2 s. Stable to ~3% across two
+independent runs.
 
-Naive per-roll play is arithmetic suicide: 6 players × 13 rounds × 4 tx ≈ 312 transactions
-≈ hours per game and 52 prompts per player.
+Per-roll play is dead on the numbers: 312 tx ≈ **109 min** serial for six players. Per-turn:
+78 tx ≈ 27 min (player transactions alone). A 2-player per-turn demo ≈ 9 min — the shape to
+aim a live demo at. Batching several calls per transaction is unprobed and inherits the gas
+under-declaration defect (~15%/60% failure at 2/3 calls upstream) — not a lever we lean on.
 
 **Chosen shape: (a) one player transaction per turn, plus one operator resolve.** A circuit
 cannot derive dice from a seed the contract only holds a commitment to, and the player must
@@ -62,13 +87,11 @@ category choice for the _previous_ turn's dice, which they have seen) and an ope
 in one circuit). Full design, including the anti-collusion entropy scheme, in
 [table-contract.md](table-contract.md).
 
-Budget at ~18 s/tx (prior measurement): 6-player game ≈ 78 player tx + 78 automated operator
-tx ≈ 47 min wall clock and 13–14 prompts per player — a normal Yahtzee-evening duration.
-2-player game ≈ 16 min. Manual per-roll play (b) may be kept as a "showcase" mode for 2-seat
-tables only. Full-game settlement (c) is a stretch goal, go/no-go decided by measuring the
-3-roll circuit and extrapolating to 39 rolls.
-
-_Measured numbers on this stack to be recorded here._
+Budget at the measured 20.9 s/tx: 6-player game ≈ 78 player tx + 78 automated operator
+resolves ≈ 54 min wall clock and 13–14 prompts per player — long but within a real Yahtzee
+evening. 2-player game ≈ 18 min. Manual per-roll play (b) may be kept as a "showcase" mode
+for 2-seat tables only. Full-game settlement (c) is a stretch goal (≈19 000 instructions
+extrapolated), go/no-go pending a proving-time measurement against the real proof server.
 
 ## Randomness — commit–reveal, never committed outcomes
 

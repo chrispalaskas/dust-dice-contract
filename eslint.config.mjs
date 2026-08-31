@@ -33,6 +33,8 @@ export default tseslint.config(
       globals: {
         console: 'readonly',
         process: 'readonly',
+        // Global since Node 18; used by probe tooling that queries the indexer over HTTP.
+        fetch: 'readonly',
         Buffer: 'readonly',
         URL: 'readonly',
         __dirname: 'readonly',

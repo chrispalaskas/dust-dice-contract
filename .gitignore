@@ -7,6 +7,10 @@ dist/
 # generated Compact output (rebuilt from source; stale copies serve old interfaces)
 contract/src/managed/
 contract/build/
+probes/*/src/managed/
+
+# probe run state (contract addresses, throwaway seeds, timings — regenerated per run)
+probes/*/.run/
 
 # local chain / wallet state (local-dev-only, regenerated at will)
 .devnet-volumes/
@@ -18,3 +22,6 @@ midnight-level-db/
 .env.local
 .DS_Store
 coverage/
+
+# local plugin/tool state
+.midnight-expert/

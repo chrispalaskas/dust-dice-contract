@@ -85,7 +85,14 @@ replay it with the same TS mirror of the dice ladder.
 - `gameDigest: Bytes<32>`
 - `lastActionAt: Uint<64>` (block-time seconds; predicates are strict, units are seconds,
   no tolerance widening — build grace into the bounds)
-- pot custody per Gate 0 verdict.
+- Pot custody: **native unshielded NIGHT, proven by Gate 0** — `join` calls
+  `receiveUnshielded(nativeToken(), tier)` (the joining wallet consents by balancing);
+  `settle`/`abortTable` call `sendUnshielded` to the payout addresses **recorded at join**,
+  so no circuit ever needs to learn its caller and no external "who won" assertion exists —
+  `settle` computes the winner in-circuit and pays that seat's stored address.
+- Transaction-size floor: every circuit call must produce a ≥ ~8 KB transaction
+  (`OutsideTimeToDismiss` — gate0-report.md). Real turn circuits likely clear it; `join`
+  and `claimTimeout` may need fallible-phase padding writes. Verified per circuit in tests.
 
 ## Exported circuits (≤ 7 — deploy ceiling is ~11 circuits, measured upstream)
 
