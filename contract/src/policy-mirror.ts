@@ -162,7 +162,6 @@ export function holdMaskOf(
 
 const BYTES32 = new CompactTypeBytes(32);
 const UINT8 = new CompactTypeUnsignedInteger(255n, 1);
-const VEC2_BYTES32 = new CompactTypeVector(2, BYTES32);
 const VEC3_BYTES32 = new CompactTypeVector(3, BYTES32);
 
 /** Mirror of the Compact `EntropyContext` struct. Field order matches the declaration. */
@@ -219,14 +218,26 @@ export function forcedEntropyTs(
   });
 }
 
-/** Mirror of `entropyKeyCommitment`: the seat's join-time `C_s = H("entkey", sk)`. */
-export function entropyKeyCommitmentTs(sk: Uint8Array): Uint8Array {
-  return persistentHash(VEC2_BYTES32, [pad(32, TAG_ENTROPY_KEY), sk]);
+/**
+ * Mirror of `entropyKeyCommitment`: the seat's join-time `C_s = H("entkey", tableId, sk)`.
+ *
+ * `tableId` is inside the hash so one reused `sk` cannot be recognised across two tables. See
+ * the circuit's doc comment; the client rule (one fresh secret per table) is in
+ * docs/client-rules.md.
+ */
+export function entropyKeyCommitmentTs(tableId: Uint8Array, sk: Uint8Array): Uint8Array {
+  return persistentHash(VEC3_BYTES32, [pad(32, TAG_ENTROPY_KEY), tableId, sk]);
 }
 
-/** Mirror of `seedCommitmentOf`: the operator's `H("seed", seed)`. */
-export function seedCommitmentTs(seed: Uint8Array): Uint8Array {
-  return persistentHash(VEC2_BYTES32, [pad(32, TAG_SEED), seed]);
+/**
+ * Mirror of `seedCommitmentOf`: the operator's `H("seed", tableId, seed)`.
+ *
+ * `tableId` is inside the hash so that a seed reused at two tables does not give both the same
+ * commitment -- the first table's settlement would otherwise publish the second's future
+ * randomness. See the circuit's doc comment.
+ */
+export function seedCommitmentTs(tableId: Uint8Array, seed: Uint8Array): Uint8Array {
+  return persistentHash(VEC3_BYTES32, [pad(32, TAG_SEED), tableId, seed]);
 }
 
 /** Mirror of `mixEntropy`: folds the running game digest into the forced entropy. */

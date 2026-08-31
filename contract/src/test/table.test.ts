@@ -108,7 +108,7 @@ describe('a full two-seat game', () => {
     assert.equal(fresh.seatCount, 0n);
     assert.equal(fresh.pot, 0n);
     assert.deepEqual(fresh.gameDigest, genesisDigestTs(config.tableId));
-    assert.deepEqual(fresh.seedCommitment, seedCommitmentTs(config.seed));
+    assert.deepEqual(fresh.seedCommitment, seedCommitmentTs(config.tableId, config.seed));
     // Every slot is pre-inserted so a runtime lookup can never abort. See decision 1.
     assert.equal(fresh.seatProgress.size(), 6n);
     assert.equal(fresh.seatIdentity.size(), 6n);
@@ -133,8 +133,9 @@ describe('a full two-seat game', () => {
       const identity = led.seatIdentity.lookup(seat);
       const player = g.players[Number(seat)]!;
       assert.deepEqual(identity.addr.bytes, player.addr.bytes, 'payout address recorded at join');
-      assert.deepEqual(identity.keyCommit, entropyKeyCommitmentTs(player.sk));
-      assert.ok(led.joinedKeys.member(entropyKeyCommitmentTs(player.sk)));
+      const commit = entropyKeyCommitmentTs(config.tableId, player.sk);
+      assert.deepEqual(identity.keyCommit, commit);
+      assert.ok(led.joinedKeys.member(commit));
 
       const prog = led.seatProgress.lookup(seat);
       assert.equal(prog.total, 0n);
@@ -194,7 +195,7 @@ describe('a full two-seat game', () => {
     assert.equal(after.pot, 0n, 'the pot is fully paid out');
     assert.deepEqual(after.revealedSeed, g.config.seed, 'settle publishes the seed');
     assert.deepEqual(
-      seedCommitmentTs(after.revealedSeed),
+      seedCommitmentTs(g.config.tableId, after.revealedSeed),
       after.seedCommitment,
       'the revealed seed must open the commitment anyone can now check',
     );
@@ -859,7 +860,7 @@ describe('timeouts', () => {
   // =======================================================================================
 
   it('refuses a timeout claim one second before the deadline and allows it one second after', async () => {
-    const g = await seated({ seats: 2, turnTimeoutSecs: 300n });
+    const g = await seated({ seats: 2, turnTimeoutSecs: 600n });
     const led = g.ledger();
     const deadline = Number(led.lastActionAt + led.turnTimeoutSecs);
 
@@ -885,7 +886,7 @@ describe('timeouts', () => {
   });
 
   it('refuses a timeout claim while waiting on the operator', async () => {
-    const g = await seated({ seats: 2, turnTimeoutSecs: 300n });
+    const g = await seated({ seats: 2, turnTimeoutSecs: 600n });
     await g.takeTurn(0, 0);
     assert.equal(g.ledger().turnState, WAIT_RESOLVE);
 
@@ -935,7 +936,7 @@ describe('timeouts', () => {
   });
 
   it('abandons the table when the last active seat forfeits, and abortTable refunds', async () => {
-    const g = await seated({ seats: 2, turnTimeoutSecs: 60n });
+    const g = await seated({ seats: 2, turnTimeoutSecs: 600n });
 
     let led = g.ledger();
     await g.sim.claimTimeout(Number(led.lastActionAt + led.turnTimeoutSecs) + 1);
@@ -1104,12 +1105,364 @@ describe('settlement guards', () => {
       // Under 100 the 1% rake floors to zero, and a zero-value payout is an unshielded output
       // nobody should have to reason about. Excluded by construction. See decision 6.
       [{ ...base, tier: 99n }, /tier must be at least 100/],
-      [{ ...base, turnTimeoutSecs: 0n }, /turn timeout must be positive/],
-      [{ ...base, tableTimeoutSecs: 0n }, /table timeout must be positive/],
+      [{ ...base, turnTimeoutSecs: 0n }, /turn timeout must exceed four times/],
+      [{ ...base, tableTimeoutSecs: 0n }, /table timeout must exceed four times/],
     ] as const;
     for (const [config, message] of bad) {
       await assert.rejects(() => TableSimulator.create(config), message);
     }
+  });
+
+  it('refuses any timeout at or below four times the declared-time slack', async () => {
+    // docs/security-review.md C1. A timeout comparable to `timeSlackSecs()` is the whole attack:
+    // the actor handing the turn over under-declares `now` by up to the slack, and the deadline
+    // they stamp -- which belongs to the NEXT seat -- is already expired when that seat receives
+    // it. `claimTimeout` is permissionless, so the hand-off itself becomes a forfeit weapon and
+    // it cascades. The floor is what removes the configuration in which that is possible.
+    const SLACK = 120n;
+    const FLOOR = SLACK * 4n;
+    const base = tableConfig({ seats: 2 });
+
+    // The boundary, both sides, for both timeouts. The assert is strict, so the floor value
+    // itself is refused and one second more is accepted.
+    for (const field of ['turnTimeoutSecs', 'tableTimeoutSecs'] as const) {
+      const which = field === 'turnTimeoutSecs' ? /turn timeout/ : /table timeout/;
+      for (const value of [1n, SLACK, FLOOR - 1n, FLOOR]) {
+        await assert.rejects(
+          () => TableSimulator.create({ ...base, [field]: value }),
+          which,
+          `${field} = ${value} should be below the floor of ${FLOOR}`,
+        );
+      }
+      await TableSimulator.create({ ...base, [field]: FLOOR + 1n });
+    }
+
+    // And the attack the floor forecloses, stated as a test rather than as a comment: with a
+    // legal turn timeout, the most an under-declaring player can take from the next seat is the
+    // slack, which is at most a quarter of the window -- so the next seat's deadline is still in
+    // the future the moment they receive the turn.
+    const g = await GameDriver.open({ seats: 2, turnTimeoutSecs: FLOOR + 1n });
+    await g.join(0);
+    await g.join(1);
+    const blockTime = Number(g.ledger().lastActionAt) + 1_000;
+    const player = g.players[0]!;
+    g.sim.asPlayer(player.sk);
+    // Seat 0 declares the earliest time the sandwich will accept, which stamps the deadline
+    // seat 1 is then judged against.
+    await g.sim.takeTurn(
+      forcedEntropyTs(player.sk, g.config.tableId, 0),
+      Policy.Stand,
+      0,
+      0,
+      blockTime - Number(SLACK) + 1,
+      blockTime,
+    );
+    g.sim.asOperator();
+    await g.sim.resolveTurn(blockTime - Number(SLACK) + 1, blockTime);
+
+    const led = g.ledger();
+    assert.equal(led.currentSeat, 1n, 'the turn is now seat 1');
+    assert.ok(
+      led.lastActionAt + led.turnTimeoutSecs > BigInt(blockTime),
+      'seat 1 must not receive a turn whose deadline has already passed',
+    );
+    await assert.rejects(
+      () => g.sim.claimTimeout(blockTime, blockTime),
+      /the turn deadline has not passed/,
+      'the seat that just received the turn must not be immediately forfeitable',
+    );
+  });
+
+  it('refuses a tier above the maximum, and accepts the maximum itself', async () => {
+    // The bound exists so `abortTable`'s `tier * seatCount` cannot overflow its checked cast:
+    // an overflow there would deny the refund path while leaving `settle` working, i.e. the pot
+    // could only ever leave through the winner. Both sides of the boundary are pinned.
+    const MAX_TIER = 1_000_000_000_000_000n;
+    const base = tableConfig({ seats: 2 });
+    await assert.rejects(
+      () => TableSimulator.create({ ...base, tier: MAX_TIER + 1n }),
+      /tier is above the maximum/,
+    );
+    await TableSimulator.create({ ...base, tier: MAX_TIER });
+
+    // At the bound with the widest table, the product a refund has to compute is still inside
+    // Uint<64> -- which is the property the bound was chosen for.
+    const wide = await GameDriver.open({ seats: 6, tier: MAX_TIER, tableTimeoutSecs: 600n });
+    await wide.join(0);
+    await wide.join(1);
+    assert.equal(wide.ledger().pot, MAX_TIER * 2n);
+    const led = wide.ledger();
+    const refunded = await wide.sim.abortTable(Number(led.lastActionAt + led.tableTimeoutSecs) + 1);
+    assert.equal(refunded, MAX_TIER * 2n, 'a maximum-tier table can still be refunded');
+  });
+
+  it('refuses a join that would record the zero payout address', async () => {
+    // Self-harm only: `settle` and `abortTable` pay the address recorded at join and nothing
+    // else, so a seat with zeros has staked into a burn. A client bug should cost a rejected
+    // transaction rather than a stake.
+    const g = await GameDriver.open({ seats: 2 });
+    g.sim.asPlayer(bytes32(0xc1));
+    await assert.rejects(
+      () => g.sim.join(userAddress(0x00), g.tick()),
+      /payout address must not be the zero address/,
+    );
+    assert.equal(g.ledger().seatCount, 0n, 'a rejected join takes no seat and stakes nothing');
+    assert.equal(g.ledger().pot, 0n);
+
+    // Any non-zero address is fine -- the contract cannot and does not judge who owns it.
+    await g.sim.join(userAddress(0x01), g.tick());
+    assert.equal(g.ledger().seatCount, 1n);
+  });
+});
+
+// =========================================================================================
+describe('the settle deadline bypass', () => {
+  // =======================================================================================
+  //
+  // docs/security-review.md §5, Critical. A finished game sits in (Playing, waitPlayer,
+  // round >= roundCount()) and `settle` is its only exit -- so before this fix an operator that
+  // vanished with the seed locked every stake forever. Past `tableTimeoutSecs` the seed check is
+  // waived: the winner and the split are determined entirely by public state, so the payout is
+  // unaffected, and only VERIFIABILITY is lost. These tests pin both halves of that: the check is
+  // mandatory before the deadline, and waiving it afterwards changes the payout by nothing at all.
+
+  it('refuses a wrong seed before the deadline, at the boundary second', async () => {
+    const g = await seated({ seats: 2, tableTimeoutSecs: 600n }, { strategy: 'bestScore' });
+    await g.playToEnd();
+    const led = g.ledger();
+    const deadline = Number(led.lastActionAt + led.tableTimeoutSecs);
+    const [q, r] = g.rakeSplit();
+
+    // `blockTimeGt` is strict, so the deadline second itself is still "before". An off-by-one
+    // here would open the bypass a second early on every table ever deployed.
+    for (const at of [DEFAULT_BLOCK_TIME, deadline - 1, deadline]) {
+      await assert.rejects(
+        () => g.sim.settle(bytes32(0x12), q, r, at),
+        /seed does not open the table's seed commitment/,
+        `a wrong seed at ${at} (deadline ${deadline}) must be refused`,
+      );
+    }
+    assert.equal(g.ledger().phase, PHASE_PLAYING, 'a refused settle changes nothing');
+  });
+
+  it('pays the in-circuit winner with a wrong seed once the deadline has passed', async () => {
+    const g = await seated({ seats: 2, tableTimeoutSecs: 600n }, { strategy: 'bestScore' });
+    await g.playToEnd();
+    const led = g.ledger();
+    const deadline = Number(led.lastActionAt + led.tableTimeoutSecs);
+    const potBefore = led.pot;
+    const [q, r] = g.rakeSplit();
+    const expectedWinner = g.expectedWinner();
+
+    const winner = await g.sim.settle(bytes32(0x12), q, r, deadline + 1);
+
+    // The payout is EXACTLY what an honest settle would have produced: the seed never entered
+    // the winner computation, the tie-break or the split.
+    assert.equal(winner, BigInt(expectedWinner), 'the force-settle must pay the same winner');
+    const after = g.ledger();
+    assert.equal(after.phase, PHASE_SETTLED);
+    assert.equal(after.winnerSeatIndex, BigInt(expectedWinner));
+    assert.equal(after.pot, 0n, 'the pot is fully paid out on the force-settle path too');
+    assert.equal(q * 100n + r, potBefore, 'the rake split is still the unique q, r');
+    assert.deepEqual(
+      after.seatIdentity.lookup(winner).addr.bytes,
+      g.players[expectedWinner]!.addr.bytes,
+      'paid at the address recorded at join, exactly as on the honest path',
+    );
+
+    // ...and the ONLY difference: the game is marked unverifiable.
+    assert.deepEqual(
+      after.revealedSeed,
+      new Uint8Array(32),
+      'a force-settled game must publish no seed -- zero is the "unverified" marker',
+    );
+    assert.notDeepEqual(
+      seedCommitmentTs(g.config.tableId, after.revealedSeed),
+      after.seedCommitment,
+      'the zero marker must not accidentally open the commitment',
+    );
+  });
+
+  it('still records a correct seed when settled after the deadline', async () => {
+    // The bypass is a waiver, not a switch: an operator that turns up late still gets to publish
+    // its seed, and the game stays verifiable. Otherwise "late" would needlessly destroy the
+    // reveal that everyone wants.
+    const g = await seated({ seats: 2, tableTimeoutSecs: 600n }, { strategy: 'bestScore' });
+    await g.playToEnd();
+    const led = g.ledger();
+    const [q, r] = g.rakeSplit();
+
+    await g.sim.settle(g.config.seed, q, r, Number(led.lastActionAt + led.tableTimeoutSecs) + 1);
+    const after = g.ledger();
+    assert.deepEqual(after.revealedSeed, g.config.seed);
+    assert.deepEqual(seedCommitmentTs(g.config.tableId, after.revealedSeed), after.seedCommitment);
+  });
+
+  it('does not let the bypass settle an unfinished game', async () => {
+    // The waiver is only over the seed. Every other guard stands: a game still in progress
+    // cannot be settled however long the table has been idle, or a stalled player could be
+    // cashed out mid-game by anyone with a wallet.
+    const g = await seated({ seats: 2, tableTimeoutSecs: 600n });
+    await g.playRound(0);
+    const far = Number(g.ledger().lastActionAt) + 10_000_000;
+    await assert.rejects(() => g.sim.settle(bytes32(0x12), 0n, 0n, far), /game is not finished/);
+    await assert.rejects(() => g.sim.settle(g.config.seed, 0n, 0n, far), /game is not finished/);
+  });
+
+  it('reaches the finished state via a forfeit too, and exits it the same way', async () => {
+    // (Playing, waitPlayer, round >= roundCount()) is reachable by two routes: the last seat's
+    // score-only takeTurn, and a `claimTimeout` on the last seat of round 13. Both land in the
+    // same trap, so both need the same exit -- and the second route is the one a stalled table
+    // actually takes.
+    const g = await seated(
+      { seats: 2, tableTimeoutSecs: 600n },
+      { strategy: 'bestScore', forfeits: [{ seat: 1, round: LAST_ROUND }] },
+    );
+    await g.playToEnd();
+
+    const led = g.ledger();
+    assert.equal(led.round, BigInt(ROUND_COUNT), 'a round-13 forfeit still completes the game');
+    assert.equal(led.phase, PHASE_PLAYING);
+    assert.equal(led.turnState, WAIT_PLAYER);
+    assert.equal(led.seatProgress.lookup(1n).forfeited, true);
+
+    const [q, r] = g.rakeSplit();
+    const winner = await g.sim.settle(
+      bytes32(0x12),
+      q,
+      r,
+      Number(led.lastActionAt + led.tableTimeoutSecs) + 1,
+    );
+    assert.equal(winner, BigInt(g.expectedWinner()));
+    assert.equal(g.ledger().pot, 0n);
+  });
+});
+
+// =========================================================================================
+describe('the stall matrix: every reachable state has a permissionless exit', () => {
+  // =======================================================================================
+  //
+  // The invariant the whole custody design rests on: from ANY state a table can reach, some
+  // permissionless circuit empties the pot. docs/security-review.md found one hole in it (the
+  // finished-but-unsettled trap) and raised a Medium against the split resolve, so the matrix is
+  // walked here explicitly rather than left as an argument in a comment. Every case sets block
+  // time deliberately -- docs/bugs-found.md #12: an implicit `now` makes a timeout test pass
+  // today and fail at some future wall-clock date.
+  //
+  //   phase      turnState    rollStep  round     exit
+  //   ---------------------------------------------------------------------------------------
+  //   filling    -            -         -         seatCount == 0: none needed, no funds staked
+  //   filling    -            -         -         seatCount >  0: abortTable (fillingStalled)
+  //   playing    waitPlayer   -         < 14      claimTimeout
+  //   playing    waitPlayer   -         >= 14     settle (seed check waived past the deadline)
+  //   playing    waitResolve  0         <= 12     abortTable (operatorStalled)
+  //   playing    waitResolve  1         <= 12     abortTable (operatorStalled)
+  //   playing    waitResolve  2         <= 12     abortTable (operatorStalled)
+  //   abandoned  -            -         -         abortTable, with no further waiting
+  //   settled    -            -         -         terminal, pot already 0
+  //   aborted    -            -         -         terminal, pot already 0
+
+  it('exits a stall at every one of the three resolve steps', async () => {
+    // The Medium raised against the split (docs/security-review.md §3): a mid-resolve sub-state
+    // that neither `claimTimeout` (needs waitPlayer) nor `abortTable` (needs waitResolve)
+    // recognised would trap the pot. It does not exist -- all three steps leave `waitResolve` --
+    // and this walks all three rather than trusting that.
+    for (const stopAfter of [0, 1, 2] as const) {
+      const g = await seated({ seats: 2, tableTimeoutSecs: 600n });
+      await g.takeTurn(0, 0);
+      g.sim.asOperator();
+      if (stopAfter >= 1) await g.sim.resolveRoll1(g.tick());
+      if (stopAfter >= 2) await g.sim.resolveRoll2(g.tick());
+
+      const led = g.ledger();
+      assert.equal(led.turnState, WAIT_RESOLVE, `rollStep ${stopAfter} left waitResolve`);
+      assert.equal(led.rollStep, BigInt(stopAfter));
+      assert.ok(led.round < BigInt(LAST_ROUND), 'waitResolve is only ever reached below round 13');
+
+      // A stalled operator is not the player's fault, so `claimTimeout` must still refuse.
+      const deadline = Number(led.lastActionAt + led.tableTimeoutSecs);
+      await assert.rejects(
+        () => g.sim.claimTimeout(deadline + 1),
+        /waiting on the operator, not on a player/,
+      );
+      // ...and the boundary of the abort deadline is exact at every step.
+      await assert.rejects(() => g.sim.abortTable(deadline), /neither stalled/);
+
+      const refunded = await g.sim.abortTable(deadline + 1);
+      assert.equal(refunded, g.config.tier * 2n, `rollStep ${stopAfter} refund was wrong`);
+      assert.equal(g.ledger().phase, PHASE_ABORTED);
+      assert.equal(g.ledger().pot, 0n, `rollStep ${stopAfter} left funds in the contract`);
+    }
+  });
+
+  it('restarts the table deadline at each resolve step, so the bound is per step', async () => {
+    // Worth pinning because it is a real consequence of the split and it is easy to assume
+    // otherwise: every one of the three steps calls `stampTime`, so an operator that keeps
+    // taking a step just before the deadline can hold a table for roughly three timeouts rather
+    // than one. That is correct -- each step is a real state advance -- but the parameter bounds
+    // one step's silence, not one turn's, and an operator SLA has to be written against that.
+    const g = await seated({ seats: 2, tableTimeoutSecs: 600n });
+    await g.takeTurn(0, 0);
+
+    g.sim.asOperator();
+    const stamps: bigint[] = [g.ledger().lastActionAt];
+    for (const step of [1, 2, 3] as const) {
+      const at = Number(g.ledger().lastActionAt + g.ledger().tableTimeoutSecs);
+      if (step === 1) await g.sim.resolveRoll1(at);
+      else if (step === 2) await g.sim.resolveRoll2(at);
+      else await g.sim.resolveRoll3(at);
+      stamps.push(g.ledger().lastActionAt);
+    }
+    for (let i = 1; i < stamps.length; i++) {
+      assert.ok(stamps[i]! > stamps[i - 1]!, `step ${i} did not advance lastActionAt`);
+    }
+    assert.equal(
+      stamps.at(-1)! - stamps[0]!,
+      g.config.tableTimeoutSecs * 3n,
+      'three steps taken at the last legal moment cost three whole table timeouts',
+    );
+  });
+
+  it('empties the pot from every reachable state', async () => {
+    // One pass over the whole matrix, asserting the same thing every time: the pot reaches 0
+    // through a circuit anyone can call. The two `filling` rows and the `abandoned` row are
+    // covered by the `timeouts` suite above; the rows below are the ones the review changed.
+
+    // playing / waitPlayer / round < 14 -- claimTimeout, seat by seat until abandoned.
+    {
+      const g = await seated({ seats: 2, turnTimeoutSecs: 600n, tableTimeoutSecs: 600n });
+      for (let i = 0; i < 2; i++) {
+        const led = g.ledger();
+        await g.sim.claimTimeout(Number(led.lastActionAt + led.turnTimeoutSecs) + 1);
+      }
+      assert.equal(g.ledger().phase, PHASE_ABANDONED);
+      await g.sim.abortTable(Number(g.ledger().lastActionAt) + 1);
+      assert.equal(g.ledger().pot, 0n);
+    }
+
+    // playing / waitPlayer / round >= 14 -- the trap this review closed. No seed, no operator,
+    // and the pot still leaves.
+    {
+      const g = await seated({ seats: 2, tableTimeoutSecs: 600n }, { strategy: 'bestScore' });
+      await g.playToEnd();
+      const led = g.ledger();
+      assert.equal(led.turnState, WAIT_PLAYER);
+      assert.equal(led.round, BigInt(ROUND_COUNT));
+      // Neither of the other two exits applies here -- which is precisely why `settle` had to
+      // grow one.
+      const past = Number(led.lastActionAt + led.tableTimeoutSecs) + 1;
+      await assert.rejects(() => g.sim.claimTimeout(past), /every seat has finished/);
+      await assert.rejects(() => g.sim.abortTable(past), /neither stalled/);
+
+      const [q, r] = g.rakeSplit();
+      await g.sim.settle(bytes32(0xde), q, r, past);
+      assert.equal(g.ledger().pot, 0n);
+      assert.equal(g.ledger().phase, PHASE_SETTLED);
+    }
+
+    // settled and aborted are terminal with a zero pot, and every circuit refuses them. Asserted
+    // in `settlement guards` and the `timeouts` suite; restated here so the matrix is complete
+    // in one place.
   });
 });
 
@@ -1132,7 +1485,7 @@ describe('the declared-time sandwich', () => {
   });
 
   it('refuses a declared time further behind than the slack', async () => {
-    const SLACK = 600;
+    const SLACK = 120;
     const g = await GameDriver.open({ seats: 2 });
     g.sim.asPlayer(g.players[0]!.sk);
 
@@ -1170,11 +1523,16 @@ describe('tie-break at table level', () => {
   // configurations that tie, and are hard-coded so the tests are deterministic and so that any
   // change to the dice ladder, the policy masks or the digest chain breaks them loudly. Each
   // test re-asserts the tie it depends on before asserting the tie-break.
+  //
+  // They were RE-SWEPT when `entropyKeyCommitment` grew its `tableId` binding
+  // (docs/security-review.md, Low): the commitment is hashed into the join digest, the join
+  // digest feeds every roll, so a different `C_s` is a different game. The ids changed; the
+  // scenarios did not. That the old ids stopped tying is the loud break working as intended.
 
   it('breaks a tie between two finishers by seat order', async () => {
     // Both seats complete, so both have a real `finishedAtTurn`, and seat 0 always finishes
     // first because seat order is turn order. Seat 0 wins on both remaining legs at once.
-    const opts: TableOptions = { seats: 2, tableId: bytes32(36) };
+    const opts: TableOptions = { seats: 2, tableId: bytes32(113) };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(2), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');
@@ -1197,7 +1555,7 @@ describe('tie-break at table level', () => {
     // tie to the seat that actually finished. This is the leg that separates the two rules,
     // and a forfeited seat is the only way to reach it -- among finishers, seat order and
     // finish order always agree.
-    const opts: TableOptions = { seats: 2, tableId: bytes32(18) };
+    const opts: TableOptions = { seats: 2, tableId: bytes32(16) };
     const plan: GamePlan = { strategy: 'firstLegal', forfeits: [{ seat: 0, round: 11 }] };
     const preview = replayGame(tableConfig(opts), makePlayers(2), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this scenario was chosen for its tie');
@@ -1223,7 +1581,7 @@ describe('tie-break at table level', () => {
     // the first two legs are exhausted. Seat 2 forfeits at round 1 with nothing; seat 3 plays
     // to the end but scores less than the tied pair. A forfeited seat CAN win -- it competes
     // with what it scored, and its stake stayed in the pot the whole time.
-    const opts: TableOptions = { seats: 4, tableId: bytes32(10) };
+    const opts: TableOptions = { seats: 4, tableId: bytes32(6) };
     const plan: GamePlan = {
       strategy: 'bestScore',
       forfeits: [

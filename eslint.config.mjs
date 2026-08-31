@@ -42,4 +42,28 @@ export default tseslint.config(
       },
     },
   },
+  {
+    // ui/ is browser code. `@yahtzee/api/node` carries wallet-sdk and other Node-only plumbing
+    // that must never reach a browser bundle (ui/README.md), and no `node:` builtin belongs
+    // there either — this is the cheap lint-time half of that rule; `npm run build -w ui`
+    // failing to bundle a Node builtin is the expensive half.
+    files: ['ui/src/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['@yahtzee/api/node', '@yahtzee/api/node/*'],
+              message: 'Node-only plumbing (wallet-sdk, proof/zk-config providers) — never import from ui.',
+            },
+            {
+              group: ['node:*'],
+              message: 'Node builtins are not available in the browser.',
+            },
+          ],
+        },
+      ],
+    },
+  },
 );

@@ -185,16 +185,39 @@ arrived at and `table.compact` decisions 8 and 9 for why.
 
 | contract | circuit        | instructions | inputs | prover key | verifier key |   k |
 | -------- | -------------- | -----------: | -----: | ---------: | -----------: | --: |
-| table    | `join`         |          783 |      3 |  5,209,319 |        2,119 |  14 |
-| table    | `takeTurn`     |        2,106 |      6 |  5,215,077 |        2,119 |  14 |
-| table    | `resolveRoll1` |        1,236 |      1 |  9,987,807 |        2,119 |  15 |
-| table    | `resolveRoll2` |          877 |      1 |  9,976,727 |        2,119 |  15 |
-| table    | `resolveRoll3` |        1,768 |      1 |  9,990,255 |        2,119 |  15 |
-| table    | `settle`       |        1,336 |      4 |  2,824,864 |        2,119 |  13 |
-| table    | `claimTimeout` |        1,360 |      1 |    575,520 |        1,351 |  11 |
-| table    | `abortTable`   |        1,996 |      1 |  1,079,285 |        1,351 |  12 |
+| table    | `join`         |          806 |      3 |  5,209,510 |        2,119 |  14 |
+| table    | `takeTurn`     |        2,124 |      6 |  5,215,131 |        2,119 |  14 |
+| table    | `resolveRoll1` |        1,254 |      1 |  9,987,859 |        2,119 |  15 |
+| table    | `resolveRoll2` |          895 |      1 |  9,976,806 |        2,119 |  15 |
+| table    | `resolveRoll3` |        1,786 |      1 |  9,990,317 |        2,119 |  15 |
+| table    | `settle`       |        1,413 |      4 |  2,827,063 |        2,119 |  13 |
+| table    | `claimTimeout` |        1,360 |      1 |    575,519 |        1,351 |  11 |
+| table    | `abortTable`   |        1,996 |      1 |  1,079,284 |        1,351 |  12 |
 | lobby    | `openTableAt`  |          233 |      3 |  2,821,203 |        2,119 |  13 |
 | lobby    | `tableFilled`  |          274 |      1 |  2,820,987 |        2,119 |  13 |
+
+> **Re-measured after the security-review remediation**
+> ([security-review.md](security-review.md)). The row above is the post-fix contract. Six circuits
+> moved by a handful of instructions and **not one moved a PLONK step** — `k` and `inputs` are
+> identical to the pre-fix measurement, and the prover keys differ by tens of bytes on
+> multi-megabyte objects:
+>
+> | circuit            | instructions        | why                                                          |
+> | ------------------ | ------------------- | ------------------------------------------------------------ |
+> | `join`             | 783 → 806 (+23)     | zero-address assert; `entropyKeyCommitment` gained `tableId` |
+> | `takeTurn`         | 2,106 → 2,124 (+18) | `entropyKeyCommitment` gained `tableId`                      |
+> | `resolveRoll1/2/3` | +18 each            | `seedCommitmentOf` gained `tableId`                          |
+> | `settle`           | 1,336 → 1,413 (+77) | `seedCommitmentOf` + the deadline predicate and the ternary  |
+> | `claimTimeout`     | unchanged           | untouched by the fixes                                       |
+> | `abortTable`       | unchanged           | untouched by the fixes                                       |
+>
+> The two commitment hashes went from a 2-element to a 3-element `Vector<n, Bytes<32>>` and cost
+> +18 instructions each rather than a whole extra hash pass: 64 bytes and 96 bytes need the same
+> **two** SHA-256 compression blocks once padding is added, so the widening is nearly free. That
+> mattered here rather than being a curiosity — `resolveRoll1/2/3` sit at the k=15 ceiling with no
+> headroom, so a fix that had cost one more block would have had to be redesigned instead of
+> shipped. The **constructor** grew sixteen explicit zero-inits and two new asserts and is not in
+> this table at all, because constructors are not proved and emit no keys.
 
 Read the `inputs` column against §3's: **129 public inputs became 1**. That is the whole of the
 padding change, and it is worth one to three PLONK steps per circuit — `claimTimeout`'s prover
@@ -255,7 +278,7 @@ decided here; all five are argued at length in `table.compact`'s header, summari
    domain separation, fixed-width fields throughout. The reason is compatibility: `RollContext`
    is pinned byte-for-byte by three measured contracts and by `src/dice-mirror.ts`, and adding a
    field would change the dice of every existing artifact and void the cross-check corpus.
-3. **`tier >= 100` is enforced at construction**, so the 1% rake `q` is never 0 and `settle`
+3. **`100 <= tier <= 10^15` is enforced at construction**, so the 1% rake `q` is never 0 and `settle`
    never has to make a payment conditional. No division exists in language 0.26, so the rake is
    the witness-checked identity `q * 100 + r == pot, r < 100` — which has exactly one solution,
    and the remainder `r` rides with the winner.
@@ -263,10 +286,17 @@ decided here; all five are argued at length in `table.compact`'s header, summari
    — `blockTimeGt/Gte/Lt/Lte(Uint<64>)` exist, strict and seconds-based; `blockTime()` does not,
    and `kernel.blockTime` is "undefined for ledger field type Kernel". A circuit that must stamp
    `lastActionAt` therefore has to be told the time and pin the claim between two predicates,
-   trapping `now` in `(blockTime − 600, blockTime]` plus `now >= lastActionAt`. Deadlines
-   themselves are exact and read real block time. Details and the incentive argument are in
-   decision 5 of the contract header; the runtime trap that makes testing this delicate is
+   trapping `now` in `(blockTime − 120, blockTime]` plus `now >= lastActionAt`. Deadlines
+   themselves are exact and read real block time. Details are in decision 5 of the contract
+   header; the runtime trap that makes testing this delicate is
    [bugs-found.md](bugs-found.md) #12.
+
+   The slack was 600 s and the incentive argument that justified it was **wrong**: on a hand-off
+   transition the deadline you stamp belongs to the next actor, not to you, so under-declaring is
+   free and costs someone else. The slack is now 120 s and the constructor refuses any timeout
+   that is not strictly greater than `120 × 4`. See [security-review.md](security-review.md) §2's
+   Critical.
+
 5. **The contract never asserts its own token balance** — see §6.
 
 ### All-forfeited settlement: refund, not last-seat-standing

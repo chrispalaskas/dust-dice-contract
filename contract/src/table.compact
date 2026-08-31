@@ -74,11 +74,25 @@
 //        blockTimeLt(now + timeSlackSecs()) =>  now >  blockTime - timeSlackSecs()
 //
 //    which traps `now` in `(blockTime - slack, blockTime]`, plus `now >= lastActionAt` for
-//    monotonicity. A caller can only under-declare, by at most the slack, and under-declaring
-//    brings their OWN next deadline forward -- the incentive points the safe way. Deadlines
+//    monotonicity. A caller can only under-declare, and by at most the slack. Deadlines
 //    themselves are exact: `blockTimeGt(lastActionAt + timeout)` is evaluated against real
 //    block time, never against a declared value. Build grace into the timeout parameters, not
 //    into the predicate; there is no tolerance widening anywhere in this file.
+//
+//    THE INCENTIVE DOES NOT POINT THE SAFE WAY, and an earlier version of this comment claimed
+//    it did. "Under-declaring only brings your OWN deadline forward" is true for `join` while a
+//    table is filling and for a `claimTimeout` that hands the turn to nobody in particular. It is
+//    FALSE for every hand-off transition, which is most of them: `takeTurn` stamps the deadline
+//    the OPERATOR is then judged against, `resolveRoll3` stamps the one the NEXT PLAYER is judged
+//    against, and `claimTimeout` stamps the one the next seat is judged against. In each of those
+//    the declarer pays nothing for under-declaring and the victim's window shrinks by up to the
+//    full slack. With `turnTimeoutSecs <= slack` the victim's deadline is already expired when
+//    they receive the turn, and a permissionless `claimTimeout` forfeits them on the spot --
+//    cascading, seat by seat, until the caller is the only one left. That is the Critical finding
+//    C1 of docs/security-review.md, and it is closed by two changes rather than by better
+//    commentary: `timeSlackSecs()` is 120 rather than 600, and the constructor refuses any
+//    timeout that is not strictly greater than `timeSlackSecs() * timeoutSlackFactor()`, so the
+//    most a hostile declarer can take from the next actor is a quarter of their window.
 //
 // 6. THE RAKE IS ALWAYS AT LEAST 1, ENFORCED AT CONSTRUCTION (`tier >= 100`). Language 0.26
 //    has no division, so the 1% rake is the witness-checked Euclidean identity
@@ -220,14 +234,49 @@ pure circuit policyNone(): Uint<8> {
   return holdPolicyCount();
 }
 
-/** Slack allowed on a declared `now`, in seconds. See decision 5 in the header. */
+/**
+ * Slack allowed on a declared `now`, in seconds. See decision 5 in the header.
+ *
+ * 120 s, and it is deliberately small. The slack is a WEAPON in the hands of whoever declares it
+ * (see decision 5), so it is sized to the thing it actually has to absorb -- proving plus
+ * submission, measured at ~21 s in the E2E run -- plus generous room for clock skew between a
+ * client and the chain. It was 600 s, which was picked for comfort rather than from any
+ * measurement, and 600 s of free deadline movement against the NEXT actor is not comfort.
+ *
+ * The constructor's `timeout > slack * 4` floor is the other half of the same fix: the slack
+ * cannot be a large fraction of a timeout, whatever the operator configures.
+ */
 pure circuit timeSlackSecs(): Uint<64> {
-  return 600;
+  return 120;
+}
+
+/**
+ * The multiple of `timeSlackSecs()` that every timeout parameter must strictly exceed.
+ *
+ * Four, so a caller who under-declares by the full slack can consume at most a quarter of the
+ * victim's window and the victim still gets three quarters of the deadline they were promised.
+ */
+pure circuit timeoutSlackFactor(): Uint<64> {
+  return 4;
 }
 
 /** Rake denominator. 1% -- `scoring-core.compact`'s `rakeIsValid` hard-codes the 100. */
 pure circuit minTier(): Uint<64> {
   return 100;
+}
+
+/**
+ * Largest stake a table may be opened with, in the smallest NIGHT unit: 10^15.
+ *
+ * The binding constraint is `abortTable`'s `tier * seatCount`, a CHECKED narrowing cast to
+ * `Uint<64>`: an overflow there aborts the circuit, which would deny the refund path while
+ * leaving `settle` working -- i.e. the pot could only ever leave through the winner. At the
+ * bound, `maxTier() * maxSeats()` is 6 x 10^15, comfortably under `Uint<64>`'s 1.8 x 10^19, and
+ * `settle`'s `q * 100 + r` (Field arithmetic, no narrowing) has room to spare. 10^15 atomic units
+ * is far above any stake this game will ever see, so the bound costs nothing real.
+ */
+pure circuit maxTier(): Uint<64> {
+  return 1000000000000000;
 }
 
 export enum Phase {
@@ -276,7 +325,13 @@ export sealed ledger seatLimit: Uint<8>;
 /** Where the rake goes. Fixed at construction so `settle` needs no argument for it. */
 export sealed ledger rakeAddress: UserAddress;
 
-/** `H(seed)`, committed before any player existed. Checked by `resolveTurn` and `settle`. */
+/**
+ * `H(tableId, seed)`, committed before any player existed.
+ *
+ * Checked by all three `resolveRoll` steps and -- before the table deadline -- by `settle`.
+ * `tableId` is inside the hash so that a seed accidentally reused at two tables does not produce
+ * one commitment for both; see `seedCommitmentOf` in policy-core.compact.
+ */
 export sealed ledger seedCommitment: Bytes<32>;
 
 /** Deadline for one player move, in seconds. `claimTimeout` forfeits past it. */
@@ -320,7 +375,15 @@ export ledger gameDigest: Bytes<32>;
 /** Block-time seconds of the last state-advancing move. Every deadline is relative to it. */
 export ledger lastActionAt: Uint<64>;
 
-/** The seed, once `settle` has revealed it. Zeros before. Lets anyone replay the whole game. */
+/**
+ * The seed, once `settle` has revealed it. Zeros before -- and zeros forever on a force-settle.
+ *
+ * A non-zero value here is the game's certificate of verifiability: it opens `seedCommitment`, so
+ * anyone can replay every roll of the whole game from the public log. It stays zero when `settle`
+ * ran on the post-deadline path with no valid seed (see `settle`), which marks the game as paid
+ * but unverifiable. Consumers must test it rather than assume it: `revealedSeed == 0` is a
+ * meaningful state, not a "not settled yet" state.
+ */
 export ledger revealedSeed: Bytes<32>;
 
 /** Winning seat, once settled. Meaningless before. */
@@ -698,7 +761,7 @@ circuit padTransaction(): [] {
  * Open an empty table.
  *
  * Called by the operator, which has already generated `seed`, persisted it to disk keyed by
- * the table address, and computed `seedCommitmentOf(seed)` -- the commitment is made BEFORE
+ * the table address, and computed `seedCommitmentOf(id, seed)` -- the commitment is made BEFORE
  * any player exists, which is what makes the commit-reveal sound.
  *
  * `lastActionAt` stays 0 and the Filling deadline therefore only starts at the first join.
@@ -719,8 +782,19 @@ constructor(id: Bytes<32>,
   // Guarantees `q >= 1` in the rake split, so `settle` never has to make a zero-value payment
   // conditional. See decision 6.
   assert(stake >= minTier(), "tier must be at least 100 so the 1% rake is non-zero");
-  assert(turnTimeout > 0, "turn timeout must be positive");
-  assert(tableTimeout > 0, "table timeout must be positive");
+  // Keeps `abortTable`'s `tier * seatCount` inside `Uint<64>`, so the refund path can never be
+  // denied by a checked-cast overflow while `settle` still works. See `maxTier`.
+  assert(stake <= maxTier(), "tier is above the maximum a table may stake");
+  // NOT merely `> 0`. A timeout at or below the declared-time slack lets the actor handing the
+  // turn over under-declare `now` far enough that the NEXT seat's deadline has already expired
+  // when they receive it, and `claimTimeout` is permissionless -- so the hand-off itself becomes
+  // a forfeit weapon. See decision 5 and docs/security-review.md C1. The floor is strict, so a
+  // timeout exactly at `slack * factor` is refused too.
+  const timeoutFloor = (timeSlackSecs() * timeoutSlackFactor()) as Uint<64>;
+  assert(turnTimeout > timeoutFloor, "turn timeout must exceed four times the declared-time slack");
+  assert(tableTimeout > timeoutFloor,
+         "table timeout must exceed four times the declared-time slack"
+         );
 
   tableId = disclose(id);
   tier = disclose(stake);
@@ -733,6 +807,35 @@ constructor(id: Bytes<32>,
   phase = Phase.filling;
   turnState = TurnState.waitPlayer;
   gameDigest = genesisDigest(disclose(id));
+
+  // Explicit zero-inits. Every one of these already holds its type's default before this runs, so
+  // none of it changes behaviour -- it is here so that the initial value of a field is a statement
+  // in the source rather than an inference about Compact's defaults, which is what
+  // docs/security-review.md §5 asked for. Two of them are load-bearing enough to be worth stating
+  // out loud: `lastActionAt` STAYS 0 so the filling deadline only starts at the first join (see
+  // the doc comment above), and `revealedSeed` STAYS zero until a settlement that actually opened
+  // the commitment writes it (see `settle`).
+  //
+  // `padStore` is deliberately NOT initialised: it is a transaction-padding sink, not state, and
+  // writing 2 KB here would grow the deploy transaction for no reason. `seatIdentity`, `seatCard`
+  // and `seatProgress` are initialised by the loop below, which is a correctness requirement
+  // rather than documentation.
+  seatCount = 0;
+  activeSeats = 0;
+  currentSeat = 0;
+  round = 0;
+  turnIndex = 0;
+  pot = 0;
+  lastActionAt = 0;
+  revealedSeed = default<Bytes<32>>;
+  winnerSeatIndex = 0;
+  pendingEntropy = default<Bytes<32>>;
+  pendingPolicy = 0;
+  pendingParam = 0;
+  rollStep = 0;
+  pendingMixed = default<Bytes<32>>;
+  pendingHold = default<HoldMask>;
+  pendingRoll = default<Dice>;
 
   // Pre-insert all six slots so every runtime `lookup` is total. See decision 1.
   for (const s of 0..6) {
@@ -777,11 +880,19 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   const t = disclose(now);
   const who = disclose(payoutTo);
 
+  // A zero payout address is where a stake goes to die: `settle` and `abortTable` both pay the
+  // address recorded here and nothing else, so a seat that records zeros has staked into a
+  // burn. It is self-harm rather than an attack on anyone else, which is why it is a cheap
+  // assert and not a phase rule -- but a client bug that leaves the field unset should cost a
+  // rejected transaction, not a lost stake.
+  assert(who != default<UserAddress>, "join: payout address must not be the zero address");
+
   // The seat's authorisation key. Proving knowledge of `sk` is what a later `takeTurn`
   // authorises against; committing to it here is what makes the per-round entropy
   // non-grindable. `entropyKeyCommitment` is a hash, so disclosing it reveals nothing about
-  // `sk` -- and it has to be public, since it is the value `takeTurn` checks against.
-  const commit = disclose(entropyKeyCommitment(playerEntropySecret()));
+  // `sk` -- and it has to be public, since it is the value `takeTurn` checks against. It binds
+  // `tableId`, so the same secret at two tables produces two unrelated commitments.
+  const commit = disclose(entropyKeyCommitment(tableId, playerEntropySecret()));
   assert(!joinedKeys.member(commit), "join: this entropy key already holds a seat");
 
   const seat = seatCount;
@@ -855,7 +966,7 @@ export circuit takeTurn(
 
   // ---- authorisation: knowledge of this seat's entropy secret -------------------------
   const sk = playerEntropySecret();
-  assert(disclose(entropyKeyCommitment(sk) == seatIdentity.lookup(seat).keyCommit),
+  assert(disclose(entropyKeyCommitment(tableId, sk) == seatIdentity.lookup(seat).keyCommit),
          "takeTurn: wrong entropy secret for this seat"
          );
   assert(disclose(forcedEntropy(sk, tableId, r) == e),
@@ -977,7 +1088,7 @@ export circuit resolveRoll1(now: Uint<64>): Dice {
   const r = round;
 
   const seed = rollSeed();
-  assert(disclose(seedCommitmentOf(seed) == seedCommitment),
+  assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
          "resolveRoll1: seed does not open the table's seed commitment"
          );
 
@@ -1016,7 +1127,7 @@ export circuit resolveRoll2(now: Uint<64>): Dice {
 
   const t = disclose(now);
   const seed = rollSeed();
-  assert(disclose(seedCommitmentOf(seed) == seedCommitment),
+  assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
          "resolveRoll2: seed does not open the table's seed commitment"
          );
 
@@ -1061,7 +1172,7 @@ export circuit resolveRoll3(now: Uint<64>): Dice {
   const r = round;
 
   const seed = rollSeed();
-  assert(disclose(seedCommitmentOf(seed) == seedCommitment),
+  assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
          "resolveRoll3: seed does not open the table's seed commitment"
          );
 
@@ -1120,15 +1231,53 @@ export circuit resolveRoll3(now: Uint<64>): Dice {
  * `q` and `r` are supplied, not trusted: `splitPot` asserts `q * 100 + r == pot` and `r < 100`,
  * which has exactly one solution, so the caller cannot inflate the rake. The remainder goes to
  * the winner.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * THE SEED CHECK IS WAIVED ONCE THE TABLE DEADLINE HAS PASSED. This is the fix for the Critical
+ * finished-but-unsettled trap in docs/security-review.md §5, and it is the one place in this
+ * contract where a check is deliberately dropped, so the reasoning is written out in full.
+ *
+ * THE TRAP. A game that runs to completion lands in (`Playing`, `waitPlayer`,
+ * `round >= roundCount()`). `claimTimeout` refuses it (`round < roundCount()`), `abortTable`
+ * refuses it (`operatorStalled` requires `waitResolve`), and `takeTurn` refuses it. `settle` was
+ * therefore the ONLY exit, and `settle` needed the operator's seed. An operator that vanished
+ * after the last resolve -- or simply lost its seed file -- locked every stake permanently. That
+ * breaks the design's own core invariant: every reachable state has a permissionless exit.
+ *
+ * WHY WAIVING IS SOUND. Nothing about the payout depends on the seed. The winner is
+ * `winnerOfSeats` over `seatProgress`, which is public ledger state built up by circuits that
+ * each already proved their dice against the commitment as they ran. The rake split is pinned by
+ * the Euclidean identity. The payout addresses were recorded at `join`. So the seed reveal was
+ * never load-bearing for SOUNDNESS -- it is load-bearing for VERIFIABILITY, which is a different
+ * property: it is what lets a third party replay the whole game offline from the public log.
+ *
+ * WHAT IS LOST, stated honestly. A force-settled game is UNVERIFIABLE after the fact.
+ * `revealedSeed` stays zero, so nobody -- including the players -- can re-derive the rolls from
+ * the log, and the CLI verifier reports the game as unverified rather than as correct. The dice
+ * were still proven correct one transaction at a time while the game was live; what is missing is
+ * the ability to re-check that offline, later, without trusting the chain's own verification.
+ * That is a real loss and it is the right trade against the alternative, which was losing the
+ * money.
+ *
+ * WHY IT PAYS THE WINNER RATHER THAN REFUNDING. A refund path here would be strictly worse: an
+ * operator that had also seated a player (which the threat model already forbids, but which the
+ * contract cannot detect) could watch that seat lose and then simply decline to settle, converting
+ * the loss into a refund. Paying the winner the game already produced removes every incentive to
+ * stall, so the timeout is a fallback nobody profits from reaching.
+ *
+ * BEFORE the deadline the seed check is mandatory, exactly as before, which is what keeps the
+ * honest path -- and the reveal it publishes -- the normal one. `settle` takes no `now`: the
+ * deadline is evaluated by the kernel against real block time, so there is nothing to declare and
+ * nothing to under-declare.
  */
 export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
   assert(phase == Phase.playing, "settle: table is not playing");
   assert(round >= roundCount(), "settle: the game is not finished");
 
   const s = disclose(seed);
-  assert(seedCommitmentOf(s) == seedCommitment,
-         "settle: seed does not open the table's seed commitment"
-         );
+  const opens = seedCommitmentOf(tableId, s) == seedCommitment;
+  const graceExpired = blockTimeGt((lastActionAt + tableTimeoutSecs) as Uint<64>);
+  assert(opens || graceExpired, "settle: seed does not open the table's seed commitment");
 
   const totals = [seatProgress.lookup(0).total,
                   seatProgress.lookup(1).total,
@@ -1158,7 +1307,12 @@ export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
     );
 
   pot = 0;
-  revealedSeed = s;
+  // Zero on a force-settle, and that zero is the game's "unverified" marker: `revealedSeed` is
+  // the one field a replaying verifier needs, so leaving it at its constructor default is what
+  // tells the verifier -- and the settle-panel -- that this game cannot be replayed. A seed that
+  // did NOT open the commitment must never be written here: it would look exactly like a reveal
+  // while opening nothing, which is worse than an honest blank.
+  revealedSeed = opens ? s : default<Bytes<32>>;
   winnerSeatIndex = winner;
   phase = Phase.settled;
 
@@ -1247,6 +1401,16 @@ export circuit claimTimeout(now: Uint<64>): Uint<8> {
  *     documented residual of the randomness design: a seed-knowing operator can selectively
  *     withhold resolution when the upcoming dice displease it. It cannot alter an outcome,
  *     only freeze the table, and this circuit is what converts that freeze into a refund.
+ *
+ *     ONE CASE, NOT THREE, ACROSS THE SPLIT RESOLVE. `waitResolve` covers `rollStep` 0, 1 and 2
+ *     alike: steps 1 and 2 write no seat state, no digest and no cursor, so a stall at any of
+ *     them is the same stall as a stall before step 1 and needs no separate rule. What the split
+ *     DOES change is the clock, and it is worth being explicit rather than surprised: every one
+ *     of the three steps calls `stampTime`, so an operator that runs step 1, waits, runs step 2,
+ *     waits, and then stops has restarted the table deadline twice. The worst-case freeze is
+ *     therefore about `3 * tableTimeoutSecs` rather than one, and that is the correct behaviour
+ *     -- each step is a real state advance and the operator is visibly still working -- but it
+ *     means the parameter bounds one step's silence, not one turn's.
  *   * `abandoned` -- every seat forfeited on a turn timeout. No further waiting: the timeout
  *     that produced `abandoned` has already elapsed.
  *

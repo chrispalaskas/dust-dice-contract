@@ -425,7 +425,7 @@ export type TableConfig = {
   rakeAddress: UserAddress;
   /** The operator's roll seed. Its commitment is what reaches the constructor. */
   seed: Uint8Array;
-  /** Committed seed hash. Defaults to `seedCommitmentTs(seed)`; override to test rejection. */
+  /** Committed seed hash. Defaults to `seedCommitmentTs(tableId, seed)`; override to reject. */
   seedCommitment: Uint8Array;
   turnTimeoutSecs: bigint;
   tableTimeoutSecs: bigint;

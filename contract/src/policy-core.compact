@@ -317,14 +317,33 @@ export struct EntropyContext {
   round: Uint<8>,
 }
 
-/** The join-time commitment to a seat's entropy secret: `C_s = H(sk_s)`, domain-tagged. */
-export pure circuit entropyKeyCommitment(sk: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "yahtzee:v1:entkey"), sk]);
+/**
+ * The join-time commitment to a seat's entropy secret: `C_s = H(tableId, sk_s)`, domain-tagged.
+ *
+ * `tableId` IS PART OF THE COMMITMENT, and the reason is linkability rather than dice fairness:
+ * without it, a client that reuses one `sk_s` across two tables publishes the same `C_s` at both,
+ * and an observer can join the two seats up. `forcedEntropy` already re-binds `tableId`, so the
+ * dice were never at risk -- this closes the identifier, not the randomness. The client rule
+ * (docs/client-rules.md) still says one fresh secret per table; this makes the reuse case merely
+ * wasteful rather than de-anonymising.
+ */
+export pure circuit entropyKeyCommitment(tableId: Bytes<32>, sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:entkey"), tableId, sk]);
 }
 
-/** The operator's commitment to its roll seed, made before any player exists. */
-export pure circuit seedCommitmentOf(seed: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "yahtzee:v1:seed"), seed]);
+/**
+ * The operator's commitment to its roll seed, made before any player exists.
+ *
+ * `tableId` IS PART OF THE COMMITMENT, and here it is a real security property rather than a
+ * tidiness one. `settle` reveals the seed by design. If the same seed were ever reused for two
+ * tables, both would carry the SAME commitment, and the first table's settlement would hand any
+ * observer the second, still-live table's entire future randomness. Binding `tableId` in means a
+ * reused seed produces two unrelated commitments and the reveal at one table says nothing about
+ * the other. The operator is still told to use a fresh seed per table; this makes a slip
+ * survivable instead of catastrophic.
+ */
+export pure circuit seedCommitmentOf(tableId: Bytes<32>, seed: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:seed"), tableId, seed]);
 }
 
 /**
@@ -414,7 +433,7 @@ export pure circuit resolveDiceChecked(
                       modal: Uint<8>,
                       ): Vector<5, Uint<8>> {
   const r0 = deriveDice(rollContext(tableId, seed, mixed, round, 0));
-  assert(policy != policyKeepModal() || isCanonicalModal(r0, modal),
+  assert(disclose(policy != policyKeepModal() || isCanonicalModal(r0, modal)),
          "resolveTurn: witnessed modal face is not the modal face of roll 1"
          );
   const hold = holdMaskOf(policy, param, modal, r0);
@@ -471,7 +490,7 @@ export pure circuit firstRollChecked(
                       modal: Uint<8>,
                       ): FirstRollResult {
   const r0 = deriveDice(rollContext(tableId, seed, mixed, round, 0));
-  assert(policy != policyKeepModal() || isCanonicalModal(r0, modal),
+  assert(disclose(policy != policyKeepModal() || isCanonicalModal(r0, modal)),
          "resolveRoll1: witnessed modal face is not the modal face of roll 1"
          );
   return FirstRollResult { dice: r0, hold: holdMaskOf(policy, param, modal, r0) };

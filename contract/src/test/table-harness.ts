@@ -100,16 +100,20 @@ export type TableOptions = {
 
 export function tableConfig(opts: TableOptions): TableConfig {
   const seed = opts.seed ?? bytes32(0x11);
+  const tableId = opts.tableId ?? bytes32(0x22);
   return {
-    tableId: opts.tableId ?? bytes32(0x22),
+    tableId,
     // 1_000_000 is divisible by 100, so `r == 0`; the remainder-to-winner path is exercised
     // separately with a tier that is not.
     tier: opts.tier ?? 1_000_000n,
     seats: BigInt(opts.seats),
     rakeAddress: opts.rakeAddress ?? userAddress(0xee),
     seed,
-    seedCommitment: opts.seedCommitment ?? seedCommitmentTs(seed),
-    turnTimeoutSecs: opts.turnTimeoutSecs ?? 300n,
+    seedCommitment: opts.seedCommitment ?? seedCommitmentTs(tableId, seed),
+    // Both defaults must clear the constructor's floor of `timeSlackSecs() * 4` = 480 s
+    // (table.compact, decision 5). Anything at or below it is refused at construction, which is
+    // itself covered by a test in src/test/table.test.ts.
+    turnTimeoutSecs: opts.turnTimeoutSecs ?? 600n,
     tableTimeoutSecs: opts.tableTimeoutSecs ?? 3_600n,
   };
 }
@@ -257,7 +261,7 @@ export class GameDriver {
       this.digest,
       seat,
       player.addr.bytes,
-      entropyKeyCommitmentTs(player.sk),
+      entropyKeyCommitmentTs(this.config.tableId, player.sk),
     );
     const led = this.ledger();
     assert.deepEqual(led.gameDigest, this.digest, `gameDigest diverged after seat ${seat} joined`);
@@ -713,7 +717,7 @@ export function replayGame(
       digest,
       seat,
       players[seat]!.addr.bytes,
-      entropyKeyCommitmentTs(players[seat]!.sk),
+      entropyKeyCommitmentTs(config.tableId, players[seat]!.sk),
     );
   }
 
