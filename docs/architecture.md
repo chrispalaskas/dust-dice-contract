@@ -54,13 +54,21 @@ batch submission (multi-call transactions inherit the gas under-declaration defe
 Naive per-roll play is arithmetic suicide: 6 players × 13 rounds × 4 tx ≈ 312 transactions
 ≈ hours per game and 52 prompts per player.
 
-**Chosen shape: (a) one transaction per turn.** The player's up-to-three rolls resolve inside
-a single circuit against a pre-declared **hold policy** chosen from a small enum, plus the
-scoring category — ~13 transactions per player per game. Manual per-roll play (b) may be kept
-as a "showcase" mode for 2-seat tables only. Full-game settlement (c) is a stretch goal,
-go/no-go decided by measuring a 3-roll circuit and extrapolating to 39.
+**Chosen shape: (a) one player transaction per turn, plus one operator resolve.** A circuit
+cannot derive dice from a seed the contract only holds a commitment to, and the player must
+not know the seed — so a turn is a player `takeTurn` (entropy + hold policy + **pipelined**
+category choice for the _previous_ turn's dice, which they have seen) and an operator
+`resolveTurn` (seed as private witness; derives all three rolls with policy-applied holds
+in one circuit). Full design, including the anti-collusion entropy scheme, in
+[table-contract.md](table-contract.md).
 
-_Measured numbers to be recorded here._
+Budget at ~18 s/tx (prior measurement): 6-player game ≈ 78 player tx + 78 automated operator
+tx ≈ 47 min wall clock and 13–14 prompts per player — a normal Yahtzee-evening duration.
+2-player game ≈ 16 min. Manual per-roll play (b) may be kept as a "showcase" mode for 2-seat
+tables only. Full-game settlement (c) is a stretch goal, go/no-go decided by measuring the
+3-roll circuit and extrapolating to 39 rolls.
+
+_Measured numbers on this stack to be recorded here._
 
 ## Randomness — commit–reveal, never committed outcomes
 
