@@ -72,12 +72,14 @@ _Measured numbers on this stack to be recorded here._
 
 ## Randomness — commit–reveal, never committed outcomes
 
-- No on-chain randomness: the kernel exposes block-time _predicates_ only (verify).
+- No on-chain randomness: the kernel exposes block-time _predicates_ only (verified in the
+  neighbouring project's field notes: seconds-based, strict, no error widening, usable in the
+  guaranteed phase).
 - Operator commits `H(seed)` **at table open, before any player entropy exists**.
-- Roll i of round r for table T derives from
-  `hash(seed, playerEntropy, tableId, round, rollIndex)`; the player submits their entropy in
-  their own transaction, so neither side can steer: the operator does not know the entropy
-  when committing, the player does not know the seed when submitting.
+- Roll inputs: `hash(seed, entropy_s(r), gameDigest, tableId, round, rollIndex)` with
+  **forced** player entropy `entropy_s(r) = H(sk_s, tableId, r)` against a join-time
+  commitment, and a running game digest — the hardened scheme closing the operator–player
+  collusion grind; full analysis in [table-contract.md](table-contract.md).
 - Seed revealed at settlement; a verifier script (and a browser panel) re-derives every roll.
 - **Never** per-roll outcome commitments: N commitments can all open to the same value and
   no in-circuit check catches it.
@@ -115,8 +117,8 @@ re-verify on 0.34.0; stay well under). Pure helper circuits inline and do not co
   per tier). Holds pot, seats, seed commitment, scorecards, turn state, settlement.
   Per-table deployment isolates any bug or stuck game to one pot.
 
-Planned exported circuits on `Table` (≤ 8): `join`, `start`, `takeTurn`, `settle`,
-`claimTimeout`, `withdraw`.
+Planned exported circuits on `Table` (6): `join`, `takeTurn`, `resolveTurn`, `settle`,
+`claimTimeout`, `abortTable` — see [table-contract.md](table-contract.md).
 
 ### Abandonment is first-class
 
