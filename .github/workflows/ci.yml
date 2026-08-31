@@ -22,6 +22,8 @@ jobs:
       - run: npm ci
       - name: Compile contracts (skip ZK keys in CI)
         run: npm run build:skip-zk -w contract --if-present
+      - name: Circuit PLONK-domain gate (proof server SRS is k=9..15; three circuits sit at k=15 with zero headroom)
+        run: npm run k -w cli
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
