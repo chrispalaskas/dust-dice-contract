@@ -1,0 +1,17 @@
+{
+  "name": "@yahtzee/api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Contract interaction layer + pure game rules. No React imports — framework-swap seam.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
+  }
+}
