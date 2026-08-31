@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    // TypeScript 6 requires `rootDir` explicitly once `outDir` is set (TS5011); 5.x inferred
+    // it from the common source directory.
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "exclude": ["src/test"]
+}

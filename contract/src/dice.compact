@@ -1,0 +1,124 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// Dice derivation, standalone, for measurement.
+//
+// This contract is never deployed. It exists so the dominant circuit cost in the project --
+// the rejection ladder that turns a hash into five fair dice -- is measured before anything
+// is built on top of it (docs/architecture.md, GATE 0 Q2).
+//
+// Every circuit below is a thin wrapper whose only job is to be IMPURE, because a
+// `pure` exported circuit gets no prover key, no verifier key and no zkir at all: it lands
+// in the generated `pureCircuits` object and is compiled to plain JavaScript. So `pure
+// circuit deriveDice` cannot be measured directly; each wrapper writes its result to the
+// ledger, which is the smallest impure act available, and the wrapper's key size is the
+// derivation's key size plus a near-constant.
+//
+// The wrappers are also the cost-attribution ladder: `probeHashOnly` < `probeOneDie` <
+// `rollDice` isolates hash cost, per-die ladder cost, and the five-dice total.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+include "dice-core";
+
+export ledger lastDice: Dice;
+
+export ledger lastHash: Bytes<32>;
+
+/** The operator's roll seed, held off-chain until settlement. */
+witness rollSeed(): Bytes<32>;
+
+// ---------------------------------------------------------------------------------------
+// The measured circuit
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Byte-ladder derivation, seed passed in as a circuit argument.
+ *
+ * "Passed in as an argument" is NOT the same as public. Compact treats the parameters of an
+ * exported circuit as private inputs to the proof exactly like witness results, so this
+ * ledger write needs `disclose()` just as `rollDiceSecretSeed`'s does -- the compiler names
+ * `tableId` as "the value of parameter tableId" in a witness-disclosure error. The dice are
+ * the public game outcome, so disclosing them is the point; nothing else is disclosed.
+ */
+export circuit rollDice(
+                 tableId: Bytes<32>,
+                 seed: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 rollIndex: Uint<8>,
+                 ): Dice {
+  const dice = toDice(deriveDice(rollContext(tableId, seed, playerEntropy, round, rollIndex)));
+  lastDice = disclose(dice);
+  return disclose(dice);
+}
+
+/**
+ * Same derivation with the seed arriving from a witness instead of a circuit argument -- the
+ * shape the live game actually uses, since the operator's seed stays secret until
+ * settlement. Compare its key size against `rollDice` to price witness-vs-argument sourcing.
+ *
+ * The `disclose` is unavoidable and intended: the dice ARE the public outcome of the game,
+ * so writing them to the ledger publishes a witness-derived value on purpose. It leaks
+ * 5 dice values, not the seed -- recovering `seed` from the dice means inverting
+ * `persistentHash` over a 32-byte preimage.
+ */
+export circuit rollDiceSecretSeed(
+                 tableId: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 rollIndex: Uint<8>,
+                 ): Dice {
+  const dice = toDice(deriveDice(rollContext(tableId, rollSeed(), playerEntropy, round, rollIndex)));
+  lastDice = disclose(dice);
+  return disclose(dice);
+}
+
+/** Bit-ladder derivation. Measured only to be rejected. */
+export circuit rollDiceBitLadder(
+                 tableId: Bytes<32>,
+                 seed: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 rollIndex: Uint<8>,
+                 ): Dice {
+  const dice = toDice(deriveDiceBitLadder(
+                        rollContext(tableId, seed, playerEntropy, round, rollIndex)
+                        )
+                      );
+  lastDice = disclose(dice);
+  return disclose(dice);
+}
+
+// ---------------------------------------------------------------------------------------
+// Cost attribution probes
+// ---------------------------------------------------------------------------------------
+
+/** Hash and ledger write, no ladder. The floor every other wrapper sits on. */
+export circuit probeHashOnly(
+                 tableId: Bytes<32>,
+                 seed: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 rollIndex: Uint<8>,
+                 ): Bytes<32> {
+  const h = persistentHash<RollContext>(rollContext(tableId, seed, playerEntropy, round, rollIndex));
+  lastHash = disclose(h);
+  return disclose(h);
+}
+
+/** Hash plus exactly one byte-ladder die. `rollDice` minus this, times 5/4, is the ladder. */
+export circuit probeOneDie(
+                 tableId: Bytes<32>,
+                 seed: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 rollIndex: Uint<8>,
+                 ): Uint<8> {
+  const v = rollBytes(rollContext(tableId, seed, playerEntropy, round, rollIndex));
+  const d = dieFromBytes([v[0], v[1], v[2], v[3]]);
+  lastDice = disclose(Dice { d0: d, d1: 0, d2: 0, d3: 0, d4: 0 });
+  return disclose(d);
+}

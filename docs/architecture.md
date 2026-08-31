@@ -86,11 +86,47 @@ _Measured numbers on this stack to be recorded here._
 
 ### Dice derivation (rejection ladder)
 
-Compact has no `%` and no `/`. A 1–6 die from hash bytes: take a byte, reduce mod 8 (mask —
-power of two), reject 6 and 7, advance to the next byte. 25% rejection per candidate; a
-32-byte hash gives ample candidates. This ladder × 5 dice × up to 3 rolls dominates the
-circuit — **it is built and measured first** (prover key size, proving time) before any
-other contract code. Every other value range in the design is a power of two.
+**Built and measured. Full record in [docs/dice-circuit.md](dice-circuit.md).**
+
+The plan below was wrong in its premise and is kept for the record:
+
+> Compact has no `%` and no `/`. A 1–6 die from hash bytes: take a byte, reduce mod 8 (mask —
+> power of two), reject 6 and 7, advance to the next byte. 25% rejection per candidate; a
+> 32-byte hash gives ample candidates.
+
+**There is no mask.** Language 0.26 has no bitwise operators at all — `&`, `|`, `^`, `<<`,
+`>>` are not even lexed. Masking a byte down to 3 bits would itself cost a 31-comparison
+ladder. What the language does give is `Bytes<32>` indexing and `Uint` comparisons, so the
+cheap primitive is a **monotone threshold ladder** (`sum of (b >= t_k)`) — and a threshold
+ladder need not bucket into a power of two.
+
+**As built:** one candidate is a whole byte, accepted when `b < 252`, bucketed into six
+ranges of exactly 42 (`252 = 6 × 42`), so each face has probability exactly 1/6 conditional
+on acceptance. **1.6% rejection per candidate, not 25%**; 4 candidates per die for an
+exhaustion probability of 5.96 × 10⁻⁸; 20 of the hash's 32 bytes per roll, so **one hash per
+roll**. Measured 4.7× cheaper than the 3-bit design above, which was implemented alongside
+and rejected on the numbers.
+
+**Measured:** one roll = 464 zkir instructions, 9.50 MiB prover key. A full three-roll turn
+(`resolveTurn`) = 1 447 instructions, 18.61 MiB prover key, 58 s to compile with keys, 8 s
+with `--skip-zk`. Verifier keys are a constant 2 119 B for every circuit. Cost is linear at
+≈490 instructions per additional roll. **Fairness: χ² = 2.64 against a critical value of
+11.07** (df=5, p=0.05) over 100 000 derived faces, with the observed candidate-rejection rate
+at 1.5351% against the predicted 1.5625%.
+
+Two consequences for the game design:
+
+- **Holding saves nothing in-circuit.** Which dice are held is not known at compile time, so
+  the ladder for all five positions exists in rolls 2 and 3 regardless; holding is a select,
+  not a skip. The hold policy is likewise free — all policies are evaluated on every proof —
+  so keep the policy set small for cost reasons, not just UX ones.
+- **The hold mask must be latched from roll 1**, not re-evaluated per roll. Re-evaluating it
+  does not compile (docs/bugs-found.md #1). Consistent with "pre-declared hold policy", but a
+  compiler-imposed constraint rather than a free choice.
+
+One transaction per turn — shape (a) — is comfortable. Full-game settlement (c) extrapolates
+to ≈19 000 instructions and stays a stretch goal pending a proving-time measurement against a
+real proof server.
 
 ## Rake and integer division
 

@@ -1,0 +1,292 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// Dice derivation core: hash -> five fair dice (1..6).
+//
+// `include`d verbatim by dice.compact and turn.compact, so this file carries NO pragma and
+// NO import of its own -- the including file supplies both. Editing this file changes the
+// verifier keys of every contract that includes it (see docs/architecture.md, "Deployment
+// pinning").
+//
+// ---------------------------------------------------------------------------------------
+// Why a comparison ladder and not a bit mask
+// ---------------------------------------------------------------------------------------
+// Language 0.26 has NO bitwise operators at all -- `&`, `|`, `^`, `<<`, `>>` are not even
+// lexed (`&` reports "unexpected character '&'"), and there is no `%` or `/`. So the
+// "mask a byte down to 3 bits" plan is not available: extracting the LOW 3 bits of a byte
+// needs `b - 8*floor(b/8)`, and `floor(b/8)` is itself 31 comparisons.
+//
+// What IS available: `Bytes<32>` indexes (`h[0]`) and casts to `Vector<32, Uint<8>>`,
+// `Uint` relational operators, and `Boolean as Uint<8>`. A monotone threshold ladder --
+// `sum of (b >= t_k)` -- is therefore the cheapest way to bucket a byte, and it does not
+// have to bucket into a power of two. That reframes the whole problem: instead of a 3-bit
+// candidate with a 25% reject rate, bucket the byte directly into 6 equal ranges of 42
+// with a 4/256 reject rate.
+//
+// Two designs are implemented so the cost difference is measured, not asserted:
+//
+//   * BYTE-LADDER (`dieFromBytes`, the chosen design). One candidate = one whole byte.
+//     Accept b < 252; die = 1 + #{t in {42,84,126,168,210} : b >= t}. Six buckets of
+//     exactly 42 values each, so conditional on acceptance every face has probability
+//     exactly 42/252 = 1/6. 6 comparisons per candidate, reject rate 1/64.
+//     4 candidates/die => exhaustion 64^-4 = 5.96e-8, and 5 dice x 4 bytes = 20 bytes,
+//     so ONE 32-byte hash covers a whole roll.
+//
+//   * BIT-LADDER (`dieFromTriples`, measured for comparison only). The literal 3-bit
+//     rejection design. Extracting a 3-bit field still costs a 7-comparison ladder
+//     (`floor(b/32)`), so a candidate costs MORE than a byte-ladder candidate while
+//     rejecting 16x more often: 25% reject => 12 candidates/die for 6e-8, i.e. 84
+//     comparisons per die against the byte ladder's 24.
+//
+// Both are exhaustive-fallback designs: if every candidate rejects, the die is 1. The bias
+// is a single face gaining 5.96e-8 of probability mass -- roughly one extra `1` per 16.8
+// million dice derived.
+
+// ---------------------------------------------------------------------------------------
+// Domain separation
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Everything that identifies one roll. Hashed as a whole, so no field can be slid into
+ * another (fixed-width fields, single hash call, no concatenation ambiguity).
+ *
+ * `domain` pins the hash to this contract and version. `seed` is the operator's
+ * commit-reveal seed, `playerEntropy` the player's contribution -- neither side can steer
+ * the outcome because the operator commits to `seed` before any entropy exists and the
+ * player never sees `seed` (docs/architecture.md, "Randomness").
+ *
+ * `stream` is spare capacity: the byte ladder needs only 20 of the hash's 32 bytes, so it
+ * is unused at 0, but a future roll needing more than 32 bytes of entropy can walk it.
+ */
+export struct RollContext {
+  domain: Bytes<32>,
+  tableId: Bytes<32>,
+  seed: Bytes<32>,
+  playerEntropy: Bytes<32>,
+  round: Uint<8>,
+  rollIndex: Uint<8>,
+  stream: Uint<8>,
+}
+
+/** Roll-hash domain tag. Any other use of these hashes must pick a different tag. */
+pure circuit rollDomain(): Bytes<32> {
+  return pad(32, "yahtzee:v1:roll");
+}
+
+pure circuit rollContext(
+               tableId: Bytes<32>,
+               seed: Bytes<32>,
+               playerEntropy: Bytes<32>,
+               round: Uint<8>,
+               rollIndex: Uint<8>,
+               ): RollContext {
+  return RollContext { domain: rollDomain(),
+                       tableId: tableId,
+                       seed: seed,
+                       playerEntropy: playerEntropy,
+                       round: round,
+                       rollIndex: rollIndex,
+                       stream: 0, };
+}
+
+/** The 32 entropy bytes for one roll. */
+pure circuit rollBytes(ctx: RollContext): Vector<32, Uint<8>> {
+  return persistentHash<RollContext>(ctx) as Vector<32, Uint<8>>;
+}
+
+// ---------------------------------------------------------------------------------------
+// Rejection ladder
+// ---------------------------------------------------------------------------------------
+
+/** Accumulator for "first accepted candidate wins". `die` is the fallback 1 until found. */
+struct Pick {
+  found: Boolean,
+  die: Uint<8>,
+}
+
+pure circuit noPick(): Pick {
+  return Pick { found: false, die: 1 };
+}
+
+/**
+ * BYTE-LADDER candidate. Six buckets of exactly 42 over 0..251; 252..255 reject.
+ *
+ * The ladder is evaluated unconditionally -- a circuit has no branches, only selects, so
+ * an already-satisfied `acc` costs the comparisons anyway. Only the select is saved.
+ */
+pure circuit byteCandidate(acc: Pick, b: Uint<8>): Pick {
+  const die = (1 +
+               ((b >= 42) as Uint<8>) +
+               ((b >= 84) as Uint<8>) +
+               ((b >= 126) as Uint<8>) +
+               ((b >= 168) as Uint<8>) +
+               ((b >= 210) as Uint<8>))
+              as Uint<8>;
+  return acc.found ? acc : (b < 252 ? Pick { found: true, die: die } : acc);
+}
+
+/** One die from 4 candidate bytes. Exhaustion probability 64^-4 = 5.96e-8. */
+pure circuit dieFromBytes(cands: Vector<4, Uint<8>>): Uint<8> {
+  const p = fold((acc: Pick, b: Uint<8>) => byteCandidate(acc, b), noPick(), cands);
+  return p.die;
+}
+
+/** `floor(b / 32)` -- the top 3 bits of a byte, as a 7-step threshold ladder. */
+pure circuit top3(b: Uint<8>): Uint<8> {
+  return (((b >= 32) as Uint<8>) +
+          ((b >= 64) as Uint<8>) +
+          ((b >= 96) as Uint<8>) +
+          ((b >= 128) as Uint<8>) +
+          ((b >= 160) as Uint<8>) +
+          ((b >= 192) as Uint<8>) +
+          ((b >= 224) as Uint<8>))
+         as Uint<8>;
+}
+
+/** `floor((b mod 32) / 4)` -- bits 4..2 of a byte, reusing `top3` to peel the high bits. */
+pure circuit mid3(b: Uint<8>): Uint<8> {
+  const r = (b - 32 * top3(b)) as Uint<8>;
+  return (((r >= 4) as Uint<8>) +
+          ((r >= 8) as Uint<8>) +
+          ((r >= 12) as Uint<8>) +
+          ((r >= 16) as Uint<8>) +
+          ((r >= 20) as Uint<8>) +
+          ((r >= 24) as Uint<8>) +
+          ((r >= 28) as Uint<8>))
+         as Uint<8>;
+}
+
+/** BIT-LADDER candidate: a 3-bit value 0..7, accept 0..5 as die value + 1. */
+pure circuit tripleCandidate(acc: Pick, t: Uint<8>): Pick {
+  return acc.found ? acc : (t < 6 ? Pick { found: true, die: (t + 1) as Uint<8> } : acc);
+}
+
+/** One die from 12 three-bit candidates. Exhaustion probability 0.25^12 = 5.96e-8. */
+pure circuit dieFromTriples(cands: Vector<12, Uint<8>>): Uint<8> {
+  const p = fold((acc: Pick, t: Uint<8>) => tripleCandidate(acc, t), noPick(), cands);
+  return p.die;
+}
+
+// ---------------------------------------------------------------------------------------
+// Dice as a struct
+// ---------------------------------------------------------------------------------------
+
+/** Five dice in ledger/return shape. Fixed 5 bytes, so ledger-write cost is constant. */
+export struct Dice {
+  d0: Uint<8>,
+  d1: Uint<8>,
+  d2: Uint<8>,
+  d3: Uint<8>,
+  d4: Uint<8>,
+}
+
+pure circuit toDice(v: Vector<5, Uint<8>>): Dice {
+  return Dice { d0: v[0], d1: v[1], d2: v[2], d3: v[3], d4: v[4] };
+}
+
+pure circuit fromDice(d: Dice): Vector<5, Uint<8>> {
+  return [d.d0, d.d1, d.d2, d.d3, d.d4];
+}
+
+// ---------------------------------------------------------------------------------------
+// Five dice
+// ---------------------------------------------------------------------------------------
+
+/**
+ * THE derivation. Five fair dice from one roll context, byte ladder, 4 candidates per die.
+ *
+ * Die d consumes hash bytes 4d..4d+3, so bytes 20..31 stay unused. Byte assignment is
+ * fixed and disjoint: no byte is ever a candidate for two different dice, so the five dice
+ * are independent.
+ *
+ * Mirrored exactly by `deriveDiceTs` in src/dice-mirror.ts -- the settlement verifier and
+ * the fairness test both run that mirror, and src/test/dice.test.ts cross-checks it
+ * against this circuit. Any edit here must be made there too.
+ */
+export pure circuit deriveDice(ctx: RollContext): Vector<5, Uint<8>> {
+  const v = rollBytes(ctx);
+  return [dieFromBytes([v[0], v[1], v[2], v[3]]),
+          dieFromBytes([v[4], v[5], v[6], v[7]]),
+          dieFromBytes([v[8], v[9], v[10], v[11]]),
+          dieFromBytes([v[12], v[13], v[14], v[15]]),
+          dieFromBytes([v[16], v[17], v[18], v[19]]),];
+}
+
+/**
+ * Bit-ladder equivalent, kept only so the two designs can be cost-compared in one compile.
+ * Die d consumes bytes 6d..6d+5, two 3-bit candidates per byte (top3 then mid3), 30 bytes
+ * for the roll. Not used by turn.compact.
+ */
+export pure circuit deriveDiceBitLadder(ctx: RollContext): Vector<5, Uint<8>> {
+  const v = rollBytes(ctx);
+  return [dieFromTriples(
+            [top3(v[0]),
+             mid3(v[0]),
+             top3(v[1]),
+             mid3(v[1]),
+             top3(v[2]),
+             mid3(v[2]),
+             top3(v[3]),
+             mid3(v[3]),
+             top3(v[4]),
+             mid3(v[4]),
+             top3(v[5]),
+             mid3(v[5]),]
+            ),
+          dieFromTriples(
+            [top3(v[6]),
+             mid3(v[6]),
+             top3(v[7]),
+             mid3(v[7]),
+             top3(v[8]),
+             mid3(v[8]),
+             top3(v[9]),
+             mid3(v[9]),
+             top3(v[10]),
+             mid3(v[10]),
+             top3(v[11]),
+             mid3(v[11]),]
+            ),
+          dieFromTriples(
+            [top3(v[12]),
+             mid3(v[12]),
+             top3(v[13]),
+             mid3(v[13]),
+             top3(v[14]),
+             mid3(v[14]),
+             top3(v[15]),
+             mid3(v[15]),
+             top3(v[16]),
+             mid3(v[16]),
+             top3(v[17]),
+             mid3(v[17]),]
+            ),
+          dieFromTriples(
+            [top3(v[18]),
+             mid3(v[18]),
+             top3(v[19]),
+             mid3(v[19]),
+             top3(v[20]),
+             mid3(v[20]),
+             top3(v[21]),
+             mid3(v[21]),
+             top3(v[22]),
+             mid3(v[22]),
+             top3(v[23]),
+             mid3(v[23]),]
+            ),
+          dieFromTriples(
+            [top3(v[24]),
+             mid3(v[24]),
+             top3(v[25]),
+             mid3(v[25]),
+             top3(v[26]),
+             mid3(v[26]),
+             top3(v[27]),
+             mid3(v[27]),
+             top3(v[28]),
+             mid3(v[28]),
+             top3(v[29]),
+             mid3(v[29]),]
+            ),];
+}

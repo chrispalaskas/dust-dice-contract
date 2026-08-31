@@ -111,14 +111,27 @@ describe('resolveTurnDice', () => {
     expect(final).toEqual([5, 6, 1, 2, 3]); // dice 11..15 of the stream
   });
 
-  it('held dice survive rerolls, non-held are replaced in index order', () => {
-    // roll1: 4,4,1,2,4 → KeepFace(4) holds idx 0,1,4; reroll idx 2,3 with (4,4) → all fours after roll 2
+  it('hold mask is latched from roll 1: a chased face rolled in roll 2 is still rerolled in roll 3', () => {
+    // roll1: 4,4,1,2,4 → KeepFace(4) latches mask [T,T,F,F,T].
+    // roll2 rerolls idx 2,3 with (4,4) → 4,4,4,4,4 — but idx 2,3 are NOT re-held:
+    // roll3 rerolls them again with (5,6).
     const { rolls, final } = resolveTurnDice(
       p(HoldPolicy.KeepFace, 4),
-      streamOf(4, 4, 1, 2, 4, /* roll2 rerolls: */ 4, 4, /* roll3 rerolls: */ ...[]),
+      streamOf(4, 4, 1, 2, 4, /* roll2 rerolls idx 2,3: */ 4, 4, /* roll3 rerolls idx 2,3: */ 5, 6),
     );
     expect(rolls[1]).toEqual([4, 4, 4, 4, 4]);
-    expect(final).toEqual([4, 4, 4, 4, 4]); // roll 3 holds everything, consumes nothing
+    expect(final).toEqual([4, 4, 5, 6, 4]);
+    expect(rolls).toHaveLength(3);
+  });
+
+  it('held dice survive rerolls, non-held are replaced in index order', () => {
+    const { rolls, final } = resolveTurnDice(
+      p(HoldPolicy.KeepModal),
+      // roll1: 5,5,1,2,3 → modal 5, mask [T,T,F,F,F]; roll2 rerolls idx 2,3,4; roll3 again
+      streamOf(5, 5, 1, 2, 3, /* roll2: */ 5, 5, 5, /* roll3: */ 1, 2, 6),
+    );
+    expect(rolls[1]).toEqual([5, 5, 5, 5, 5]);
+    expect(final).toEqual([5, 5, 1, 2, 6]);
     expect(rolls).toHaveLength(3);
   });
 });

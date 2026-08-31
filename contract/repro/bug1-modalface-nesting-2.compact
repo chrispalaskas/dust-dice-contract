@@ -1,0 +1,28 @@
+pragma language_version >= 0.26;
+import CompactStandardLibrary;
+export ledger out: Uint<8>;
+pure circuit faceCount(d: Vector<5, Uint<8>>, f: Uint<8>): Uint<8> {
+  return (((d[0] == f) as Uint<8>) + ((d[1] == f) as Uint<8>) + ((d[2] == f) as Uint<8>)
+        + ((d[3] == f) as Uint<8>) + ((d[4] == f) as Uint<8>)) as Uint<8>;
+}
+pure circuit modalFace(d: Vector<5, Uint<8>>): Uint<8> {
+  const c1 = faceCount(d,1); const c2 = faceCount(d,2); const c3 = faceCount(d,3);
+  const c4 = faceCount(d,4); const c5 = faceCount(d,5); const c6 = faceCount(d,6);
+  const w2 = c2 >= c1; const f2 = w2 ? 2 as Uint<8> : 1 as Uint<8>; const b2 = w2 ? c2 : c1;
+  const w3 = c3 >= b2; const f3 = w3 ? 3 as Uint<8> : f2; const b3 = w3 ? c3 : b2;
+  const w4 = c4 >= b3; const f4 = w4 ? 4 as Uint<8> : f3; const b4 = w4 ? c4 : b3;
+  const w5 = c5 >= b4; const f5 = w5 ? 5 as Uint<8> : f4; const b5 = w5 ? c5 : b4;
+  return c6 >= b5 ? 6 as Uint<8> : f5;
+}
+pure circuit step(a: Vector<5, Uint<8>>, b: Vector<5, Uint<8>>): Vector<5, Uint<8>> {
+  const m = modalFace(a);
+  return [a[0]==m?a[0]:b[0], a[1]==m?a[1]:b[1], a[2]==m?a[2]:b[2],
+          a[3]==m?a[3]:b[3], a[4]==m?a[4]:b[4]];
+}
+export circuit chain2(a0: Vector<5, Uint<8>>, a1: Vector<5, Uint<8>>, a2: Vector<5, Uint<8>>): Uint<8> {
+  const s1 = step(a0, a1);
+  const s2 = step(s1, a2);
+  const r = modalFace(s2);
+  out = disclose(r);
+  return disclose(r);
+}

@@ -1,0 +1,24 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    // Import siblings as "./x.ts" so `node --test src/test/*.test.ts` runs the sources
+    // directly with Node's type stripping, which does NOT remap a ".js" specifier onto a
+    // ".ts" file. `rewriteRelativeImportExtensions` turns those back into ".js" on emit, so
+    // the built dist/ is still plain ESM. Generated Compact output stays ".js" -- it really
+    // is JavaScript.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+
+    // Kept local rather than pushed into the shared base: the other workspaces have not been
+    // written against it and it is an error-level change, not a preference.
+    "verbatimModuleSyntax": true,
+
+    // Required, not belt-and-braces. TypeScript 6.0.3 does not pick up the workspace-hoisted
+    // @types/node from this subdirectory on its own: without this, every `node:` builtin
+    // import fails with TS2591 "Cannot find name 'node:crypto'" -- which reads like a
+    // missing package but is a types-discovery problem, and `npm i -D @types/node` (any
+    // version) does not fix it.
+    "types": ["node"]
+  },
+  "include": ["src"]
+}

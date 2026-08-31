@@ -1,0 +1,23 @@
+pragma language_version >= 0.26;
+import CompactStandardLibrary;
+export ledger out: Uint<8>;
+pure circuit step(x: Uint<8>): Uint<8> {
+  const y = (x >= 128) ? x : (x + 1) as Uint<8>;
+  return (y >= 64) ? y : (y + 1) as Uint<8>;
+}
+export circuit deep(x: Uint<8>): Uint<8> {
+  const v1 = step(x);
+  const v2 = step(v1);
+  const v3 = step(v2);
+  const v4 = step(v3);
+  const v5 = step(v4);
+  const v6 = step(v5);
+  const v7 = step(v6);
+  const v8 = step(v7);
+  const v9 = step(v8);
+  const v10 = step(v9);
+  const v11 = step(v10);
+  const v12 = step(v11);
+  out = disclose(v12);
+  return disclose(v12);
+}

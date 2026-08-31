@@ -82,9 +82,17 @@ export function holdMask(choice: PolicyChoice, dice: Dice): boolean[] {
 
 /**
  * Resolve a full turn: roll 1 in full, then up to two rerolls of the non-held
- * dice under the declared policy. `nextDie` is the deterministic dice stream
- * (the rejection-ladder mirror seeded from the roll hash); dice are consumed
- * strictly left-to-right per reroll so the circuit and this mirror agree.
+ * dice. `nextDie` is the deterministic dice stream (the rejection-ladder mirror
+ * seeded from the roll hash); dice are consumed strictly left-to-right per
+ * reroll so the circuit and this mirror agree.
+ *
+ * **The hold mask is latched from roll 1** and reused verbatim for the roll-3
+ * reroll — it is NOT re-evaluated on roll 2's dice. This is a compiler-imposed
+ * constraint (re-evaluating the policy per roll makes compactc 0.34.0's compile
+ * time explode — docs/bugs-found.md #1), consistent with "pre-declared hold
+ * policy": a die your roll-1 mask did not hold is rerolled in both rerolls even
+ * if roll 2 turned it into the face you are chasing. The circuit, this mirror,
+ * and the site rules text must all say the same thing.
  *
  * Returns the final dice plus each intermediate roll for the game log.
  */
@@ -92,14 +100,17 @@ export function resolveTurnDice(
   choice: PolicyChoice,
   nextDie: () => Die,
 ): { rolls: Dice[]; final: Dice } {
-  const roll = (prev: Dice | null): Dice => {
-    const held = prev ? holdMask(choice, prev) : [false, false, false, false, false];
-    return (prev ?? [1, 1, 1, 1, 1]).map((d, i) => (held[i] ? d : nextDie())) as unknown as Dice;
-  };
+  const rollAll = (): Dice =>
+    [nextDie(), nextDie(), nextDie(), nextDie(), nextDie()] as unknown as Dice;
 
-  const r1 = roll(null);
+  const r1 = rollAll();
   if (choice.policy === HoldPolicy.Stand) return { rolls: [r1], final: r1 };
-  const r2 = roll(r1);
-  const r3 = roll(r2);
+
+  const held = holdMask(choice, r1); // latched — see doc comment
+  const reroll = (prev: Dice): Dice =>
+    prev.map((die, i) => (held[i] ? die : nextDie())) as unknown as Dice;
+
+  const r2 = reroll(r1);
+  const r3 = reroll(r2);
   return { rolls: [r1, r2, r3], final: r3 };
 }

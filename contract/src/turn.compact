@@ -1,0 +1,215 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// Turn-shaped circuit: three rolls of five dice with policy-decided holds between them.
+//
+// This is the real cost shape of the chosen game design -- one transaction per turn, the
+// player's up-to-three rolls resolved inside a single circuit against a pre-declared hold
+// policy (docs/architecture.md, GATE 0 Q2). It is measured, not deployed: scoring, seats,
+// pot and turn-order state are all absent, so its cost is a floor for `Table.takeTurn`,
+// not an estimate of it.
+//
+// ---------------------------------------------------------------------------------------
+// Holding saves nothing in-circuit
+// ---------------------------------------------------------------------------------------
+// "Re-derive only the un-held dice" is an off-chain optimisation with no in-circuit
+// analogue. A circuit is a fixed arithmetisation: which dice are held depends on roll 1's
+// values, which are not known at compile time, so the ladder for all five positions in
+// rolls 2 and 3 must exist in the circuit regardless. Holding is a SELECT between the kept
+// die and the freshly derived one -- the derivation still happens. A three-roll turn
+// therefore costs three full five-dice derivations plus three hashes plus the policy
+// logic, and `HoldPolicy.keepNone` costs exactly as much as `keepModalFace`.
+//
+// The same argument makes the policy argument free: all three policies are evaluated on
+// every proof and the enum only selects between the results.
+//
+// Freshly derived dice for roll i come from a hash with `rollIndex = i`, so a held die and
+// its replacement are drawn from disjoint entropy and re-rolling is not correlated with
+// what was held.
+//
+// ---------------------------------------------------------------------------------------
+// The hold mask is LATCHED, and that is forced by a compiler defect
+// ---------------------------------------------------------------------------------------
+// The obvious shape re-evaluates the policy on the merged dice before each re-roll. That
+// shape DOES NOT COMPILE: compactc 0.34.0 spins at 100% CPU past 200 s and 1.3 GB of RSS
+// on `--skip-zk`, and never finishes. See docs/bugs-found.md #1 -- compile time is
+// exponential in the nesting depth of a `const` that is reused inside a conditional, and
+// `modalFace`'s running-max chain nested two deep crosses the cliff. Measured on the same
+// machine: mask latched from roll 1 => 2.6 s; mask re-evaluated each roll => unbounded.
+//
+// So `holdMask` is computed ONCE, from roll 1, and both re-rolls use it. This is not a
+// concession -- it is what "pre-declared hold policy" already meant, and it is ordinary
+// Yahtzee (a player may keep their holds across both re-rolls). It also happens to be
+// cheaper. But it is a constraint the design did not choose freely, and if the defect is
+// fixed, re-evaluating per roll becomes available again.
+//
+// The cost consequence is small and worth stating: with the mask latched, `keepModalFace`
+// chases whatever the first roll's modal face was, even if rolls 2 and 3 hand it a better
+// one.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+include "dice-core";
+
+/**
+ * The hold policies measured here. Deliberately a small set -- this exists to measure the
+ * cost shape, not to be good Yahtzee strategy.
+ *
+ * * `keepNone` -- re-roll all five dice every time.
+ * * `keepModalFace` -- keep every die showing the most common face (ties to the higher
+ *   face, which scores more). The "chase a Yahtzee" policy.
+ * * `keepGe4` -- keep 4s, 5s and 6s. The "chase upper-section points" policy.
+ */
+export enum HoldPolicy {
+  keepNone,
+  keepModalFace,
+  keepGe4,
+}
+
+/** All three rolls of a turn, in order. `roll2` is the dice the turn ends with. */
+export struct TurnResult {
+  roll0: Dice,
+  roll1: Dice,
+  roll2: Dice,
+}
+
+export ledger lastTurn: TurnResult;
+
+/** The operator's roll seed, held off-chain until settlement. */
+witness rollSeed(): Bytes<32>;
+
+// ---------------------------------------------------------------------------------------
+// Hold policy
+// ---------------------------------------------------------------------------------------
+
+/** How many of the five dice show face `f`. */
+pure circuit faceCount(d: Vector<5, Uint<8>>, f: Uint<8>): Uint<8> {
+  return (((d[0] == f) as Uint<8>) +
+          ((d[1] == f) as Uint<8>) +
+          ((d[2] == f) as Uint<8>) +
+          ((d[3] == f) as Uint<8>) +
+          ((d[4] == f) as Uint<8>))
+         as Uint<8>;
+}
+
+/**
+ * The most common face. Ties break to the HIGHER face: with two 2s and two 5s, keeping the
+ * 5s is strictly better in the upper section, so `>=` rather than `>` in the running max.
+ *
+ * This running max is the expression that trips docs/bugs-found.md #1 when nested. Keep it
+ * one level deep -- i.e. only ever call it on freshly derived dice, never on merged dice.
+ */
+pure circuit modalFace(d: Vector<5, Uint<8>>): Uint<8> {
+  const c1 = faceCount(d, 1);
+  const c2 = faceCount(d, 2);
+  const c3 = faceCount(d, 3);
+  const c4 = faceCount(d, 4);
+  const c5 = faceCount(d, 5);
+  const c6 = faceCount(d, 6);
+  const w2 = c2 >= c1;
+  const f2 = w2 ? 2 as Uint<8> : 1 as Uint<8>;
+  const b2 = w2 ? c2 : c1;
+  const w3 = c3 >= b2;
+  const f3 = w3 ? 3 as Uint<8> : f2;
+  const b3 = w3 ? c3 : b2;
+  const w4 = c4 >= b3;
+  const f4 = w4 ? 4 as Uint<8> : f3;
+  const b4 = w4 ? c4 : b3;
+  const w5 = c5 >= b4;
+  const f5 = w5 ? 5 as Uint<8> : f4;
+  const b5 = w5 ? c5 : b4;
+  return c6 >= b5 ? 6 as Uint<8> : f5;
+}
+
+pure circuit holdOne(policy: HoldPolicy, die: Uint<8>, modal: Uint<8>): Boolean {
+  return policy == HoldPolicy.keepNone
+           ? false
+           : (policy == HoldPolicy.keepGe4 ? die >= 4 : die == modal);
+}
+
+/** Which dice the policy keeps. Called exactly once per turn, on roll 1. */
+pure circuit holdMask(policy: HoldPolicy, d: Vector<5, Uint<8>>): Vector<5, Boolean> {
+  const modal = modalFace(d);
+  return [holdOne(policy, d[0], modal),
+          holdOne(policy, d[1], modal),
+          holdOne(policy, d[2], modal),
+          holdOne(policy, d[3], modal),
+          holdOne(policy, d[4], modal),];
+}
+
+/** Per-position select: keep the held die, take the freshly derived one otherwise. */
+pure circuit mergeDice(
+               hold: Vector<5, Boolean>,
+               kept: Vector<5, Uint<8>>,
+               fresh: Vector<5, Uint<8>>,
+               ): Vector<5, Uint<8>> {
+  return [hold[0] ? kept[0] : fresh[0],
+          hold[1] ? kept[1] : fresh[1],
+          hold[2] ? kept[2] : fresh[2],
+          hold[3] ? kept[3] : fresh[3],
+          hold[4] ? kept[4] : fresh[4],];
+}
+
+// ---------------------------------------------------------------------------------------
+// The turn
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Three rolls, one latched hold mask. Pure, so mirrored 1:1 by `resolveTurnTs` in
+ * src/dice-mirror.ts and re-derivable by the settlement verifier from the revealed seed.
+ */
+export pure circuit resolveTurnPure(
+                      tableId: Bytes<32>,
+                      seed: Bytes<32>,
+                      playerEntropy: Bytes<32>,
+                      round: Uint<8>,
+                      policy: HoldPolicy,
+                      ): TurnResult {
+  const r0 = deriveDice(rollContext(tableId, seed, playerEntropy, round, 0));
+  const hold = holdMask(policy, r0);
+  const r1 = mergeDice(hold, r0, deriveDice(rollContext(tableId, seed, playerEntropy, round, 1)));
+  const r2 = mergeDice(hold, r1, deriveDice(rollContext(tableId, seed, playerEntropy, round, 2)));
+  return TurnResult { roll0: toDice(r0), roll1: toDice(r1), roll2: toDice(r2) };
+}
+
+/**
+ * The measured entry point: `resolveTurnPure` plus the ledger write that makes it impure,
+ * and so gives it a prover key. The seed comes from a witness, matching the live game where
+ * the operator's seed is secret until settlement.
+ *
+ * `disclose` publishes all three rolls: the dice are the public record of the turn and a
+ * spectator has to be able to see them. The seed itself is never written, and recovering it
+ * from 15 dice values means inverting `persistentHash` on a 32-byte preimage.
+ */
+export circuit resolveTurn(
+                 tableId: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 policy: HoldPolicy,
+                 ): TurnResult {
+  const result = resolveTurnPure(tableId, rollSeed(), playerEntropy, round, policy);
+  lastTurn = disclose(result);
+  return disclose(result);
+}
+
+/**
+ * Two rolls instead of three. Only here to pin the per-roll slope: with `rollDice` (one
+ * roll, dice.compact) and `resolveTurn` (three), three points decide whether cost is linear
+ * in rolls, which is what the 39-roll full-game-settlement stretch goal turns on.
+ */
+export circuit probeTwoRolls(
+                 tableId: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 policy: HoldPolicy,
+                 ): Dice {
+  const seed = rollSeed();
+  const r0 = deriveDice(rollContext(tableId, seed, playerEntropy, round, 0));
+  const hold = holdMask(policy, r0);
+  const r1 = mergeDice(hold, r0, deriveDice(rollContext(tableId, seed, playerEntropy, round, 1)));
+  const out = toDice(r1);
+  lastTurn = disclose(TurnResult { roll0: toDice(r0), roll1: out, roll2: out });
+  return disclose(out);
+}

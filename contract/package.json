@@ -1,0 +1,27 @@
+{
+  "name": "@yahtzee/contract",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "compact": "npm run compact:dice && npm run compact:turn",
+    "compact:dice": "compact compile src/dice.compact src/managed/dice",
+    "compact:turn": "compact compile src/turn.compact src/managed/turn",
+    "compact:fast": "compact compile --skip-zk src/dice.compact src/managed/dice && compact compile --skip-zk src/turn.compact src/managed/turn",
+    "format:compact": "compact format src/dice-core.compact src/dice.compact src/turn.compact",
+    "measure": "scripts/measure-build.sh build/measure && node scripts/zkir-stats.mjs build/measure/dice-zk build/measure/turn-zk",
+    "zkir-stats": "node scripts/zkir-stats.mjs src/managed/dice src/managed/turn",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"src/test/*.test.ts\"",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp -Rf src/managed dist/managed",
+    "ci": "npm run compact && npm run typecheck && npm run build && npm run test"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "0.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0"
+  }
+}

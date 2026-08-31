@@ -6,9 +6,10 @@ Any change here must land together with the matching circuit/api change.
 ## The game
 
 Standard Yahtzee, 2–6 players per table. 13 rounds; each turn you get up to three rolls of
-five dice. You pre-declare a **roll strategy** for the turn (how holds are decided between
-rolls — e.g. "keep fours", "chase the straight", "stand on the first roll"); the scoring
-**category is yours to choose after you see the final dice**. Upper-section bonus: +35 when
+five dice. You pre-declare a **roll strategy** for the turn (e.g. "keep fours", "chase the
+straight", "stand on the first roll"); it decides your holds **once, on your first roll**,
+and those holds stand for both rerolls. The scoring **category is yours to choose after you
+see the final dice**. Upper-section bonus: +35 when
 your six upper categories total 63+. Extra Yahtzees: +100 each while your Yahtzee box holds
 50, with official joker placement rules.
 
