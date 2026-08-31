@@ -10,6 +10,9 @@ export default tseslint.config(
       '**/.next/**',
       'contract/src/managed/**',
       'contract/build/**',
+      // generated compactc output anywhere (probe workspaces compile throwaway contracts)
+      '**/managed/**',
+      'probes/*/discovery/**',
     ],
   },
   js.configs.recommended,

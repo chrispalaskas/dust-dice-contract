@@ -57,7 +57,7 @@ describe('rawScore', () => {
 
 describe('applyScore + totals', () => {
   it('rejects double-filling a category', () => {
-    let card = applyScore(emptyScorecard(), Category.Chance, d(1, 1, 1, 1, 2));
+    const card = applyScore(emptyScorecard(), Category.Chance, d(1, 1, 1, 1, 2));
     expect(() => applyScore(card, Category.Chance, d(2, 2, 2, 2, 2))).toThrow(RuleViolation);
   });
 
