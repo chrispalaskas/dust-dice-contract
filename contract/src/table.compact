@@ -9,8 +9,9 @@
 // hardened entropy scheme, structural authorisation, WaitPlayer/WaitResolve sub-state,
 // claimTimeout vs abortTable, native unshielded NIGHT custody, and the witness-checked rake.
 //
-// Six exported circuits -- join, takeTurn, resolveTurn, settle, claimTimeout, abortTable --
-// against a deploy ceiling of ~11.
+// Eight exported circuits -- join, takeTurn, resolveRoll1/2/3, settle, claimTimeout, abortTable
+// -- against a deploy ceiling of ~11. The operator's move is three transactions rather than one
+// because the one-transaction version cannot be proved on this platform; see decision 9.
 //
 // Building blocks are `include`d verbatim and NOT reimplemented:
 //   dice-core.compact     byte-threshold ladder, roll derivation      (measured)
@@ -29,7 +30,7 @@
 //    write frequency, so no circuit rewrites bytes it did not change:
 //      seatIdentity  written once, at join  (payout address + entropy-key commitment)
 //      seatCard      written by takeTurn    (the 13 packed scores + filled bitmap)
-//      seatProgress  written by takeTurn / resolveTurn / claimTimeout
+//      seatProgress  written by takeTurn / resolveRoll3 / claimTimeout
 //    Scores are `Uint<8>` and `filled` is a `Vector<13, Boolean>` -- the packing
 //    scoring-core.compact already uses, because a circuit has no `null`.
 //
@@ -43,8 +44,8 @@
 //    through the witness-the-answer trick; the two count-based masks are computed in-circuit.
 //    They were expected to risk docs/bugs-found.md #1 and do not: the whole set compiles in
 //    ~1 s at 1,542 instructions for the dice half. Measurements in docs/table-circuit.md.
-//    The reason they are safe is structural and worth stating: `resolveTurn` DERIVES dice and
-//    `takeTurn` SCORES them, so no merged die is ever read by `applyScore`. Merging the two
+//    The reason they are safe is structural and worth stating: the resolve circuits DERIVE dice
+//    and `takeTurn` SCORES them, so no merged die is ever read by `applyScore`. Merging the two
 //    into one circuit is what previously failed to compile at all.
 //
 // 3. THE ROLL HASH REACHES THE SPEC'S INPUT SET ONE HASH EARLIER. docs/table-contract.md
@@ -87,14 +88,68 @@
 //
 // 7. ALL-FORFEITED SETTLES AS A REFUND, NOT AS A WIN. See `claimTimeout` and `abortTable`.
 //
-// 8. EVERY EXPORTED CIRCUIT CARRIES FALLIBLE-PHASE PADDING. `Padding` is 64 x `Bytes<32>`
-//    written to the ledger after `kernel.checkpoint()` -- the one lever that grew a
+// 8. EVERY EXPORTED CIRCUIT CARRIES FALLIBLE-PHASE PADDING, AND IT IS A CONSTANT.
+//    2 KB written to the ledger after `kernel.checkpoint()` -- the one lever that grew a
 //    transaction past the ~8 KB `OutsideTimeToDismiss` floor in Gate 0 without growing its
-//    dismiss cost (docs/gate0-report.md, probes/gate0/src/pot.compact). Applied to all six
+//    dismiss cost (docs/gate0-report.md, probes/gate0/src/pot.compact). Applied to all eight
 //    circuits and not only the small ones: Gate 0's padded transactions all landed at 9.0-10.2
 //    KB regardless of circuit size, because a PLONK proof is a constant-size object and the
-//    transcript is not what dominates. `paddingWords()` is the single knob; final sizing is
-//    tuned against the real node in the E2E run.
+//    transcript is not what dominates.
+//
+//    THE PADDING IS A COMPILE-TIME CONSTANT, NOT A CIRCUIT ARGUMENT, and that change is what
+//    makes decision 9's split fit. Gate 0's `pot.compact` took its padding as a
+//    `Vector<64, Bytes<32>>` parameter, and docs/table-circuit.md measured the price of that:
+//    5 instructions and TWO PUBLIC INPUTS per 32-byte word, which was enough to push five of
+//    the six original circuits up one or two PLONK steps on its own. A constant costs neither.
+//    The compiler emits it as a literal `StateValue` push inside the ledger op, so the 2,048
+//    bytes still land in the transcript -- and therefore still earn the dismiss-time allowance
+//    -- while the proving domain barely moves. Measured, same contract, same 2 KB of padding:
+//
+//      circuit         as an argument   as a constant
+//      join                     k=15            k=14
+//      takeTurn                 k=15            k=14
+//      settle                   k=15            k=13
+//      claimTimeout             k=15            k=12
+//      abortTable               k=15            k=12
+//      resolveRoll1/2/3         k=16            k=15   <- the difference between shipping and not
+//
+//    With an argument the split circuits are k=16 and the contract is undeployable; the only
+//    argument-padding size that fits is 16 words (512 bytes), which does not clear the
+//    admission floor. So the constant is not a tidiness preference, it is the thing that makes
+//    both bounds satisfiable at once. The width (2,048) is the single knob and appears in two
+//    places, `padStore`'s type and `paddingConstant()`; final sizing is checked against the
+//    real node in the E2E run.
+//
+// 9. THE OPERATOR'S MOVE IS THREE TRANSACTIONS, ONE PER ROLL, BECAUSE ONE IS UNPROVABLE.
+//    The single `resolveTurn` this file originally carried compiles to a PLONK domain of
+//    **k=17**. The proof server bundles `bls_midnight_2p9` .. `2p15` and has no route to
+//    `srs.midnight.network` (docs/gate0-report.md), so k=16 and k=17 are both unreachable and
+//    the circuit could never produce a transaction. This was settled offline, before any
+//    proving attempt, by reading `k` straight out of the compiled ZKIR with
+//    `@midnight-ntwrk/zkir-v2`'s `Zkir.fromJson(...).getK()` -- see docs/e2e-report.md, which
+//    also records the measured k of every circuit in the project.
+//
+//    The cut is ONE ROLL PER TRANSACTION, and it is forced rather than chosen: the measured
+//    corpus already says one roll is k=15 (`dice/rollDice`) and two rolls is k=16
+//    (`turn/probeTwoRolls`), so a two-way split covering rolls 1+2 would not have fitted
+//    either. `resolveRoll1` latches the mixed entropy and the hold mask, `resolveRoll2`
+//    rerolls once, `resolveRoll3` rerolls again and is the only step that writes seat state,
+//    advances `gameDigest` and hands the turn back.
+//
+//    WHAT DOES NOT CHANGE: the dice. Same three roll hashes over the same `RollContext`s in
+//    the same order under the same latched mask, so a turn's final dice are bit-for-bit what
+//    the one-circuit version produced. `gameDigest` still absorbs exactly one event per turn,
+//    with the same fields. The TypeScript mirrors and the settlement verifier are untouched by
+//    the split and do not know about it.
+//
+//    WHAT DOES CHANGE, and is worth saying plainly: the intermediate hands are now public --
+//    rolls 1 and 2 land on chain as their own transactions instead of staying inside one
+//    proof. Nothing exploitable follows, because the only player choice in a turn (the hold
+//    policy) is made in `takeTurn`, before any roll exists, and the mask is latched from
+//    roll 1; by the time roll 1 is public every remaining die is already determined. It is
+//    strictly more legible -- a UI can animate the three rolls from chain data alone. The real
+//    cost is throughput: a turn is 4 transactions instead of 2, and at the measured ~21 s per
+//    transaction that is what sets the length of a game.
 //
 // -------------------------------------------------------------------------------------------
 // A residual in the randomness design that docs/table-contract.md does not name
@@ -279,6 +334,47 @@ export ledger pendingPolicy: Uint<8>;
 
 export ledger pendingParam: Uint<8>;
 
+/**
+ * Which of the turn's three rolls comes next: 0, 1 or 2. See decision 9.
+ *
+ * Only meaningful while `turnState == waitResolve`. `takeTurn` leaves it at 0 (nothing resets
+ * it, because `resolveRoll3` returns it to 0 as it hands the turn back), and each of the three
+ * resolve circuits asserts the exact value it is the successor of, so the operator cannot skip,
+ * repeat or reorder a roll.
+ */
+export ledger rollStep: Uint<8>;
+
+/**
+ * `mixEntropy(pendingEntropy, gameDigest)`, latched by `resolveRoll1`.
+ *
+ * Carried in the ledger rather than recomputed by steps 2 and 3 because recomputing it is a
+ * `persistentHash` per step and the whole point of the split is to fit under k=15. It is not a
+ * new disclosure: both its inputs were already public, so anyone could compute it.
+ */
+export ledger pendingMixed: Bytes<32>;
+
+/** The mask latched from roll 1 by `resolveRoll1`, applied by steps 2 and 3. */
+export ledger pendingHold: HoldMask;
+
+/**
+ * The turn's dice as of the most recent resolved roll.
+ *
+ * Public, and deliberately so: with the split, rolls 1 and 2 land on chain as their own
+ * transactions, so the intermediate hands are visible where previously only the final hand was.
+ * That reveals nothing exploitable -- the policy is declared in `takeTurn`, BEFORE any roll, and
+ * the mask is latched from roll 1, so no player choice remains once `resolveRoll1` has run --
+ * and it is what lets a UI animate the three rolls from chain data alone.
+ *
+ * Defaults to all-zero and is never read before `resolveRoll1` writes it: `mergeHeld` only
+ * selects between dice, so unlike `SeatProgress.dice` there is no `face - 1` to underflow.
+ */
+export ledger pendingRoll: Dice;
+
+/** The five latched hold bits. A struct because a ledger cell holds one named type. */
+export struct HoldMask {
+  bits: Vector<5, Boolean>,
+}
+
 /** Written once per seat, at `join`. */
 export struct SeatIdentity {
   /** Where this seat is paid. Recorded at join, so no circuit ever learns its caller. */
@@ -325,16 +421,17 @@ export ledger seatProgress: Map<Uint<8>, SeatProgress>;
 export ledger joinedKeys: Set<Bytes<32>>;
 
 /** Sink for the transaction padding, so the compiler cannot drop it. See decision 8. */
-export ledger padStore: Padding;
+export ledger padStore: Bytes<2048>;
 
-/** Number of `Bytes<32>` words of padding. THE knob for transaction-size tuning. */
-pure circuit paddingWords(): Uint<8> {
-  return 64;
-}
-
-/** `paddingWords()` x 32 bytes of public padding. Keep the two in step by hand. */
-export struct Padding {
-  words: Vector<64, Bytes<32>>,
+/**
+ * The 2 KB of transaction padding, as a COMPILE-TIME CONSTANT. See decision 8.
+ *
+ * The width appears twice -- here and in `padStore`'s type -- and language 0.26 has no way to
+ * write it once, because `pad`'s length argument must be a literal. Keep the two in step by
+ * hand; a mismatch is a compile error, not a silent shrink.
+ */
+pure circuit paddingConstant(): Bytes<2048> {
+  return pad(2048, "yahtzee:v1:pad");
 }
 
 // ===========================================================================================
@@ -581,10 +678,16 @@ circuit stampTime(now: Uint<64>): [] {
  * hash: hashing 2 KB pushed the circuit to k=17 in Gate 0 and the proof server has no SRS for
  * it. Transaction bytes and circuit size are independent levers and this one must move only
  * the first.
+ *
+ * The padding is a CONSTANT and not a caller-supplied argument. See decision 8: an argument
+ * costs two public inputs per 32-byte word and is what pushed the resolve circuits over the
+ * SRS ceiling; a constant is compiled straight into the ledger op as a literal `StateValue`
+ * push, so it lands in the transcript -- and therefore in the transaction's byte count -- while
+ * contributing essentially nothing to the proving domain.
  */
-circuit padTransaction(p: Padding): [] {
+circuit padTransaction(): [] {
   kernel.checkpoint();
-  padStore = disclose(p);
+  padStore = paddingConstant();
 }
 
 // ===========================================================================================
@@ -667,7 +770,7 @@ constructor(id: Bytes<32>,
  * The last join flips the table to `playing`, zeroes the cursor and stamps `lastActionAt`, so
  * seat 0 gets a full turn timeout to make the first move.
  */
-export circuit join(payoutTo: UserAddress, now: Uint<64>, p: Padding): Uint<8> {
+export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   assert(phase == Phase.filling, "join: table is not filling");
   assert(seatCount < seatLimit, "join: table is full");
 
@@ -701,7 +804,7 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>, p: Padding): Uint<8> {
   }
 
   stampTime(t);
-  padTransaction(p);
+  padTransaction();
   return seat;
 }
 
@@ -736,7 +839,6 @@ export circuit takeTurn(
                  param: Uint<8>,
                  category: Uint<8>,
                  now: Uint<64>,
-                 p: Padding,
                  ): [] {
   assert(phase == Phase.playing, "takeTurn: table is not playing");
   assert(turnState == TurnState.waitPlayer, "takeTurn: waiting on the operator to resolve");
@@ -811,6 +913,11 @@ export circuit takeTurn(
     pendingEntropy = e;
     pendingPolicy = pol;
     pendingParam = par;
+    // `resolveRoll3` already returns the step counter to 0 as it hands the turn back, and
+    // nothing else can leave `waitResolve`, so this is an invariant restated rather than a
+    // reset that is ever needed. Written anyway: it costs one cell and it means the three
+    // resolve steps' sequencing cannot be broken by some future path into `waitResolve`.
+    rollStep = 0;
     turnState = TurnState.waitResolve;
   } else {
     // Round 13: the seat has just taken its thirteenth category and is done. There is no roll
@@ -823,33 +930,131 @@ export circuit takeTurn(
   }
 
   stampTime(t);
-  padTransaction(p);
+  padTransaction();
 }
 
 // ===========================================================================================
-// resolveTurn
+// resolveRoll1 / resolveRoll2 / resolveRoll3 -- the operator's move, in three transactions
 // ===========================================================================================
+//
+// This is the one place ZK genuinely earns its keep in the base game. The seed stays a private
+// witness -- each circuit proves `H(seed) == seedCommitment` without revealing `seed` -- so the
+// dice are proven correct against a commitment made before any player existed, while the game
+// is still live and the player still must not know the seed.
+//
+// Authorisation is knowledge of the seed and nothing else, in all three steps. There is no
+// operator address anywhere in this contract. Re-checking the seed in every step is not
+// redundant: each step derives a roll from it, so a step that skipped the check would accept
+// dice derived from a different preimage.
+//
+// The roll inputs are `H(tableId, seed, mixEntropy(entropy, gameDigest), round, rollIndex)`, and
+// the digest folded in is the one from BEFORE this turn's resolution -- which is the digest a
+// replaying verifier has at that point in the log. `resolveRoll1` latches it into
+// `pendingMixed` so all three rolls hash against the same value, and `resolveRoll3` is the only
+// step that advances `gameDigest`. Getting that ordering wrong is the easiest way to make an
+// unverifiable game, so the mirror pins it too.
+//
+// WHY THREE TRANSACTIONS AND NOT ONE: see decision 9 in the file header. The one-circuit version
+// is still in `policy-core.compact` as `resolveDiceChecked`, is still cross-checked against
+// these three by the tests, and is unprovable on this platform.
 
 /**
- * The operator's move: derive this turn's three rolls from the committed seed and publish the
- * final dice.
+ * Step 1 of 3: derive roll 1, verify the witnessed modal face against it, latch the mask.
  *
- * This is the one place ZK genuinely earns its keep in the base game. The seed stays a private
- * witness -- the circuit proves `H(seed) == seedCommitment` without revealing `seed` -- so the
- * dice are proven correct against a commitment made before any player existed, while the game
- * is still live and the player still must not know the seed.
- *
- * Authorisation is knowledge of the seed and nothing else. There is no operator address
- * anywhere in this contract.
- *
- * The roll inputs are `H(tableId, seed, mixEntropy(entropy, gameDigest), round, rollIndex)`,
- * and the digest folded in is the one BEFORE this call's update -- which is the digest a
- * replaying verifier has at that point in the log. Getting that ordering wrong is the easiest
- * way to make an unverifiable game, so the mirror pins it too.
+ * Also the step that latches `pendingMixed`, so steps 2 and 3 need neither `pendingEntropy` nor
+ * a second `mixEntropy` hash. Nothing about the turn is decided here that was not already fixed
+ * by `takeTurn`: the policy and its parameter are ledger state before this runs, so latching the
+ * mask is a computation, not a choice.
  */
-export circuit resolveTurn(now: Uint<64>, p: Padding): Dice {
-  assert(phase == Phase.playing, "resolveTurn: table is not playing");
-  assert(turnState == TurnState.waitResolve, "resolveTurn: waiting on the player, not the operator");
+export circuit resolveRoll1(now: Uint<64>): Dice {
+  assert(phase == Phase.playing, "resolveRoll1: table is not playing");
+  assert(turnState == TurnState.waitResolve,
+         "resolveRoll1: waiting on the player, not the operator"
+         );
+  assert(rollStep == 0, "resolveRoll1: this turn's first roll is already resolved");
+
+  const t = disclose(now);
+  const r = round;
+
+  const seed = rollSeed();
+  assert(disclose(seedCommitmentOf(seed) == seedCommitment),
+         "resolveRoll1: seed does not open the table's seed commitment"
+         );
+
+  const mixed = mixEntropy(pendingEntropy, gameDigest);
+  const modal = modalFaceHint(tableId, mixed, r);
+  const first = firstRollChecked(tableId, seed, mixed, r, pendingPolicy, pendingParam, modal);
+
+  // `mixed` needs NO `disclose`, and the asymmetry is the point: it is a hash of `pendingEntropy`
+  // and `gameDigest`, both public ledger reads, so anyone could already compute it -- writing it
+  // down discloses nothing. The roll and the mask below DO need one, because they depend on
+  // `seed`. Checked by removing each and recompiling, not by inspection.
+  pendingMixed = mixed;
+  pendingHold = HoldMask { bits: disclose(first.hold) };
+  const dice = disclose(toDice(first.dice));
+  pendingRoll = dice;
+  rollStep = 1;
+
+  stampTime(t);
+  padTransaction();
+  return dice;
+}
+
+/**
+ * Step 2 of 3: reroll every die the latched mask does not hold, from roll hash 1.
+ *
+ * Writes no seat state and touches no digest -- the turn is still in progress. A table stalled
+ * here is stalled in `waitResolve` exactly as it would be stalled before step 1, so `abortTable`
+ * covers an operator that dies mid-turn without any extra case.
+ */
+export circuit resolveRoll2(now: Uint<64>): Dice {
+  assert(phase == Phase.playing, "resolveRoll2: table is not playing");
+  assert(turnState == TurnState.waitResolve,
+         "resolveRoll2: waiting on the player, not the operator"
+         );
+  assert(rollStep == 1, "resolveRoll2: roll 1 has not been resolved yet");
+
+  const t = disclose(now);
+  const seed = rollSeed();
+  assert(disclose(seedCommitmentOf(seed) == seedCommitment),
+         "resolveRoll2: seed does not open the table's seed commitment"
+         );
+
+  const dice = disclose(toDice(rerollUnderMask(
+                                 tableId,
+                                 seed,
+                                 pendingMixed,
+                                 round,
+                                 1,
+                                 pendingHold.bits,
+                                 fromDice(pendingRoll)
+                                 )
+                               ));
+  pendingRoll = dice;
+  rollStep = 2;
+
+  stampTime(t);
+  padTransaction();
+  return dice;
+}
+
+/**
+ * Step 3 of 3: the last reroll, the turn's final dice, the digest, and the turn hand-back.
+ *
+ * This is the step that makes the turn real: it writes the dice the next `takeTurn` will score,
+ * folds the turn into `gameDigest` and advances the cursor. Steps 1 and 2 are pure preparation,
+ * so a turn that stops after either of them has changed nothing a seat can be scored on.
+ *
+ * `resolveDigest` hashes the FINAL dice and the turn's declared policy, exactly as the
+ * one-transaction version did -- the split is invisible in the digest chain, which is why a
+ * verifier replaying the log needs to know nothing about it.
+ */
+export circuit resolveRoll3(now: Uint<64>): Dice {
+  assert(phase == Phase.playing, "resolveRoll3: table is not playing");
+  assert(turnState == TurnState.waitResolve,
+         "resolveRoll3: waiting on the player, not the operator"
+         );
+  assert(rollStep == 2, "resolveRoll3: roll 2 has not been resolved yet");
 
   const t = disclose(now);
   const seat = currentSeat;
@@ -857,19 +1062,19 @@ export circuit resolveTurn(now: Uint<64>, p: Padding): Dice {
 
   const seed = rollSeed();
   assert(disclose(seedCommitmentOf(seed) == seedCommitment),
-         "resolveTurn: seed does not open the table's seed commitment"
+         "resolveRoll3: seed does not open the table's seed commitment"
          );
 
-  const mixed = mixEntropy(pendingEntropy, gameDigest);
-  const modal = modalFaceHint(tableId, mixed, r);
-
-  // `resolveDiceChecked` derives roll 1 once, asserts the witnessed modal face is canonical
-  // when the policy is KeepModal, latches the hold mask from roll 1 and rerolls twice.
-  const d = toDice(resolveDiceChecked(tableId, seed, mixed, r, pendingPolicy, pendingParam, modal));
-
-  // The dice are witness-derived (they depend on `seed`), and they are the public record of the
-  // turn, so this is the one disclosure this circuit makes.
-  const dice = disclose(d);
+  const dice = disclose(toDice(rerollUnderMask(
+                                 tableId,
+                                 seed,
+                                 pendingMixed,
+                                 r,
+                                 2,
+                                 pendingHold.bits,
+                                 fromDice(pendingRoll)
+                                 )
+                               ));
 
   const prog = seatProgress.lookup(seat);
   seatProgress.insert(
@@ -884,9 +1089,12 @@ export circuit resolveTurn(now: Uint<64>, p: Padding): Dice {
   gameDigest =
     resolveDigest(gameDigest, turnIndex, seat, r, pendingPolicy, pendingParam, pendingEntropy, dice);
 
+  pendingRoll = dice;
+  rollStep = 0;
+
   advanceTurn();
   stampTime(t);
-  padTransaction(p);
+  padTransaction();
   return dice;
 }
 
@@ -913,7 +1121,7 @@ export circuit resolveTurn(now: Uint<64>, p: Padding): Dice {
  * which has exactly one solution, so the caller cannot inflate the rake. The remainder goes to
  * the winner.
  */
-export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>, p: Padding): Uint<8> {
+export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
   assert(phase == Phase.playing, "settle: table is not playing");
   assert(round >= roundCount(), "settle: the game is not finished");
 
@@ -954,7 +1162,7 @@ export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>, p: Padding): Ui
   winnerSeatIndex = winner;
   phase = Phase.settled;
 
-  padTransaction(p);
+  padTransaction();
   return winner;
 }
 
@@ -985,7 +1193,7 @@ export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>, p: Padding): Ui
  * anything, it also walked away. Paying it the pot would make timing out profitable for
  * whoever times out last.
  */
-export circuit claimTimeout(now: Uint<64>, p: Padding): Uint<8> {
+export circuit claimTimeout(now: Uint<64>): Uint<8> {
   assert(phase == Phase.playing, "claimTimeout: table is not playing");
   assert(turnState == TurnState.waitPlayer,
          "claimTimeout: the table is waiting on the operator, not on a player"
@@ -1018,7 +1226,7 @@ export circuit claimTimeout(now: Uint<64>, p: Padding): Uint<8> {
   }
 
   stampTime(t);
-  padTransaction(p);
+  padTransaction();
   return remaining;
 }
 
@@ -1047,7 +1255,7 @@ export circuit claimTimeout(now: Uint<64>, p: Padding): Uint<8> {
  * address burns the stake; `seatCount` is public ledger state, so the condition is public and
  * the transcript is deterministic.
  */
-export circuit abortTable(now: Uint<64>, p: Padding): Uint<64> {
+export circuit abortTable(now: Uint<64>): Uint<64> {
   const stalled = blockTimeGt((lastActionAt + tableTimeoutSecs) as Uint<64>);
   const fillingStalled = phase == Phase.filling && seatCount > 0 && stalled;
   const operatorStalled = phase == Phase.playing && turnState == TurnState.waitResolve && stalled;
@@ -1074,7 +1282,7 @@ export circuit abortTable(now: Uint<64>, p: Padding): Uint<64> {
   phase = Phase.aborted;
 
   stampTime(t);
-  padTransaction(p);
+  padTransaction();
   return refunded;
 }
 

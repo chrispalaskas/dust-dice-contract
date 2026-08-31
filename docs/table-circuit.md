@@ -10,22 +10,33 @@ Toolchain, unchanged from [gate0-report.md](gate0-report.md): Compact CLI `0.5.1
 
 ---
 
+> **This document was written before the E2E run and is superseded in two places by
+> [e2e-report.md](e2e-report.md).** The single `resolveTurn` measured throughout §3 is
+> **unprovable on this platform** (k=17 against a proof-server ceiling of k=15) and has been
+> split into `resolveRoll1/2/3`; and the transaction padding is now a compile-time constant
+> rather than a circuit argument, which changes every prover-key figure below. §3.4 carries the
+> as-shipped numbers. Everything else here — the compile-time findings, the `takeTurn`/resolve
+> separation, the padding _mechanism_ — stands unchanged and is what made the split possible.
+
 ## 1. Exported circuits
 
-Six, against a deploy ceiling of ~11 measured upstream. **The deploy fits with five circuits to
-spare.**
+Eight, against a deploy ceiling of ~11 measured upstream. **The deploy fits with three circuits
+to spare.**
 
 | circuit        | caller   | does                                                                                     |
 | -------------- | -------- | ---------------------------------------------------------------------------------------- |
 | `join`         | player   | stake `tier` in, register `C_s = H(sk_s)`, take the next seat; the last join starts play |
 | `takeTurn`     | player   | score the previous round's dice; declare this round's forced entropy and hold policy     |
-| `resolveTurn`  | operator | witness the seed, derive three rolls under the latched mask, publish the dice            |
+| `resolveRoll1` | operator | witness the seed, derive roll 1, check the modal face, latch the mask and mixed entropy  |
+| `resolveRoll2` | operator | witness the seed, reroll once under the latched mask                                     |
+| `resolveRoll3` | operator | witness the seed, reroll again, publish the dice, advance the digest and the turn        |
 | `settle`       | anyone   | reveal the seed, pick the winner by tie-break, pay winner `pot − q` and rake `q`         |
 | `claimTimeout` | anyone   | forfeit a player who missed their deadline, and move the game on                         |
 | `abortTable`   | anyone   | refund `tier` to every seated player; nothing to the rake                                |
 
 Helper circuits (`advanceTurn`, `stampTime`, `padTransaction`, `forfeitFlags`) are **not**
-exported and are inlined — the compiler emits exactly six `.zkir` files and six key pairs, so
+exported and are inlined — the compiler emits exactly one `.zkir` file and one key pair per
+exported circuit, so
 they cost nothing against the ceiling. Neither do the `pure` circuits from `dice-core`,
 `scoring-core` and `policy-core`: a pure circuit produces no prover key, no verifier key and no
 zkir at all.
@@ -155,6 +166,43 @@ the sixth.** Two consequences for the E2E run, and they point opposite ways:
 - If **`resolveTurn`** is unprovable, padding will not save it. Its domain is set by three passes
   of the rejection ladder and six hashes, and shrinking the padding to an eighth moves it by
   0.03 %. The only lever left there is splitting the rolls across two transactions.
+
+**Both consequences fired.** `resolveTurn` was indeed unprovable, and padding indeed did not save
+it. The one thing this section did not anticipate is that the padding's cost was almost entirely
+an artefact of it being a **circuit argument** — see §3.4.
+
+### 3.4 As shipped, after the E2E run
+
+Two changes, both forced, both measured. See [e2e-report.md](e2e-report.md) for how they were
+arrived at and `table.compact` decisions 8 and 9 for why.
+
+1. **The operator's move is three circuits, one roll each.** `resolveTurn` compiles to k=17; the
+   proof server bundles k=9..15 only.
+2. **The padding is a compile-time constant, not a `Padding` argument.** `pad(2048, ...)` written
+   to the ledger after `kernel.checkpoint()`, which the compiler emits as a literal `StateValue`
+   push inside the ledger op. The bytes still land in the transcript — so they still earn the
+   dismiss-time allowance — but there are no public inputs and no per-word instructions.
+
+| contract | circuit        | instructions | inputs | prover key | verifier key |   k |
+| -------- | -------------- | -----------: | -----: | ---------: | -----------: | --: |
+| table    | `join`         |          783 |      3 |  5,209,319 |        2,119 |  14 |
+| table    | `takeTurn`     |        2,106 |      6 |  5,215,077 |        2,119 |  14 |
+| table    | `resolveRoll1` |        1,236 |      1 |  9,987,807 |        2,119 |  15 |
+| table    | `resolveRoll2` |          877 |      1 |  9,976,727 |        2,119 |  15 |
+| table    | `resolveRoll3` |        1,768 |      1 |  9,990,255 |        2,119 |  15 |
+| table    | `settle`       |        1,336 |      4 |  2,824,864 |        2,119 |  13 |
+| table    | `claimTimeout` |        1,360 |      1 |    575,520 |        1,351 |  11 |
+| table    | `abortTable`   |        1,996 |      1 |  1,079,285 |        1,351 |  12 |
+| lobby    | `openTableAt`  |          233 |      3 |  2,821,203 |        2,119 |  13 |
+| lobby    | `tableFilled`  |          274 |      1 |  2,820,987 |        2,119 |  13 |
+
+Read the `inputs` column against §3's: **129 public inputs became 1**. That is the whole of the
+padding change, and it is worth one to three PLONK steps per circuit — `claimTimeout`'s prover
+key fell from 8.46 MB to 0.58 MB, a factor of fifteen, for a contract that does exactly the same
+thing and produces the same size of transaction.
+
+The three resolve circuits sit at **k=15, the ceiling**, with no headroom at all. Any future
+circuit work on the resolve path has to be checked with `npm run k -w cli` before it is trusted.
 
 ---
 

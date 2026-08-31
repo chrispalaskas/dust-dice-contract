@@ -68,7 +68,6 @@ import {
   ledger as tableLedger,
   type Dice as TableDice,
   type Ledger as TableLedgerType,
-  type Padding as TablePadding,
   type UserAddress,
 } from '../managed/table/contract/index.js';
 import {
@@ -76,7 +75,6 @@ import {
   ledger as lobbyLedger,
   type ContractAddress as LobbyContractAddress,
   type Ledger as LobbyLedgerType,
-  type LobbyPadding,
 } from '../managed/lobby/contract/index.js';
 import { diceWitnesses, type DicePrivateState } from '../witnesses.ts';
 import {
@@ -414,21 +412,6 @@ export class TakeTurnSimulator extends SimpleSimulator<DicePrivateState> {
 // table.compact
 // ---------------------------------------------------------------------------------------
 
-/** The padding argument every exported circuit takes. See table.compact, decision 8. */
-export const PADDING_WORDS = 64;
-
-/**
- * A zero-filled `Padding`.
- *
- * The bytes are never read by any circuit -- the struct exists only to grow the transaction
- * past the node's admission floor -- so their value is irrelevant to correctness and zeros
- * keep the tests readable. On devnet the operator can put anything here; the size is what
- * matters, and the size is fixed by the type.
- */
-export function zeroPadding(): TablePadding {
-  return { words: Array.from({ length: PADDING_WORDS }, () => new Uint8Array(32)) };
-}
-
 /** A `UserAddress` from a single repeated byte -- distinct, readable test addresses. */
 export function userAddress(fill: number): UserAddress {
   return { bytes: new Uint8Array(32).fill(fill) };
@@ -505,9 +488,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
 
   join(payoutTo: UserAddress, now: number, blockTime = now): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('join', (ctx) =>
-      this.table.impureCircuits.join(ctx, payoutTo, BigInt(now), zeroPadding()),
-    );
+    return this.run('join', (ctx) => this.table.impureCircuits.join(ctx, payoutTo, BigInt(now)));
   }
 
   takeTurn(
@@ -527,48 +508,75 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         BigInt(param),
         BigInt(category),
         BigInt(now),
-        zeroPadding(),
       ),
     );
   }
 
-  resolveTurn(now: number, blockTime = now): Promise<TableDice> {
+  /**
+   * One roll of the operator's move. The three steps must run in order; each asserts the
+   * `rollStep` it is the successor of, so a skipped or repeated step is refused on chain.
+   */
+  resolveRoll1(now: number, blockTime = now): Promise<TableDice> {
     this.blockTime = blockTime;
-    return this.run('resolveTurn', (ctx) =>
-      this.table.impureCircuits.resolveTurn(ctx, BigInt(now), zeroPadding()),
+    return this.run('resolveRoll1', (ctx) =>
+      this.table.impureCircuits.resolveRoll1(ctx, BigInt(now)),
     );
+  }
+
+  resolveRoll2(now: number, blockTime = now): Promise<TableDice> {
+    this.blockTime = blockTime;
+    return this.run('resolveRoll2', (ctx) =>
+      this.table.impureCircuits.resolveRoll2(ctx, BigInt(now)),
+    );
+  }
+
+  resolveRoll3(now: number, blockTime = now): Promise<TableDice> {
+    this.blockTime = blockTime;
+    return this.run('resolveRoll3', (ctx) =>
+      this.table.impureCircuits.resolveRoll3(ctx, BigInt(now)),
+    );
+  }
+
+  /**
+   * The operator's whole move: all three rolls, in order, returning the turn's final dice.
+   *
+   * A convenience over the three circuits and NOT a circuit itself -- on chain these are three
+   * separate transactions (table.compact, decision 9). Kept because almost every test cares
+   * about the turn rather than about the split, and because a test that reads as
+   * `resolveTurn()` is a test that still describes the game.
+   *
+   * `now` is the declared time for all three steps. `BaseSimulator.run` commits state only on
+   * success, so a step that throws leaves the table exactly where the previous step left it --
+   * which is what lets the rejection tests below assert on step 1 without cleanup.
+   */
+  async resolveTurn(now: number, blockTime = now): Promise<TableDice> {
+    await this.resolveRoll1(now, blockTime);
+    await this.resolveRoll2(now, blockTime);
+    return await this.resolveRoll3(now, blockTime);
   }
 
   /** `settle` needs no time: no deadline is involved and the outcome is already determined. */
   settle(seed: Uint8Array, q: bigint, r: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('settle', (ctx) =>
-      this.table.impureCircuits.settle(ctx, seed, q, r, zeroPadding()),
-    );
+    return this.run('settle', (ctx) => this.table.impureCircuits.settle(ctx, seed, q, r));
   }
 
   claimTimeout(now: number, blockTime = now): Promise<bigint> {
     this.blockTime = blockTime;
     return this.run('claimTimeout', (ctx) =>
-      this.table.impureCircuits.claimTimeout(ctx, BigInt(now), zeroPadding()),
+      this.table.impureCircuits.claimTimeout(ctx, BigInt(now)),
     );
   }
 
   abortTable(now: number, blockTime = now): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('abortTable', (ctx) =>
-      this.table.impureCircuits.abortTable(ctx, BigInt(now), zeroPadding()),
-    );
+    return this.run('abortTable', (ctx) => this.table.impureCircuits.abortTable(ctx, BigInt(now)));
   }
 }
 
 // ---------------------------------------------------------------------------------------
 // lobby.compact
 // ---------------------------------------------------------------------------------------
-
-export function zeroLobbyPadding(): LobbyPadding {
-  return { words: Array.from({ length: PADDING_WORDS }, () => new Uint8Array(32)) };
-}
 
 /** A `ContractAddress` from a single repeated byte. */
 export function contractAddress(fill: number): LobbyContractAddress {
@@ -604,13 +612,13 @@ export class LobbySimulator extends BaseSimulator<LobbyPrivateState> {
 
   openTableAt(tier: number, address: LobbyContractAddress): Promise<[]> {
     return this.run('openTableAt', (ctx) =>
-      this.lobby.impureCircuits.openTableAt(ctx, BigInt(tier), address, zeroLobbyPadding()),
+      this.lobby.impureCircuits.openTableAt(ctx, BigInt(tier), address),
     );
   }
 
   tableFilled(tier: number): Promise<[]> {
     return this.run('tableFilled', (ctx) =>
-      this.lobby.impureCircuits.tableFilled(ctx, BigInt(tier), zeroLobbyPadding()),
+      this.lobby.impureCircuits.tableFilled(ctx, BigInt(tier)),
     );
   }
 }

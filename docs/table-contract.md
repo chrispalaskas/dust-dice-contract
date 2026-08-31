@@ -6,18 +6,31 @@ mechanics follow the Gate 0, Q1 verdict (see architecture.md).
 ## Who computes the dice — the two-step turn
 
 The contract holds only `H(seed)`; no circuit can derive dice from a commitment, and the
-player must not know the seed. So a turn is two transactions by two parties:
+player must not know the seed. So a turn is a player step and an operator step, by two
+different parties (four transactions as built — see the amendment below):
 
 1. **`takeTurn` (player):** submits their per-round entropy (see below), a hold-policy choice,
    and the scoring category **for their previous turn's dice** (pipelined — see next section).
-2. **`resolveTurn` (operator):** supplies the seed as a **witness** (private — never disclosed
-   mid-game), the circuit asserts `H(seed) == seedCommitment`, derives the three rolls with
-   holds applied per the declared policy, and writes the resulting dice into the turn log.
+2. **`resolveRoll1` / `resolveRoll2` / `resolveRoll3` (operator):** supplies the seed as a
+   **witness** (private — never disclosed mid-game), each circuit asserts
+   `H(seed) == seedCommitment`, and between them they derive the three rolls with holds applied
+   per the declared policy and write the resulting dice into the turn log.
 
 This is the one place ZK genuinely works in the base game: the dice are _proven_ correct
 against the seed commitment without revealing the seed while the game is live.
 
-The player experiences 13–14 wallet prompts per game; the operator automates one resolve per
+> **Amendment, after the E2E run** ([e2e-report.md](e2e-report.md)). The operator's move was
+> designed as ONE transaction, `resolveTurn`, and is built as **three**. The one-circuit version
+> compiles to a PLONK domain of k=17 and the proof server bundles only k=9..15, so it could
+> never have produced a transaction. The cut is one roll per transaction, which the existing
+> measurements already forced: one roll is k=15, two are k=16. The dice, the digest chain and the
+> settlement verifier are **unchanged** — the same three roll hashes in the same order under the
+> same latched mask. What changes is throughput (a turn is four transactions, not two) and that
+> the intermediate hands are public, which is exploitable by nobody because the only player
+> choice in a turn is made in `takeTurn`, before any roll exists. Full rationale in
+> `table.compact`, decision 9.
+
+The player experiences 13–14 wallet prompts per game; the operator automates three resolves per
 turn from its own wallet (strictly sequential — one wallet per process).
 
 ## Pipelined category choice — keep the skill
@@ -63,7 +76,8 @@ turn time for perfect dice. Fixes, layered:
    `entropy_s(r) = H(sk_s, tableId, r)`, proven in-circuit against `C_s` (sk is a witness,
    entropy is disclosed). A player cannot pick their entropy per turn at all.
 2. **Entropy is non-grindable at join time.** Rolls also mix in a **running game digest**:
-   `gameDigest' = H(gameDigest, <event>)` updated by every `join` and every `resolveTurn`.
+   `gameDigest' = H(gameDigest, <event>)` updated by every `join` and every completed turn
+   (`resolveRoll3`).
    As built, the digest is folded into the entropy one hash early
    (`mixEntropy(entropy_s(r), gameDigest)` feeding the measured `RollContext`) rather than
    widening the roll-hash input set — same security argument, keeps the measured dice
@@ -120,24 +134,30 @@ replay it with the same TS mirror of the dice ladder.
   (`OutsideTimeToDismiss` — gate0-report.md). Real turn circuits likely clear it; `join`
   and `claimTimeout` may need fallible-phase padding writes. Verified per circuit in tests.
 
-## Exported circuits (≤ 7 — deploy ceiling is ~11 circuits, measured upstream)
+## Exported circuits (8 — deploy ceiling is ~11 circuits, measured upstream)
 
 | circuit        | caller   | does                                                                                                                                                                                            |
 | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `join`         | player   | stake in, register `C_s`, take next seat; last join flips to Playing and stamps `lastActionAt`                                                                                                  |
 | `takeTurn`     | player   | score previous dice (category, joker rules), declare entropy `H(sk,tableId,r)` + policy for this turn; advances `lastActionAt`                                                                  |
-| `resolveTurn`  | operator | witness seed; derive 3 rolls with policy holds; write dice, update digest; advance turn pointer                                                                                                 |
+| `resolveRoll1` | operator | witness seed; derive roll 1; check the witnessed modal face; latch the mixed entropy and the hold mask                                                                                          |
+| `resolveRoll2` | operator | witness seed; reroll once under the latched mask                                                                                                                                                |
+| `resolveRoll3` | operator | witness seed; reroll again; write the turn's dice, update the digest, advance the turn pointer                                                                                                  |
 | `settle`       | anyone   | all seats finished/forfeited; seed disclosed + checked; winner via tie-break; pay winner (pot − q) and rake (q) with witness-checked `q*100 + r == pot, r < 100`                                |
 | `claimTimeout` | anyone   | only while waiting on a **player** (`WaitPlayer`): `blockTimeGt(lastActionAt + turnTimeoutSecs)` forfeits the stalled seat (remaining categories score 0, stake stays in the pot), advance turn |
 | `abortTable`   | anyone   | `blockTimeGt(lastActionAt + tableTimeoutSecs)` while waiting on the **operator** (`WaitResolve`) or while `Filling` never completed: refund `tier` to every seated player, nothing to rake      |
 
-Authorisation is structural, not address-based: `resolveTurn`'s authority is knowledge of
-the seed (only the operator has it); `takeTurn`'s is knowledge of the seat's `sk_s`;
+Authorisation is structural, not address-based: each `resolveRoll`'s authority is knowledge of
+the seed (only the operator has it), re-checked at every step because every step derives a roll
+from it; `takeTurn`'s is knowledge of the seat's `sk_s`;
 `settle`/`claimTimeout`/`abortTable` are permissionless because their outcomes are fully
 determined by on-chain state. No circuit ever needs the caller's address.
 
-Turn sub-state: `WaitPlayer(currentSeat)` → takeTurn → `WaitResolve` → resolveTurn →
-advance (skip forfeited seats; bounded scan over ≤6). No division anywhere: `currentSeat`
+Turn sub-state: `WaitPlayer(currentSeat)` → takeTurn → `WaitResolve` → resolveRoll1 →
+resolveRoll2 → resolveRoll3 → advance (skip forfeited seats; bounded scan over ≤6). The three
+resolve steps are sequenced by a `rollStep` counter, each asserting the value it is the successor
+of, so the operator cannot skip, repeat or reorder a roll. A stall at any of the three is still
+`WaitResolve`, so `abortTable` covers them all without a new case. No division anywhere: `currentSeat`
 and `round` advance incrementally, never derived from `turnIndex`.
 
 Timeout deadlines use the sandwich discipline from the field notes: the claim is a
@@ -153,6 +173,7 @@ the two must never diverge.
 
 - The seed is the only thing whose loss aborts a table: persisted to disk at commit time,
   before the table opens, keyed by table address.
-- One wallet per daemon; resolves strictly sequential; restart after any node_modules patch.
+- One wallet per daemon; resolves strictly sequential — and there are now three per turn, so an
+  operator serves ~3× the transaction rate the original design assumed.
 - The operator never holds discretion over an outcome — resolves are mechanical, timeouts are
   permissionless (anyone can call), and settlement is verifiable by anyone.

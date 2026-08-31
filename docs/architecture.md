@@ -68,30 +68,45 @@ trust boundary documented honestly. We do not fake custody.
 **Question:** what does one state-changing transaction really cost (proof time + wallet
 prompt + inclusion), and what game shape fits inside it?
 
-**Status: ANSWERED — measured on this stack** ([gate0-report.md](gate0-report.md)): average
-**20.9 s per transaction** over four distinct circuit calls (proving 1.5 s, balancing 0.4 s,
-**submission→inclusion 18.0 s** — 86% of the budget is waiting for the chain, so optimising
-circuits buys ≤ 9%; only fewer transactions helps). Deploy 26.2 s. Stable to ~3% across two
-independent runs.
+**Status: ANSWERED — measured on this stack**, first by probe ([gate0-report.md](gate0-report.md),
+four calls) and then by a whole game ([e2e-report.md](e2e-report.md), **111 calls**):
 
-Per-roll play is dead on the numbers: 312 tx ≈ **109 min** serial for six players. Per-turn:
-78 tx ≈ 27 min (player transactions alone). A 2-player per-turn demo ≈ 9 min — the shape to
-aim a live demo at. Batching several calls per transaction is unprobed and inherits the gas
-under-declaration defect (~15%/60% failure at 2/3 calls upstream) — not a lever we lean on.
+| source                       | calls |  prove | balance | submit→inclusion | total per tx |
+| ---------------------------- | ----: | -----: | ------: | ---------------: | -----------: |
+| Gate 0 probe                 |     4 | 1.47 s |  0.39 s |          17.98 s |      20.92 s |
+| E2E game (**authoritative**) |   111 | 1.59 s |  0.35 s |          16.11 s |  **19.13 s** |
 
-**Chosen shape: (a) one player transaction per turn, plus one operator resolve.** A circuit
+Gate 0's estimate held to within 9% at 28× the sample, and its shape is unchanged: **inclusion is
+84% of the budget**, so optimising circuits buys almost nothing and only fewer transactions
+helps. Deploy 18.6 s.
+
+Per-roll play was already dead on the numbers and the resolve split (below) doubles it. The
+measured shapes are now: **2 seats × 13 rounds = 111 tx ≈ 35 min** (executed), **6 seats × 13
+rounds = 343 tx ≈ 109 min** (extrapolated). A six-seat table is no longer "within a real Yahtzee
+evening" and needs a product decision — fewer rounds, smaller tables, concurrent tables, or
+batching. Batching several calls per transaction remains unprobed and inherits the gas
+under-declaration defect (~15%/60% failure at 2/3 calls upstream) — not a lever we lean on
+without its own probe.
+
+**Chosen shape: (a) one player transaction per turn, plus the operator's resolve.** A circuit
 cannot derive dice from a seed the contract only holds a commitment to, and the player must
 not know the seed — so a turn is a player `takeTurn` (entropy + hold policy + **pipelined**
-category choice for the _previous_ turn's dice, which they have seen) and an operator
-`resolveTurn` (seed as private witness; derives all three rolls with policy-applied holds
-in one circuit). Full design, including the anti-collusion entropy scheme, in
-[table-contract.md](table-contract.md).
+category choice for the _previous_ turn's dice, which they have seen) and an operator resolve
+(seed as private witness; derives the three rolls with policy-applied holds). Full design,
+including the anti-collusion entropy scheme, in [table-contract.md](table-contract.md).
 
-Budget at the measured 20.9 s/tx: 6-player game ≈ 78 player tx + 78 automated operator
-resolves ≈ 54 min wall clock and 13–14 prompts per player — long but within a real Yahtzee
-evening. 2-player game ≈ 18 min. Manual per-roll play (b) may be kept as a "showcase" mode
-for 2-seat tables only. Full-game settlement (c) is a stretch goal (≈19 000 instructions
-extrapolated), go/no-go pending a proving-time measurement against the real proof server.
+**Amended by the E2E run** ([e2e-report.md](e2e-report.md)): the operator's resolve is **three
+transactions, one per roll**, not one. The single-circuit version compiles to a PLONK domain of
+k=17 and the proof server bundles only k=9..15, so it could never have produced a transaction —
+a fact established offline, from the compiled ZKIR, before anything was deployed
+(`npm run k -w cli`). A turn is therefore **four** transactions, and every wall-clock figure
+below is that shape, measured end to end rather than extrapolated. The dice, the digest chain
+and the settlement verifier are unchanged by the split.
+
+Manual per-roll play (b) is dead: it was already 109 min for six players at one transaction per
+roll, and the resolve split doubles that. Full-game settlement (c) is likewise dead as designed —
+at ≈19 000 extrapolated instructions it is far beyond k=15, and the SRS ceiling is not a
+performance limit that better hardware relieves.
 
 ## Randomness — commit–reveal, never committed outcomes
 

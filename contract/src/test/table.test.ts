@@ -607,6 +607,155 @@ describe('resolveTurn', () => {
 });
 
 // =========================================================================================
+describe('the three-transaction resolve', () => {
+  // =======================================================================================
+  //
+  // `TableSimulator.resolveTurn` above is a convenience that runs all three steps, so the rest
+  // of this file reads as if the operator's move were one call. These tests are the ones that
+  // care that it is three (table.compact, decision 9): that the steps are ordered, that a
+  // half-resolved turn has changed nothing a seat can be scored on, and -- the one that
+  // matters most -- that splitting did not change a single die.
+
+  it('produces exactly the dice the one-circuit version would have', async () => {
+    // `resolveDiceChecked` is the unsplit turn, kept in policy-core.compact precisely so this
+    // assertion can exist. It is unprovable on this platform (k=17) but it still SIMULATES, so
+    // it remains a usable oracle: if the split ever drifts, this fails.
+    for (const choice of [
+      { policy: Policy.Stand, param: 0 },
+      { policy: Policy.RerollAll, param: 0 },
+      { policy: Policy.KeepModal, param: 0 },
+      { policy: Policy.KeepFace, param: 4 },
+      { policy: Policy.ChaseStraight, param: 0 },
+      { policy: Policy.KeepPairsPlus, param: 0 },
+    ]) {
+      const g = await seated({ seats: 2, tableId: bytes32(0x60 + choice.policy) });
+      await g.takeTurn(0, 0, choice);
+
+      const entropy = forcedEntropyTs(g.players[0]!.sk, g.config.tableId, 0);
+      const mixed = mixEntropyTs(entropy, g.ledger().gameDigest);
+      const modal = modalFace(
+        resolveDiceTs(g.config.tableId, g.config.seed, mixed, 0, choice.policy, choice.param).roll0,
+      );
+
+      g.sim.asOperator();
+      const dice = diceToArray(await g.sim.resolveTurn(g.tick()));
+
+      assert.deepEqual(
+        dice,
+        tablePure
+          .resolveDiceChecked(
+            g.config.tableId,
+            g.config.seed,
+            mixed,
+            0n,
+            BigInt(choice.policy),
+            BigInt(choice.param),
+            BigInt(modal),
+          )
+          .map(Number),
+        `the split resolve diverged from resolveDiceChecked for policy ${choice.policy}`,
+      );
+    }
+  });
+
+  it('refuses the three steps out of order', async () => {
+    const g = await seated({ seats: 2 });
+    await g.takeTurn(0, 0);
+    g.sim.asOperator();
+
+    // Nothing but step 1 is legal from rollStep 0.
+    await assert.rejects(() => g.sim.resolveRoll2(g.tick()), /roll 1 has not been resolved yet/);
+    await assert.rejects(() => g.sim.resolveRoll3(g.tick()), /roll 2 has not been resolved yet/);
+
+    await g.sim.resolveRoll1(g.tick());
+    assert.equal(g.ledger().rollStep, 1n);
+    // ...and step 1 cannot be replayed to re-latch the mask.
+    await assert.rejects(
+      () => g.sim.resolveRoll1(g.tick()),
+      /this turn's first roll is already resolved/,
+    );
+    await assert.rejects(() => g.sim.resolveRoll3(g.tick()), /roll 2 has not been resolved yet/);
+
+    await g.sim.resolveRoll2(g.tick());
+    assert.equal(g.ledger().rollStep, 2n);
+    await assert.rejects(() => g.sim.resolveRoll2(g.tick()), /roll 1 has not been resolved yet/);
+
+    await g.sim.resolveRoll3(g.tick());
+    assert.equal(g.ledger().rollStep, 0n);
+    assert.equal(g.ledger().turnState, WAIT_PLAYER);
+  });
+
+  it('leaves the seat unscoreable until the third step lands', async () => {
+    // Steps 1 and 2 are preparation: no seat state, no digest, no cursor movement. An operator
+    // that dies after step 2 has produced nothing a game can be settled on, which is what makes
+    // `abortTable`'s single `waitResolve` case cover a stall at any of the three steps.
+    const g = await seated({ seats: 2 });
+    await g.takeTurn(0, 0);
+    const digestBefore = g.ledger().gameDigest;
+    const turnIndexBefore = g.ledger().turnIndex;
+
+    g.sim.asOperator();
+    for (const step of [1, 2] as const) {
+      await (step === 1 ? g.sim.resolveRoll1(g.tick()) : g.sim.resolveRoll2(g.tick()));
+      const led = g.ledger();
+      assert.equal(led.seatProgress.lookup(0n).hasDice, false, `step ${step} wrote seat dice`);
+      assert.deepEqual(led.gameDigest, digestBefore, `step ${step} advanced the digest`);
+      assert.equal(led.turnIndex, turnIndexBefore, `step ${step} advanced the cursor`);
+      assert.equal(led.turnState, WAIT_RESOLVE, `step ${step} handed the turn back`);
+      assert.equal(led.currentSeat, 0n);
+    }
+
+    await g.sim.resolveRoll3(g.tick());
+    const after = g.ledger();
+    assert.equal(after.seatProgress.lookup(0n).hasDice, true);
+    assert.notDeepEqual(after.gameDigest, digestBefore);
+    assert.equal(after.turnIndex, turnIndexBefore + 1n);
+  });
+
+  it('checks the seed at every step, not only the first', async () => {
+    // Each step derives a roll from the seed, so a step that trusted an earlier step's check
+    // would accept dice derived from a different preimage.
+    const g = await seated({ seats: 2 });
+    await g.takeTurn(0, 0);
+    g.sim.asOperator();
+    await g.sim.resolveRoll1(g.tick());
+
+    const wrongSeed = { rollSeed: bytes32(0x12), playerSecret: bytes32(0) };
+    for (const step of ['resolveRoll2', 'resolveRoll3'] as const) {
+      const honest = g.sim.privateState;
+      g.sim.privateState = wrongSeed;
+      await assert.rejects(
+        () =>
+          step === 'resolveRoll2' ? g.sim.resolveRoll2(g.tick()) : g.sim.resolveRoll3(g.tick()),
+        /seed does not open the table's seed commitment/,
+        `${step} accepted a seed that does not open the commitment`,
+      );
+      g.sim.privateState = honest;
+      if (step === 'resolveRoll2') await g.sim.resolveRoll2(g.tick());
+    }
+  });
+
+  it('publishes rolls 1 and 2 as it goes, matching the mirror', async () => {
+    // The intermediate hands are public with the split (decision 9). Pin them: this is what a
+    // UI animates from, and it is a real behavioural difference from the one-circuit version.
+    const g = await seated({ seats: 2 });
+    await g.takeTurn(0, 0, { policy: Policy.KeepFace, param: 3 });
+    const entropy = forcedEntropyTs(g.players[0]!.sk, g.config.tableId, 0);
+    const mixed = mixEntropyTs(entropy, g.ledger().gameDigest);
+    const expected = resolveDiceTs(g.config.tableId, g.config.seed, mixed, 0, Policy.KeepFace, 3);
+
+    g.sim.asOperator();
+    assert.deepEqual(diceToArray(await g.sim.resolveRoll1(g.tick())), expected.roll0);
+    assert.deepEqual(diceToArray(g.ledger().pendingRoll), expected.roll0);
+    assert.deepEqual(g.ledger().pendingHold.bits, expected.hold);
+    assert.deepEqual(g.ledger().pendingMixed, mixed);
+
+    assert.deepEqual(diceToArray(await g.sim.resolveRoll2(g.tick())), expected.roll1);
+    assert.deepEqual(diceToArray(await g.sim.resolveRoll3(g.tick())), expected.roll2);
+  });
+});
+
+// =========================================================================================
 describe('hold policies', () => {
   // =======================================================================================
 

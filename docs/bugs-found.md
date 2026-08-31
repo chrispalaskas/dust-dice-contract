@@ -632,3 +632,109 @@ minimum that the JSDoc on `createCircuitContext` say the parameter defaults to w
 omitting it makes block-time-dependent execution non-reproducible. The parameter is currently
 documented as "The current time. Used to execute the block time related kernel operations", which
 does not hint that leaving it out is a correctness hazard in a test.
+
+## 13. compactc 0.34.0 / proof-server 9.0.0-rc.5: a circuit's PLONK domain is never reported, so provability cannot be checked before proving — **worked-around**
+
+**Symptom.** A contract compiles cleanly, generates prover and verifier keys, deploys
+successfully, and is then **unprovable**. Every `/prove` hangs for ~366 s and fails with a
+generic `BadInput`. Nothing between writing the circuit and losing six minutes to a hang tells
+you which PLONK domain size the circuit needs, and §4's failure mode gives you no hint either —
+the proof server's log names the missing degree only after it has finished retrying a download
+that was never going to work.
+
+This is §4 seen from the other end. §4 says "some SRS degrees are missing". This entry is that
+**you cannot tell whether your circuit is one of them** until you try.
+
+**Root cause.** `k` is a property of the compiled ZKIR and the compiler knows it, but it is
+surfaced nowhere in the toolchain's output:
+
+- `compact compile` prints only `Compiling N circuits:`.
+- `<managed>/compiler/contract-info.json` carries every circuit's full type signature and no `k`.
+- `<managed>/compiler/contract-manifest.json` carries sizes and hashes of the artifacts and no
+  `k`.
+- **Prover key size cannot be used as a proxy**, which is the trap, because it looks like one.
+  It is a step function of the domain plus a constant that depends on the gate set, so it is not
+  monotonic in circuit size and it is not comparable across circuits: in this project `settle`
+  (1,584 instructions) had a prover key 1.5 MB **larger** than `claimTimeout` (1,608
+  instructions), and `join` at 5,211,067 B and `abortTable` at 2,140,815 B were k=14 and k=13
+  respectively — a 2.4× size ratio for one step.
+
+There is exactly one accessor, and it is undocumented: `@midnight-ntwrk/zkir-v2` exports a
+`Zkir` class whose `fromJson(json).getK()` reads the domain straight out of
+`<managed>/zkir/<circuit>.zkir`. The package is a transitive dependency of the proof provider,
+its entire `.d.ts` is 33 lines, and it appears in no guide. `--skip-zk` compilation is enough to
+produce the ZKIR, so the check costs seconds.
+
+**Impact here.** This was the E2E run's go/no-go. `table.compact`'s `resolveTurn` needed **k=17**
+against a proof-server ceiling of **k=15**; the contract as designed could never have produced a
+single transaction, and would have failed as a six-minute hang on the first turn of a
+twenty-minute run. Reading `getK()` off the ZKIR answered it offline in about a second, before
+anything was deployed, and turned "the demo silently doesn't work" into a design change made in
+advance.
+
+**Workaround — worked-around.** `cli/tools/circuit-k.mjs` (`npm run k -w cli`) reports every
+circuit's `k` against the SRS degrees the proof-server image actually bundles, and exits non-zero
+if any is out of range. The bundled set has to be enumerated by `docker export <container> | tar
+-t` — the image is distroless, so there is no shell to ask and no endpoint that reports it.
+
+**Intended upstream action.** Three separate issues, in decreasing order of value:
+
+1. `midnightntwrk/compact` — have `compact compile` print `k` per circuit, and record it in
+   `contract-info.json`. The compiler already computes it; not emitting it is the whole defect.
+2. `midnightntwrk/proof-server` — expose the bundled SRS degrees on an endpoint (`GET /params`),
+   and **fail fast** with a message naming `k` when a circuit needs one that is absent, instead
+   of retrying an unreachable host for six minutes and returning `BadInput`.
+3. `midnightntwrk/artifacts` — document `zkir-v2`'s `Zkir.getK()`, which is currently the only
+   way any project can answer "will this deploy be usable?" ahead of time.
+
+## 14. compactc 0.34.0: an exported circuit's array argument costs two public inputs per word and can dominate the proving domain — **fixed-here**
+
+**Symptom.** Five circuits that do very different amounts of work all landed on exactly the same
+PLONK domain, k=15, and their prover keys clustered at 8.5–10 MB regardless of what they
+computed. `claimTimeout`, which forfeits a seat and writes three ledger fields, needed the same
+domain as `join`, which hashes twice and takes custody of a token. Replacing one argument with a
+compile-time constant — changing nothing the contract does and nothing about the resulting
+transaction's size — moved them to k=11..14 and their keys to 0.58–5.2 MB.
+
+Measured on the same contract, same 2 KB of padding, same behaviour:
+
+| circuit            | padding as a `Vector<64, Bytes<32>>` argument | padding as a `pad(2048, …)` constant |
+| ------------------ | --------------------------------------------: | -----------------------------------: |
+| `claimTimeout`     |                             k=15, 8,458,853 B |                  **k=11, 575,520 B** |
+| `abortTable`       |                             k=15, 8,458,463 B |                **k=12, 1,079,285 B** |
+| `settle`           |                             k=15, 9,948,285 B |                **k=13, 2,824,864 B** |
+| `join`             |                             k=15, 9,960,155 B |                **k=14, 5,209,319 B** |
+| `takeTurn`         |                             k=15, 9,967,349 B |                **k=14, 5,215,077 B** |
+| `resolveRoll1/2/3` |                         k=16 — **unprovable** |                  **k=15 — provable** |
+
+A factor of fifteen on `claimTimeout`'s prover key, and on the resolve circuits the difference
+between a contract that can be deployed and one that cannot.
+
+**Root cause.** An exported circuit's parameters are **public inputs** to the proof. A
+`Vector<64, Bytes<32>>` is 128 field elements after alignment — measured at exactly 2 public
+inputs and 5 instructions per 32-byte word, flat across every circuit — and PLONK's domain has to
+cover the public-input region, so on a small circuit the argument alone sets the domain. A
+compile-time constant is folded into the ledger operation as a literal `StateValue` push and is
+never an input at all.
+
+Nothing here is wrong, exactly. It is a cost model that is invisible from the source: the two
+versions of `padTransaction` differ by one word and look equally inert, and the expensive one is
+the one the natural reading of "padding" suggests.
+
+**Why it mattered.** This padding exists to work around §3 — a contract call must exceed ~7,984
+bytes or the node refuses it — and §3's own workaround, from Gate 0, was argument-shaped. So the
+two ledger constraints were being pushed against each other unnecessarily: the argument form
+spent PLONK steps to buy transaction bytes, when the constant form buys the same bytes for free.
+With the argument, the only padding width that kept the resolve circuits provable was 16 words
+(512 B), which does not clear the admission floor — i.e. the contract had **no** feasible
+configuration. With the constant, both bounds are satisfied with room to spare.
+
+**Fix — fixed-here.** `table.compact` and `lobby.compact` take no padding argument at all;
+`padTransaction()` writes `pad(2048, "yahtzee:v1:pad")` to a `Bytes<2048>` ledger cell after
+`kernel.checkpoint()`. Documented as decision 8 in `table.compact`, with the measurements above.
+
+**Intended upstream action.** Documentation issue against `midnightntwrk/compact`: state
+explicitly that exported-circuit parameters are public inputs and that their **width** feeds the
+proving domain, with the per-word figure. Ideally the compiler would also warn when public inputs
+dominate a circuit's domain — it is the one cost that is entirely invisible in the source and
+entirely avoidable.

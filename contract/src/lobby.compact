@@ -68,11 +68,19 @@ export ledger openedCount: Map<Uint<8>, Uint<32>>;
 export ledger closedCount: Map<Uint<8>, Uint<32>>;
 
 /** Sink for the transaction padding. Same lever as `table.compact`; see its decision 8. */
-export ledger padStore: LobbyPadding;
+export ledger padStore: Bytes<2048>;
 
-/** 2 KB of public padding, written after `kernel.checkpoint()` so it grows bytes, not cost. */
-export struct LobbyPadding {
-  words: Vector<64, Bytes<32>>,
+/**
+ * 2 KB of public padding, written after `kernel.checkpoint()` so it grows bytes, not cost.
+ *
+ * A COMPILE-TIME CONSTANT rather than a circuit argument, for the reason `table.compact`'s
+ * decision 8 sets out: an argument costs two public inputs per 32-byte word and buys nothing,
+ * while a constant is emitted as a literal `StateValue` push into the ledger op and so lands in
+ * the transcript -- and in the transaction's byte count -- for free. The width appears twice,
+ * here and in `padStore`'s type; keep them in step by hand.
+ */
+pure circuit paddingConstant(): Bytes<2048> {
+  return pad(2048, "yahtzee:v1:pad");
 }
 
 /** The operator's key. Never disclosed; only the equality against the commitment is. */
@@ -94,9 +102,9 @@ circuit requireOperator(): [] {
          );
 }
 
-circuit padTransaction(p: LobbyPadding): [] {
+circuit padTransaction(): [] {
   kernel.checkpoint();
-  padStore = disclose(p);
+  padStore = paddingConstant();
 }
 
 /**
@@ -126,7 +134,7 @@ constructor(operatorCommit: Bytes<32>) {
  * enforced because losing a table's address here means the UI cannot find it, even though the
  * table itself keeps working and its timeout paths keep protecting the stakes.
  */
-export circuit openTableAt(tier: Uint<8>, address: ContractAddress, p: LobbyPadding): [] {
+export circuit openTableAt(tier: Uint<8>, address: ContractAddress): [] {
   requireOperator();
   const t = disclose(tier);
   assert(t < tierCount(), "lobby: unknown tier");
@@ -136,7 +144,7 @@ export circuit openTableAt(tier: Uint<8>, address: ContractAddress, p: LobbyPadd
   hasOpen.insert(t, true);
   openedCount.insert(t, (openedCount.lookup(t) + 1) as Uint<32>);
 
-  padTransaction(p);
+  padTransaction();
 }
 
 /**
@@ -147,7 +155,7 @@ export circuit openTableAt(tier: Uint<8>, address: ContractAddress, p: LobbyPadd
  * recording the operator's claim as if it were a fact. A client that wants to know how a table
  * ended reads that table's own `phase`.
  */
-export circuit tableFilled(tier: Uint<8>, p: LobbyPadding): [] {
+export circuit tableFilled(tier: Uint<8>): [] {
   requireOperator();
   const t = disclose(tier);
   assert(t < tierCount(), "lobby: unknown tier");
@@ -158,7 +166,7 @@ export circuit tableFilled(tier: Uint<8>, p: LobbyPadding): [] {
   openTable.insert(t, default<ContractAddress>);
   closedCount.insert(t, (closedCount.lookup(t) + 1) as Uint<32>);
 
-  padTransaction(p);
+  padTransaction();
 }
 
 export { ContractAddress, UserAddress };

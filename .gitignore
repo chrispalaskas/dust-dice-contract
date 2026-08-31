@@ -25,3 +25,6 @@ coverage/
 
 # local plugin/tool state
 .midnight-expert/
+
+# cli run state (contract addresses, throwaway seeds, timings — regenerated per run)
+cli/.run/

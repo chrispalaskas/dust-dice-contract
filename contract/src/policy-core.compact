@@ -421,3 +421,78 @@ export pure circuit resolveDiceChecked(
   const r1 = mergeHeld(hold, r0, deriveDice(rollContext(tableId, seed, mixed, round, 1)));
   return mergeHeld(hold, r1, deriveDice(rollContext(tableId, seed, mixed, round, 2)));
 }
+
+// ---------------------------------------------------------------------------------------
+// The three-roll turn, SPLIT ACROSS THREE TRANSACTIONS
+// ---------------------------------------------------------------------------------------
+//
+// `resolveDiceChecked` above is the whole turn in one circuit. It is correct, it is what
+// docs/table-circuit.md measured, and it CANNOT BE PROVED on this platform: the exported
+// circuit built on it compiles to a PLONK domain of k=17, and the proof server bundles only
+// `bls_midnight_2p9` .. `2p15` with no route to fetch more (docs/e2e-report.md). Every other
+// circuit in the project lands at exactly k=15 -- the ceiling, with no headroom.
+//
+// The two circuits below are the same computation cut so that EACH TRANSACTION DERIVES EXACTLY
+// ONE ROLL. One roll is `dice/rollDice`, measured at k=15; two rolls is `turn/probeTwoRolls`,
+// measured at k=16. So one roll per transaction is not a conservative choice, it is the only
+// cut that fits. `table.compact` calls `firstRollChecked` once and `rerollUnderMask` twice, from
+// three separate exported circuits.
+//
+// The GAME is unchanged by this: the same three roll hashes over the same `RollContext`s in the
+// same order under the same latched mask, so a turn's dice are bit-for-bit what
+// `resolveDiceChecked` -- and `resolveDiceTs` in src/policy-mirror.ts -- produce. The settlement
+// verifier does not learn about the split at all. `resolveDiceChecked` is therefore kept, unused
+// by any exported circuit but still cross-checked against both the mirror and the split by
+// src/test/table.test.ts, as the executable statement that the split did not change the dice.
+
+/** Roll 1, and the mask latched from it. The two outputs of the split's first step. */
+export struct FirstRollResult {
+  dice: Vector<5, Uint<8>>,
+  hold: Vector<5, Boolean>,
+}
+
+/**
+ * Step 1 of 3: derive roll 1, check the witnessed modal face against it, latch the hold mask.
+ *
+ * Roll 1 is derived ONCE and shared between the modality check and the mask, for the same
+ * reason `resolveDiceChecked` exists rather than composing `firstRoll` with `resolveDice`.
+ *
+ * The check is guarded on the policy, so the other five policies do not have to supply a
+ * meaningful `modal`. The guard is not a branch a prover can dodge: `policy` is public ledger
+ * state, so exactly one side of it is live for any given transaction.
+ */
+export pure circuit firstRollChecked(
+                      tableId: Bytes<32>,
+                      seed: Bytes<32>,
+                      mixed: Bytes<32>,
+                      round: Uint<8>,
+                      policy: Uint<8>,
+                      param: Uint<8>,
+                      modal: Uint<8>,
+                      ): FirstRollResult {
+  const r0 = deriveDice(rollContext(tableId, seed, mixed, round, 0));
+  assert(policy != policyKeepModal() || isCanonicalModal(r0, modal),
+         "resolveRoll1: witnessed modal face is not the modal face of roll 1"
+         );
+  return FirstRollResult { dice: r0, hold: holdMaskOf(policy, param, modal, r0) };
+}
+
+/**
+ * Steps 2 and 3 of 3: one reroll under a mask that was already latched from roll 1.
+ *
+ * `hold` comes off the ledger rather than being recomputed, which is what makes this circuit
+ * one roll's worth of work: recomputing the mask would need roll 1 back, i.e. a second ladder.
+ * That the mask is latched from roll 1 and never re-evaluated is a game rule (see `holdMaskOf`),
+ * so carrying it forward is not an approximation -- it is the rule, written into the ledger.
+ */
+export pure circuit rerollUnderMask(
+                      tableId: Bytes<32>,
+                      seed: Bytes<32>,
+                      mixed: Bytes<32>,
+                      round: Uint<8>,
+                      rollIndex: Uint<8>,
+                      hold: Vector<5, Boolean>,
+                      kept: Vector<5, Uint<8>>,
+                      ): Vector<5, Uint<8>> {
+  return mergeHeld(hold, kept, deriveDice(rollContext(tableId, seed, mixed, round, rollIndex)));
+}
