@@ -29,11 +29,19 @@ expression. Instead, `takeTurn` k carries:
   on-chain), and
 - the **entropy + hold policy for turn k**.
 
-The first `takeTurn` carries no category; a final `scoreLast` step (folded into `takeTurn`
-with a flag, not a separate exported circuit) scores turn 13. Hold decisions remain
-policy-driven (a small enum: keep-none, keep-modal-face, keep-face(f), keep-≥4,
-chase-straight — final set decided with circuit cost data); category choice — the dominant
-skill decision in Yahtzee — stays fully manual.
+Concretely: `takeTurn` for round r carries the category for round r−1 (omitted at r=0) and
+the entropy + hold policy for round r (omitted in the final score-only round 13). Per seat:
+14 `takeTurn`s, 13 resolves. Category choice — the dominant skill decision in Yahtzee —
+stays fully manual; holds are policy-driven and latched from roll 1.
+
+**Hold-policy set, decided by measurement** (docs/scoring-circuit.md §5): per-die policies
+(Stand, RerollAll, KeepFace(1–6), KeepGe4) compile cleanly; **modal-face cannot be computed
+in-circuit** (compiler defect #1: re-reads × DAG size). KeepModal ships only via the
+witness-the-answer trick — the operator witnesses the modal face `m`, the circuit verifies
+canonical-modality cheaply (`count[m] > count[f]` for `f > m`, `≥` for `f < m`) and the mask
+is `die == m`. Count-based masks (KeepPairsPlus, ChaseStraight) are expected cheap (wide
+fan-in with cheap nodes compiles fine) — implement, measure, prune. Policy encoding mirrors
+api/src/policies.ts exactly.
 
 ## Randomness: commit–reveal hardened against operator–player collusion
 
@@ -96,14 +104,23 @@ replay it with the same TS mirror of the dice ladder.
 
 ## Exported circuits (≤ 7 — deploy ceiling is ~11 circuits, measured upstream)
 
-| circuit        | caller   | does                                                                                                                                                             |
-| -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `join`         | player   | stake in, register `C_s`, take next seat; last join flips to Playing and stamps `lastActionAt`                                                                   |
-| `takeTurn`     | player   | score previous dice (category, joker rules), declare entropy `H(sk,tableId,r)` + policy for this turn; advances `lastActionAt`                                   |
-| `resolveTurn`  | operator | witness seed; derive 3 rolls with policy holds; write dice, update digest; advance turn pointer                                                                  |
-| `settle`       | anyone   | all seats finished/forfeited; seed disclosed + checked; winner via tie-break; pay winner (pot − q) and rake (q) with witness-checked `q*100 + r == pot, r < 100` |
-| `claimTimeout` | anyone   | `blockTimeGt(lastActionAt + turnTimeoutSecs)`: forfeit the stalled seat's remaining categories (scored 0), advance turn                                          |
-| `abortTable`   | anyone   | `blockTimeGt(lastActionAt + tableTimeoutSecs)` while unresolved (operator vanished): refund `tier` to every seated player, nothing to rake                       |
+| circuit        | caller   | does                                                                                                                                                                                            |
+| -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `join`         | player   | stake in, register `C_s`, take next seat; last join flips to Playing and stamps `lastActionAt`                                                                                                  |
+| `takeTurn`     | player   | score previous dice (category, joker rules), declare entropy `H(sk,tableId,r)` + policy for this turn; advances `lastActionAt`                                                                  |
+| `resolveTurn`  | operator | witness seed; derive 3 rolls with policy holds; write dice, update digest; advance turn pointer                                                                                                 |
+| `settle`       | anyone   | all seats finished/forfeited; seed disclosed + checked; winner via tie-break; pay winner (pot − q) and rake (q) with witness-checked `q*100 + r == pot, r < 100`                                |
+| `claimTimeout` | anyone   | only while waiting on a **player** (`WaitPlayer`): `blockTimeGt(lastActionAt + turnTimeoutSecs)` forfeits the stalled seat (remaining categories score 0, stake stays in the pot), advance turn |
+| `abortTable`   | anyone   | `blockTimeGt(lastActionAt + tableTimeoutSecs)` while waiting on the **operator** (`WaitResolve`) or while `Filling` never completed: refund `tier` to every seated player, nothing to rake      |
+
+Authorisation is structural, not address-based: `resolveTurn`'s authority is knowledge of
+the seed (only the operator has it); `takeTurn`'s is knowledge of the seat's `sk_s`;
+`settle`/`claimTimeout`/`abortTable` are permissionless because their outcomes are fully
+determined by on-chain state. No circuit ever needs the caller's address.
+
+Turn sub-state: `WaitPlayer(currentSeat)` → takeTurn → `WaitResolve` → resolveTurn →
+advance (skip forfeited seats; bounded scan over ≤6). No division anywhere: `currentSeat`
+and `round` advance incrementally, never derived from `turnIndex`.
 
 Timeout deadlines use the sandwich discipline from the field notes: the claim is a
 refund/forfeit, never compensation, so a tight deadline can't be farmed.
