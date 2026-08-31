@@ -63,9 +63,9 @@ done
 
 | Variant      | `mask` reads    | `mask` cost   | reuse=6 | reuse=12 | reuse=18 |
 | ------------ | --------------- | ------------- | ------: | -------: | -------: |
-| `narrow`     | own position    | 1 comparison  | 0.43 s  | 0.48 s   | 0.57 s   |
-| `wide-cheap` | all 5 positions | 1 `faceCount` | 0.45 s  | —        | —        |
-| `wide-modal` | all 5 positions | running max   | 3.89 s  | 25.5 s   | 51.6 s   |
+| `narrow`     | own position    | 1 comparison  |  0.43 s |   0.48 s |   0.57 s |
+| `wide-cheap` | all 5 positions | 1 `faceCount` |  0.45 s |        — |        — |
+| `wide-modal` | all 5 positions | running max   |  3.89 s |   25.5 s |   51.6 s |
 
 `reuse=N` is the number of times each element of `merged` is read; the shipped files use 6. To
 reproduce the other columns, repeat the `faceCount(d, 1..6)` block inside `reuse`. `narrow` is

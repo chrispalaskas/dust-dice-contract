@@ -54,12 +54,12 @@ score = sum over c of  (category == c) * value(c)
 Exactly one selector is 1, so the sum is the score. Flat, nesting depth 1, and no more
 expensive than the ladder would have been. The same rewrite is applied three more times:
 
-| Reference shape in `rules.ts`                   | Circuit shape                                            |
-| ----------------------------------------------- | -------------------------------------------------------- |
-| `switch (category)` over 13 cases               | 13 products summed                                       |
-| `if / else if / else` over 3 joker branches      | one Boolean disjunction, flattened by Boolean algebra     |
-| `for` scan for the running-best seat             | all 36 pairwise comparisons                              |
-| `card.scores[category]` (run-time index)         | 13-way disjunction / 13-way conditional vector rebuild    |
+| Reference shape in `rules.ts`               | Circuit shape                                          |
+| ------------------------------------------- | ------------------------------------------------------ |
+| `switch (category)` over 13 cases           | 13 products summed                                     |
+| `if / else if / else` over 3 joker branches | one Boolean disjunction, flattened by Boolean algebra  |
+| `for` scan for the running-best seat        | all 36 pairwise comparisons                            |
+| `card.scores[category]` (run-time index)    | 13-way disjunction / 13-way conditional vector rebuild |
 
 The winner rewrite is worth spelling out. `rules.ts` finds the winner with a scan that
 replaces the leader on strict improvement. That is a running max — the same shape as
@@ -97,11 +97,11 @@ different pair. `rake = q`, `winnerPayout = pot - q`, so the remainder goes to t
 
 Each compile into a fresh directory (`contract/scripts/measure-build.sh`).
 
-| Contract                        | `--skip-zk` | full ZK  |
-| ------------------------------- | ----------- | -------- |
-| `dice.compact` (5 circuits)     | 0.77 s      | 46.2 s   |
-| `turn.compact` (2 circuits)     | 7.97 s      | 57.2 s   |
-| `scoring.compact` (9 circuits)  | **0.64 s**  | **3.2 s** |
+| Contract                        | `--skip-zk` | full ZK    |
+| ------------------------------- | ----------- | ---------- |
+| `dice.compact` (5 circuits)     | 0.77 s      | 46.2 s     |
+| `turn.compact` (2 circuits)     | 7.97 s      | 57.2 s     |
+| `scoring.compact` (9 circuits)  | **0.64 s**  | **3.2 s**  |
 | `takeTurn.compact` (4 circuits) | **22.9 s**  | **78.4 s** |
 
 `scoring.compact` has more circuits than the other three put together and compiles fastest of
@@ -119,21 +119,21 @@ as circuit size, and it is 6–72× faster. Use it for everything but key genera
 
 From `contract/scripts/zkir-stats.mjs`.
 
-| Contract   | Circuit           | Instructions | Prover key | Verifier key |
-| ---------- | ----------------- | -----------: | ---------: | -----------: |
-| scoring    | `probeRake`       |       **36** |    148 800 |    **1 351** |
-| scoring    | `resetCard`       |           87 |     39 076 |        1 351 |
-| scoring    | `loadCard`        |          136 |    147 960 |        1 351 |
-| scoring    | `probeCardWrite`  |          204 |    147 312 |        1 351 |
-| scoring    | `probeRawScore`   |          243 |    281 245 |        1 351 |
-| scoring    | `probeWinner`     |          246 |    546 532 |        1 351 |
-| scoring    | `settleTable`     |          269 |    548 601 |        1 351 |
-| scoring    | `probeApplyScore` |          524 |    282 506 |        1 351 |
-| scoring    | **`scoreTurn`**   |    **579**   | **547 523**|        1 351 |
-| takeTurn   | `probeRollsOnly`  |        1 260 | 19 519 507 |        2 119 |
-| takeTurn   | **`takeTurn`**    |  **1 804**   | 19 524 992 |        2 119 |
-| dice       | `rollDice`        |          464 |  9 965 533 |        2 119 |
-| turn       | `resolveTurn`     |        1 447 | 19 522 042 |        2 119 |
+| Contract | Circuit           | Instructions |  Prover key | Verifier key |
+| -------- | ----------------- | -----------: | ----------: | -----------: |
+| scoring  | `probeRake`       |       **36** |     148 800 |    **1 351** |
+| scoring  | `resetCard`       |           87 |      39 076 |        1 351 |
+| scoring  | `loadCard`        |          136 |     147 960 |        1 351 |
+| scoring  | `probeCardWrite`  |          204 |     147 312 |        1 351 |
+| scoring  | `probeRawScore`   |          243 |     281 245 |        1 351 |
+| scoring  | `probeWinner`     |          246 |     546 532 |        1 351 |
+| scoring  | `settleTable`     |          269 |     548 601 |        1 351 |
+| scoring  | `probeApplyScore` |          524 |     282 506 |        1 351 |
+| scoring  | **`scoreTurn`**   |      **579** | **547 523** |        1 351 |
+| takeTurn | `probeRollsOnly`  |        1 260 |  19 519 507 |        2 119 |
+| takeTurn | **`takeTurn`**    |    **1 804** |  19 524 992 |        2 119 |
+| dice     | `rollDice`        |          464 |   9 965 533 |        2 119 |
+| turn     | `resolveTurn`     |        1 447 |  19 522 042 |        2 119 |
 
 ### Two corrections to docs/dice-circuit.md
 
@@ -142,37 +142,37 @@ constant 2 119 bytes for every circuit measured, from 33 instructions to 2 163".
 because every circuit measured there hashed. Across all 20 circuits now measured the split is
 perfectly clean:
 
-| Uses `persistentHash` | Verifier key | Prover key range         |
-| --------------------- | ------------ | ------------------------ |
-| yes                   | 2 119 B      | 2.8 MB – 19.5 MB         |
-| no                    | **1 351 B**  | **39 KB – 549 KB**       |
+| Uses `persistentHash` | Verifier key | Prover key range   |
+| --------------------- | ------------ | ------------------ |
+| yes                   | 2 119 B      | 2.8 MB – 19.5 MB   |
+| no                    | **1 351 B**  | **39 KB – 549 KB** |
 
 Every hashing circuit is 2 119 and every non-hashing circuit is 1 351, with no exceptions and
 no correlation to instruction count — `probeHashOnly` is 33 instructions and 2 119 B; `loadCard`
 is 136 instructions and 1 351 B. Key size tracks **which PLONK gates the circuit needs**, and
-the SHA-256 gate is what costs. The revised claim: verifier keys are constant *within a gate
-set*, at two observed values, and on-chain verification cost still does not grow with circuit
+the SHA-256 gate is what costs. The revised claim: verifier keys are constant _within a gate
+set_, at two observed values, and on-chain verification cost still does not grow with circuit
 size.
 
 **2. The prover-key step function goes much finer than 2.7 MiB.** dice-circuit.md observed
 steps at ≈2.7 / 9.5 / 18.6 MiB and concluded key size is useless for comparing designs. The
 steps below that are 39 KB, ≈148 KB, ≈282 KB, ≈548 KB — roughly doubling, as PLONK domain
 rounding implies. The conclusion stands (`probeWinner` at 246 instructions and
-`probeApplyScore` at 524 land on 547 KB and 283 KB respectively — the *smaller* circuit gets
-the *bigger* key), but the resolution at the low end is better than it looked.
+`probeApplyScore` at 524 land on 547 KB and 283 KB respectively — the _smaller_ circuit gets
+the _bigger_ key), but the resolution at the low end is better than it looked.
 
 ### Cost attribution
 
-| Component                                                | Instructions |
-| -------------------------------------------------------- | -----------: |
-| Write an empty scorecard, no read (`resetCard`)           |           87 |
-| Read a scorecard, write it back, total it twice           |          204 |
-| `rawScore`, one category, 13 products summed              |         ≈156 |
-| Joker-rule placement decision on top of `rawScore`        |         ≈281 |
-| `placeScore` + card write + incremental total             |          ≈55 |
-| Dice range check (5 dice, 2 comparisons each)             |          ≈35 |
-| Winner tie-break, 6 seats, 36 pairwise comparisons        |          246 |
-| Rake identity check                                       |           36 |
+| Component                                          | Instructions |
+| -------------------------------------------------- | -----------: |
+| Write an empty scorecard, no read (`resetCard`)    |           87 |
+| Read a scorecard, write it back, total it twice    |          204 |
+| `rawScore`, one category, 13 products summed       |         ≈156 |
+| Joker-rule placement decision on top of `rawScore` |         ≈281 |
+| `placeScore` + card write + incremental total      |          ≈55 |
+| Dice range check (5 dice, 2 comparisons each)      |          ≈35 |
+| Winner tie-break, 6 seats, 36 pairwise comparisons |          246 |
+| Rake identity check                                |           36 |
 
 The opcode mix confirms the design. `scoreTurn` has **`test_eq` = 63** — thirteen category
 selectors, thirteen `filledAt` positions, thirteen `setFilledAt`, and the count-equality
@@ -193,7 +193,7 @@ Yes, and the accounting closes.
 | -------------------------------- | -----------: | ---------: |
 | `takeTurn/probeRollsOnly` (dice) |        1 260 | 19 519 507 |
 | `takeTurn/takeTurn` (dice+score) |    **1 804** | 19 524 992 |
-| difference — scoring in-circuit  |      **544** |    **5 485** |
+| difference — scoring in-circuit  |      **544** |  **5 485** |
 | `scoring/scoreTurn` standalone   |          579 |    547 523 |
 
 **544 against 579**, and the 35-instruction gap is exactly the dice range check that
@@ -214,18 +214,18 @@ sized by the three SHA-256 hashes. **Scoring is not a cost problem for this proj
 `takeTurn.compact` offers `keepNone` and `keepGe4` and asserts against `keepModalFace`. This is
 forced. Measured, `--skip-zk`, three rolls with scoring on the final merged dice:
 
-| Hold mask                | Merged-die fan-in | Reads of each merged die | Compile   |
-| ------------------------ | ----------------: | -----------------------: | --------- |
-| `die >= 4` (per-die)     |                 3 |     ~40 (full applyScore) | 10.2 s    |
-| `die == d[0]` (fan-in 2) |                 4 |     ~40 (full applyScore) | 8.9 s     |
-| `die == modalFace(roll1)`|                15 |               1 (diceSum) | 5.0 s     |
-| `die == modalFace(roll1)`|                15 |             6 (isYahtzee) | 45.5 s    |
-| `die == modalFace(roll1)`|                15 |              7 (rawScore) | **>150 s** |
-| `die == modalFace(roll1)`|                15 |     ~40 (full applyScore) | **>200 s** |
+| Hold mask                 | Merged-die fan-in | Reads of each merged die | Compile    |
+| ------------------------- | ----------------: | -----------------------: | ---------- |
+| `die >= 4` (per-die)      |                 3 |    ~40 (full applyScore) | 10.2 s     |
+| `die == d[0]` (fan-in 2)  |                 4 |    ~40 (full applyScore) | 8.9 s      |
+| `die == modalFace(roll1)` |                15 |              1 (diceSum) | 5.0 s      |
+| `die == modalFace(roll1)` |                15 |            6 (isYahtzee) | 45.5 s     |
+| `die == modalFace(roll1)` |                15 |             7 (rawScore) | **>150 s** |
+| `die == modalFace(roll1)` |                15 |    ~40 (full applyScore) | **>200 s** |
 
 A per-die hold predicate makes a merged die depend on three leaves — its own die in each of the
 three rolls — and forty re-reads of a three-leaf value is free. A whole-hand predicate makes
-*every* merged die depend on all fifteen ladder outputs plus the whole `modalFace` expression,
+_every_ merged die depend on all fifteen ladder outputs plus the whole `modalFace` expression,
 and the compiler re-expands all of it on every re-read.
 
 `holdOne` in takeTurn.compact therefore takes **one die**, not the hand:
@@ -282,11 +282,11 @@ and if that DAG itself contains a re-read value, the factors multiply.
 `contract/repro/bug1-fanin-{narrow,wide-cheap,wide-modal}.compact` are three files identical
 except for the three-line body of `mask`, with the same instruction count to within 6%:
 
-| Repro variant | mask reads      | mask cost   | reuse=6 | reuse=12 | reuse=18 |
-| ------------- | --------------- | ----------- | ------: | -------: | -------: |
-| `narrow`      | own position    | 1 comparison| 0.43 s  | 0.48 s   | 0.57 s   |
-| `wide-cheap`  | all 5 positions | 1 faceCount | 0.45 s  | —        | —        |
-| `wide-modal`  | all 5 positions | running max | 3.89 s  | 25.5 s   | 51.6 s   |
+| Repro variant | mask reads      | mask cost    | reuse=6 | reuse=12 | reuse=18 |
+| ------------- | --------------- | ------------ | ------: | -------: | -------: |
+| `narrow`      | own position    | 1 comparison |  0.43 s |   0.48 s |   0.57 s |
+| `wide-cheap`  | all 5 positions | 1 faceCount  |  0.45 s |        — |        — |
+| `wide-modal`  | all 5 positions | running max  |  3.89 s |   25.5 s |   51.6 s |
 
 `narrow` is flat in the reuse count. `wide-modal` is not, on identical instruction counts. That
 is the defect in 116 lines with no hashing, no witnesses and no ledger ADTs.
@@ -311,20 +311,20 @@ reads it twice. Same answer, pinned by the tests on every corpus case; 8× the c
 `contract/src/test/scoring.test.ts`, 35 tests. The circuit is compared against the reference
 engine, never against a second copy of itself.
 
-| Check                              | Corpus                                              | Result       |
-| ---------------------------------- | --------------------------------------------------- | ------------ |
+| Check                               | Corpus                                                 | Result      |
+| ----------------------------------- | ------------------------------------------------------ | ----------- |
 | `rawScore`                          | **exhaustive**: 13 categories × all 6⁵ hands = 101 088 | exact match |
-| `isYahtzee`                         | exhaustive: all 7 776 hands                          | exact match  |
-| `applyScore` placement/score/bonus  | 2 500 scorecards × 13 categories = **32 500**        | exact match  |
-| `placeScore` whole updated card     | every legal case of the 32 500                       | exact match  |
-| `cardTotal` and `totalAfterPlacing` | every legal case of the 32 500                       | exact match  |
-| `upperTotal`, `grandTotal`          | 2 500 scorecards                                     | exact match  |
-| Joker scenarios                     | all 4 from `api/src/rules.test.ts`, plus 3 more      | exact match  |
-| `winnerSeat`                        | 4 000 random tables, seat counts 2–6                 | exact match  |
+| `isYahtzee`                         | exhaustive: all 7 776 hands                            | exact match |
+| `applyScore` placement/score/bonus  | 2 500 scorecards × 13 categories = **32 500**          | exact match |
+| `placeScore` whole updated card     | every legal case of the 32 500                         | exact match |
+| `cardTotal` and `totalAfterPlacing` | every legal case of the 32 500                         | exact match |
+| `upperTotal`, `grandTotal`          | 2 500 scorecards                                       | exact match |
+| Joker scenarios                     | all 4 from `api/src/rules.test.ts`, plus 3 more        | exact match |
+| `winnerSeat`                        | 4 000 random tables, seat counts 2–6                   | exact match |
 | `splitPot`                          | 4 tiers × 5 seat counts, 9 boundary pots, 2 000 random | exact match |
-| `scoreTurn` against a ledger        | a full 13-turn game, box by box                      | exact match  |
-| `takeTurn` against a ledger         | a full 13-turn game, dice derived in-circuit          | exact match  |
-| `takeTurn` dice vs turn.compact     | 2 policies × 13 rounds, via `resolveTurnTs`           | exact match  |
+| `scoreTurn` against a ledger        | a full 13-turn game, box by box                        | exact match |
+| `takeTurn` against a ledger         | a full 13-turn game, dice derived in-circuit           | exact match |
+| `takeTurn` dice vs turn.compact     | 2 policies × 13 rounds, via `resolveTurnTs`            | exact match |
 
 **All 35 pass. Zero divergences from `rules.ts` at any point.**
 
@@ -333,7 +333,7 @@ Two things about the corpus that matter more than its size:
 **It is shaped, not just large.** Uniform random dice are a Yahtzee 6/7776 of the time, so a
 plain random corpus would exercise the joker branches essentially never — and the joker branches
 are the only part of `applyScore` with non-obvious behaviour. Two fifths of the cases are
-five-of-a-kind with the Yahtzee box already taken. The test then *asserts on its own coverage*:
+five-of-a-kind with the Yahtzee box already taken. The test then _asserts on its own coverage_:
 it counts how many cases reached the forced-upper branch, the lower-joker branch and the
 scratched-box path, and fails if any is under 50. A corpus generator that drifts cannot make
 this suite pass vacuously.
@@ -396,8 +396,8 @@ about 13 `test_eq` each — cheap, but they are the reason a scorecard is fixed-
 rather than a `Map`.
 
 **13. Nine circuits in one contract compile faster than two in another.** `scoring.compact` has
-9 circuits and compiles in 0.64 s; `turn.compact` has 2 and takes 7.97 s. Circuit *count* is
-irrelevant to compile time next to circuit *shape*. Do not batch circuits into separate
+9 circuits and compiles in 0.64 s; `turn.compact` has 2 and takes 7.97 s. Circuit _count_ is
+irrelevant to compile time next to circuit _shape_. Do not batch circuits into separate
 contracts to speed up the dev loop; fix the shape instead.
 
 ---

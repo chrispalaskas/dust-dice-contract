@@ -14,7 +14,8 @@
     "./node": {
       "types": "./dist/node/index.d.ts",
       "default": "./dist/node/index.js"
-    }
+    },
+    "./src/*": "./src/*"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

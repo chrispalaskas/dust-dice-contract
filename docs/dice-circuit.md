@@ -168,6 +168,7 @@ Two things to take from this table:
    > is **1 351 B**, with no correlation to instruction count. Verifier key size tracks the
    > PLONK gate set, not circuit size. The conclusion that it does not scale with circuit size
    > still holds.
+
 2. **Prover key size is a step function, not a cost measure.** `rollDice` (464 instructions)
    and `rollDiceBitLadder` (2 163 instructions) differ 4.7× in real size and land within
    0.25% of each other on key size — PLONK rounds the proving domain up to a power of two.

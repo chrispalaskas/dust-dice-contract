@@ -34,14 +34,21 @@ the entropy + hold policy for round r (omitted in the final score-only round 13)
 14 `takeTurn`s, 13 resolves. Category choice — the dominant skill decision in Yahtzee —
 stays fully manual; holds are policy-driven and latched from roll 1.
 
-**Hold-policy set, decided by measurement** (docs/scoring-circuit.md §5): per-die policies
-(Stand, RerollAll, KeepFace(1–6), KeepGe4) compile cleanly; **modal-face cannot be computed
-in-circuit** (compiler defect #1: re-reads × DAG size). KeepModal ships only via the
-witness-the-answer trick — the operator witnesses the modal face `m`, the circuit verifies
-canonical-modality cheaply (`count[m] > count[f]` for `f > m`, `≥` for `f < m`) and the mask
-is `die == m`. Count-based masks (KeepPairsPlus, ChaseStraight) are expected cheap (wide
-fan-in with cheap nodes compiles fine) — implement, measure, prune. Policy encoding mirrors
-api/src/policies.ts exactly.
+**Hold-policy set, as built and measured** (docs/table-circuit.md): all six policies from
+api/src/policies.ts shipped — Stand, RerollAll, KeepModal, KeepFace(1–6), ChaseStraight,
+KeepPairsPlus — encoding mirrored exactly. Modal-face cannot be _computed_ in-circuit
+(compiler defect #1: re-reads × DAG size), so KeepModal is witness-checked: the operator
+witnesses the modal face `m`, the circuit verifies canonical-modality via counts, the mask
+is `die == m` — proven equivalent to the reference over all 252 sorted hands. Whole-hand
+count-based masks (ChaseStraight, KeepPairsPlus) compile fine: fan-in alone was never the
+trigger, fan-in × re-reads is.
+
+**Residual, stated honestly (policy grinding):** entropy is forced, but the policy is a free
+per-turn choice made after the digest is public — so a _seed-knowing_ player can preview all
+eleven legal policy choices and pick the best. Bounded (best-of-11, not best-of-2^256),
+inherent to any design that preserves turn-time choice, and it requires the seed — i.e. it
+falls under the existing "operator must not play / collude" assumption. Documented in
+table.compact's header.
 
 ## Randomness: commit–reveal hardened against operator–player collusion
 
@@ -57,7 +64,10 @@ turn time for perfect dice. Fixes, layered:
    entropy is disclosed). A player cannot pick their entropy per turn at all.
 2. **Entropy is non-grindable at join time.** Rolls also mix in a **running game digest**:
    `gameDigest' = H(gameDigest, <event>)` updated by every `join` and every `resolveTurn`.
-   Roll inputs: `H(seed, entropy_s(r), gameDigest, tableId, r, rollIndex)`. Because seat
+   As built, the digest is folded into the entropy one hash early
+   (`mixEntropy(entropy_s(r), gameDigest)` feeding the measured `RollContext`) rather than
+   widening the roll-hash input set — same security argument, keeps the measured dice
+   circuits and their cross-check corpus intact. Because seat
    order = join order, every player's first roll digest includes joins that happened _after_
    theirs (or, for late seats, earlier turns' resolutions), so no one — even knowing the
    seed — can simulate their own future dice while still free to choose `sk_s`.
@@ -84,15 +94,23 @@ replay it with the same TS mirror of the dice ladder.
 - Constructor args: `tableId: Bytes<32>` (fresh random — `kernel.self()` is zeros in
   constructors), `tier: Uint<64>`, `maxSeats: Uint<8>`, `rakeAddress`,
   `seedCommitment: Bytes<32>`, timeout params `turnTimeoutSecs`, `tableTimeoutSecs`.
-- `phase: enum { Filling, Playing, Settled, Aborted }`
+- `phase: enum { Filling, Playing, Abandoned, Settled, Aborted }` — **Abandoned** is entered
+  when the last unforfeited seat forfeits: `settle` refuses it and `abortTable` refunds every
+  seat with nothing to rake. (Paying the last seat standing was rejected: it would make
+  _timing out last_ profitable.) A partial forfeit is deliberately asymmetric — the stake
+  stays in the pot and the forfeited seat still competes with what it scored.
+- `tier >= 100` is enforced at construction, so the 1% rake is never zero and no conditional
+  payment path exists in `settle`.
 - Per seat (≤6): player payout address, `C_s` entropy-key commitment, scorecard (13 packed
   category scores + filled bitmap), `upperTotal`, `total`, `yahtzeeBonuses`,
   `finishedAtTurn`, `forfeited: Boolean`
 - `currentSeat`, `round` (0–12), `turnIndex` (global), `pendingTurn` (entropy, policy,
   awaiting-resolve flag, resolved dice of previous turn per seat)
 - `gameDigest: Bytes<32>`
-- `lastActionAt: Uint<64>` (block-time seconds; predicates are strict, units are seconds,
-  no tolerance widening — build grace into the bounds)
+- `lastActionAt: Uint<64>` — **declared, not read**: the kernel exposes block-time
+  _predicates_ only, no accessor, so each state-advancing call declares `now` and the circuit
+  traps it in `(blockTime − 600, blockTime]` plus monotonicity against the stored value.
+  Deadlines stay exact; predicates are strict and seconds-based with no tolerance widening.
 - Pot custody: **native unshielded NIGHT, proven by Gate 0** — `join` calls
   `receiveUnshielded(nativeToken(), tier)` (the joining wallet consents by balancing);
   `settle`/`abortTable` call `sendUnshielded` to the payout addresses **recorded at join**,
