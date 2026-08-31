@@ -11,6 +11,9 @@ circuit cost in the project.
 - Verifier mirror: `contract/src/dice-mirror.ts`
 - Tests: `contract/src/test/dice.test.ts`, `contract/src/test/fairness.test.ts`
 - Reproduce: `npm run measure -w @yahtzee/contract`, `npm test -w @yahtzee/contract`
+- **Companion page: docs/scoring-circuit.md** — the scoring half, the combined `takeTurn`
+  circuit, and two corrections to this page (§3's constant verifier key, §6's account of
+  bugs-found.md #1)
 
 Toolchain: Compact CLI 0.5.1, compactc 0.34.0, language 0.26.0,
 `@midnight-ntwrk/compact-runtime` 0.19.0. Machine: x86_64 linux, single-threaded compile.
@@ -156,13 +159,26 @@ bugs-found.md #1 — `resolveTurn` sits one level below the cliff, not far from 
 
 Two things to take from this table:
 
-1. **The verifier key is a constant 2 119 bytes** for every circuit measured, from 33
-   instructions to 2 163. On-chain verification cost does not grow with circuit size.
+1. **The verifier key is 2 119 bytes** for every circuit measured here, from 33 instructions to
+   2 163, so on-chain verification cost does not grow with circuit size.
+
+   > **CORRECTED — see docs/scoring-circuit.md §4.** It is not a universal constant. Every
+   > circuit measured on this page hashes, and hashing is what sets it: across the 20 circuits
+   > now measured, every circuit using `persistentHash` is 2 119 B and every circuit without it
+   > is **1 351 B**, with no correlation to instruction count. Verifier key size tracks the
+   > PLONK gate set, not circuit size. The conclusion that it does not scale with circuit size
+   > still holds.
 2. **Prover key size is a step function, not a cost measure.** `rollDice` (464 instructions)
    and `rollDiceBitLadder` (2 163 instructions) differ 4.7× in real size and land within
    0.25% of each other on key size — PLONK rounds the proving domain up to a power of two.
    The observed steps are ≈2.7 MiB, ≈9.5 MiB, ≈18.6 MiB. **Do not use key size to compare
    designs**; use the zkir instruction count.
+
+   > **EXTENDED — see docs/scoring-circuit.md §4.** The steps continue much further down for
+   > circuits that do not hash: 39 KB, ≈148 KB, ≈282 KB, ≈548 KB. The full official Yahtzee
+   > scoring path has a **548 KB** prover key against `rollDice`'s 9.5 MB. The "do not compare
+   > designs by key size" rule survives intact — a 246-instruction circuit there lands on
+   > 547 KB while a 524-instruction one lands on 283 KB.
 
 ---
 
@@ -439,7 +455,13 @@ Reimplementing Compact's field-aligned encoding would be reimplementing the plat
    proving-time measurement against a real proof server before anyone commits.
 5. **Keep the hold-policy set small** — every policy is evaluated on every turn.
 6. **Keep the operator's seed in a witness.** It costs 2 instructions.
-7. **Verifier keys are constant-size (2 119 B)**, so on-chain verification cost is flat.
+7. **Verifier keys do not scale with circuit size.** They are 2 119 B for every circuit here;
+   docs/scoring-circuit.md §4 shows the value is set by the gate set (2 119 B with
+   `persistentHash`, 1 351 B without), not by size. Either way on-chain verification is flat.
 8. **Never compare designs by prover key size.** Use zkir instruction counts.
 9. **A latched hold mask is a compiler-imposed constraint**, not a design choice. Revisit if
    bugs-found.md #1 is fixed.
+10. **Scoring on top of these dice is the next constraint, and it is tighter.**
+    docs/scoring-circuit.md: a combined dice-and-scoring circuit compiles only with a _per-die_
+    hold policy, so `keepModalFace` is unavailable in a one-transaction turn. That page also
+    corrects bugs-found.md #1's root cause — nesting depth is not the variable.

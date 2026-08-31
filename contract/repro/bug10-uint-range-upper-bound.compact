@@ -1,0 +1,109 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// bugs-found.md #10 -- `Uint<a..b>` excludes `b`, contradicting the documentation.
+//
+// compactc 0.34.0, language 0.26.0. No dependencies beyond `CompactStandardLibrary`.
+//
+// The Compact documentation states that `Uint<8>` and `Uint<0..255>` are the same type and
+// that the range is inclusive. In this compiler the range spelling is EXCLUSIVE of its upper
+// bound, so `Uint<0..N>` is `{0 .. N-1}`. Everything below compiles CLEANLY -- including full
+// ZK key generation -- and the disagreement only appears when the circuits are executed.
+//
+//   compact compile --skip-zk repro/bug10-uint-range-upper-bound.compact /tmp/b10
+//   grep -n 't1 > ' /tmp/b10/contract/index.js
+//
+// Expected from the documentation, and observed:
+//
+//   circuit                target spelling   documented max   emitted bound check   verdict
+//   ---------------------------------------------------------------------------------------
+//   viaWidth1              Uint<1>                        1   t1 > 1n               correct
+//   viaRange1              Uint<0..1>                     1   t1 > 0n               OFF BY ONE
+//   viaRange3              Uint<0..3>                     3   t1 > 2n               OFF BY ONE
+//   viaWidth8              Uint<8>                      255   t1 > 255n             correct
+//   viaRange256            Uint<0..256>                 255   t1 > 255n             = Uint<8>
+//
+// `viaRange256` is the decisive one: `Uint<0..256>` behaves exactly as `Uint<8>` does, which
+// is only consistent with an exclusive upper bound.
+//
+// `assignMaxRange` does not compile at all. Uncomment it to see:
+//
+//   Exception: line N char M:
+//     mismatch between actual return type Uint<8> and declared return type Uint<0..255>
+//     of circuit assignMaxRange
+//
+// -- i.e. the compiler itself does not believe `Uint<8>` and `Uint<0..255>` are the same type,
+// while the documentation says they are.
+//
+// To see the runtime failure, run the compiled `pureCircuits` from a directory where
+// `@midnight-ntwrk/compact-runtime` resolves:
+//
+//   import { pureCircuits as P } from '<outdir>/contract/index.js';
+//   P.boolToRange1(true);   // throws: '1 is greater than 0'
+//   P.boolToWidth1(true);   // 1n
+//
+// The practical hazard is `Boolean -> Uint<0..1>`, the natural spelling for a 0/1 selector in
+// a sum-of-products circuit: it throws on EVERY `true`. It was written into
+// contract/src/scoring-core.compact's first draft, survived `compact compile`, `--skip-zk`,
+// full ZK key generation and `compact format`, and was caught only by the first execution.
+//
+// Not part of the build; nothing includes this file.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+// --- Bound checks emitted for a checked narrowing cast --------------------------------------
+
+export pure circuit viaWidth1(x: Field): Uint<1> {
+  return x as Uint<1>;
+}
+
+export pure circuit viaRange1(x: Field): Uint<0..1> {
+  return x as Uint<0..1>;
+}
+
+export pure circuit viaRange3(x: Field): Uint<0..3> {
+  return x as Uint<0..3>;
+}
+
+export pure circuit viaWidth8(x: Field): Uint<8> {
+  return x as Uint<8>;
+}
+
+export pure circuit viaRange256(x: Field): Uint<0..256> {
+  return x as Uint<0..256>;
+}
+
+// --- The hazard: a 0/1 selector -------------------------------------------------------------
+
+/** Correct. The cast is statically safe, so no check is emitted at all. */
+export pure circuit boolToWidth1(x: Boolean): Uint<1> {
+  return x as Uint<1>;
+}
+
+/** Throws at run time for every `true`, having compiled without a word of complaint. */
+export pure circuit boolToRange1(x: Boolean): Uint<0..1> {
+  return x as Uint<0..1>;
+}
+
+/** Also throws: a literal 1 that the compiler could have folded is checked, and rejected. */
+export pure circuit literalToRange1(): Uint<0..1> {
+  return 1 as Uint<0..1>;
+}
+
+// --- Does not compile; uncomment to reproduce the type error --------------------------------
+//
+// export pure circuit assignMaxRange(): Uint<0..255> {
+//   return 255;
+// }
+
+/** Compiles, and is the same thing the documentation claims `Uint<0..255>` is. */
+export pure circuit assignMaxWidth(): Uint<8> {
+  return 255;
+}
+
+/** Compiles: 255 fits `Uint<0..256>`, confirming the bound is exclusive. */
+export pure circuit assignMaxRangeExclusive(): Uint<0..256> {
+  return 255;
+}

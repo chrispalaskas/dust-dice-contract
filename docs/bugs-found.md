@@ -54,9 +54,17 @@ Hit while building `contract/src/turn.compact`: three rolls of five dice where t
 policy is re-evaluated on the merged dice before each re-roll. Two rolls compiled in 1.48 s;
 three never completed.
 
-**Root cause.** Compile time is exponential in the nesting depth of a `const` binding that is
-reused inside a conditional. The compiler expands the expression DAG into a tree rather than
-sharing bound subexpressions, so each level of nesting multiplies.
+**Root cause.** The compiler expands the expression DAG into a tree rather than sharing
+`const`-bound subexpressions, so a value read _M_ times costs _M_ expansions of its entire
+DAG — and where that DAG itself contains a re-read value, the factors multiply.
+
+> **AMENDED 2026-08-31 — the original diagnosis below was wrong.** This entry first said
+> compile time is exponential in the **nesting depth** of a `const` reused inside a
+> conditional, and prescribed keeping such chains one level deep. Building the scoring
+> circuit falsified both halves: see "Corrected diagnosis" after the original measurements,
+> and docs/scoring-circuit.md §6. The measurements themselves stand; the explanation of them
+> did not. The prescription was followed to the letter in `scoring-core.compact` and did not
+> prevent the blowup.
 
 Measured with a `step` circuit whose body uses its argument twice in a conditional, composed
 N deep — no hashing, no witnesses, no ledger ADTs, one `Uint<8>` in and out:
@@ -93,26 +101,71 @@ candidate per die, and with no hashing at all); ledger ADTs; witnesses; `fold`; 
 versus full ZK; simple comparisons at depth (`d >= 4` re-evaluated on merged dice compiles in
 0.44 s).
 
-**Workaround — worked-around.** Keep chains of comparisons whose operands are themselves
-conditional results **one level deep**. In `turn.compact` the hold mask is computed once from
-roll 1 and reused for both re-rolls rather than re-evaluated per roll:
+### Corrected diagnosis — nesting depth is not the variable
 
-| Shape                       | `--skip-zk` compile |
-| --------------------------- | ------------------- |
-| Mask latched from roll 1    | **2.65 s**          |
-| Mask re-evaluated each roll | **never completes** |
+Hit again building `contract/src/takeTurn.compact` (dice and scoring in one circuit), which
+this entry predicted in its last line. Two measurements kill the depth explanation:
 
-The latched form is a defensible design in its own right (see docs/dice-circuit.md §5), so
-this costs the project little — but it is a constraint imposed by the compiler, not chosen,
-and it is recorded as such. Note also that `turn.compact` still compiles 10× slower than the
-much larger `dice.compact`: the workaround sits below the cliff, not far from it. Any future
-`Table.takeTurn` that adds scoring on top of merged dice should expect to meet this again.
+- **Flattening does not help.** Rewriting `modalFace` from a 5-step running max into a flat
+  argmax — six independent "is this face the maximum" predicates, summed, with no chained
+  conditionals at all — leaves the combined circuit non-terminating at >200 s. Zero nesting,
+  same blowup.
+- **Fan-in alone is not it either.** A whole-hand mask built from a single `faceCount` gives
+  every merged element the same fan-in of 15 and compiles in **0.45 s**.
 
-**Intended upstream action.** Issue against `LFDT-Minokawa/compact` with the 24-line depth
-scaling repro and the 30-line `modalFace` repro, both self-contained. Two asks: (1) share
-`const`-bound subexpressions instead of re-expanding them per use site; (2) failing that,
-emit a diagnostic or a progress indicator so an exponential expansion is distinguishable from
-a hang — the current behaviour costs an hour before anyone suspects the compiler.
+The variable is **the size of the sub-expression each re-read must re-expand, times the number
+of re-reads**, compounding layer by layer. Measured on the real contract, `--skip-zk`, three
+rolls with scoring on the final merged dice:
+
+| Hold mask                 | Merged-die fan-in | Reads of each merged die | Compile    |
+| ------------------------- | ----------------: | -----------------------: | ---------- |
+| `die >= 4` (per-die)      |                 3 |    ~40 (full applyScore) | 10.2 s     |
+| `die == d[0]`             |                 4 |    ~40 (full applyScore) | 8.9 s      |
+| `die == modalFace(roll1)` |                15 |              1 (diceSum) | 5.0 s      |
+| `die == modalFace(roll1)` |                15 |            6 (isYahtzee) | 45.5 s     |
+| `die == modalFace(roll1)` |                15 |             7 (rawScore) | **>150 s** |
+| `die == modalFace(roll1)` |                15 |    ~40 (full applyScore) | **>200 s** |
+
+A third repro pins it in 116 self-contained lines with no hashing, no witnesses and no ledger
+ADTs: `contract/repro/bug1-fanin-{narrow,wide-cheap,wide-modal}.compact` are identical except
+for the three-line body of `mask`, and their instruction counts agree to within 6% (1 293 /
+1 303 / 1 367).
+
+| Repro variant | `mask` reads    | `mask` cost   | reuse=6 | reuse=12 | reuse=18 |
+| ------------- | --------------- | ------------- | ------: | -------: | -------: |
+| `narrow`      | own position    | 1 comparison  | 0.43 s  | 0.48 s   | 0.57 s   |
+| `wide-cheap`  | all 5 positions | 1 `faceCount` | 0.45 s  | —        | —        |
+| `wide-modal`  | all 5 positions | running max   | 3.89 s  | 25.5 s   | 51.6 s   |
+
+`narrow` is flat in the reuse count; `wide-modal` is not, at equal instruction counts.
+
+**Workaround — worked-around.** Restated: **before re-reading a value many times, ask what its
+expression DAG contains.** If it carries a large shared sub-expression, cut the DAG first — put
+the value through the ledger, take it as a circuit argument, or restructure so each element
+depends only on what it needs. Three applications in this repo:
+
+| Shape                                                     | `--skip-zk` compile |
+| --------------------------------------------------------- | ------------------- |
+| `turn.compact`, hold mask latched from roll 1              | **2.65 s**          |
+| `turn.compact`, hold mask re-evaluated each roll           | **never completes** |
+| `takeTurn.compact`, per-die hold policy                    | **22.9 s**          |
+| `takeTurn.compact`, `keepModalFace`                        | **never completes** |
+| `takeTurn`, incremental `totalAfterPlacing`                | **22.9 s**          |
+| `takeTurn`, `cardTotal(placeScore(...))` — 19 reads not 2  | **187 s**           |
+
+`takeTurn.compact` ships with a `holdOne(policy, die)` signature that cannot see the other four
+dice, so the constraint is enforced by the type rather than by a comment. The cost to the game
+is real and is recorded in docs/scoring-circuit.md §5: the combined one-transaction circuit
+cannot offer `keepModalFace`, and the alternatives are a two-transaction turn (both halves
+measured) or a client-declared hold mask (unmeasured).
+
+**Intended upstream action.** Issue against `LFDT-Minokawa/compact` with all five self-contained
+repros — the depth-scaling pair, the `modalFace` nesting pair, and the three-file fan-in set.
+Three asks: (1) share `const`-bound subexpressions instead of re-expanding them per use site;
+(2) failing that, emit a diagnostic or a progress indicator so an exponential expansion is
+distinguishable from a hang — the current behaviour costs an hour before anyone suspects the
+compiler; (3) document the cost model, so "this value is read forty times" is a thing a
+developer knows to look for.
 
 ## 2. Language 0.26: `div_mod_power_of_two` exists in ZKIR but is unreachable from Compact — **open**
 
@@ -395,3 +448,74 @@ in the same emission, or the docs should state that it is eventually-consistent 
 used for accounting. As it stands there is no documented predicate a caller can wait on to get a
 balance that is safe to reason about, which makes the field a trap for exactly the use it looks
 designed for.
+
+## 10. compactc 0.34.0: `Uint<a..b>` excludes `b`, so `x as Uint<0..1>` throws on every `true` — **open**
+
+**Symptom.** A `Boolean`-to-0/1 cast written the obvious way aborts at run time, 100% of the
+time, on a value that is trivially in range:
+
+```compact
+pure circuit flag(x: Boolean): Uint<0..1> { return x as Uint<0..1>; }
+```
+
+```
+CompactError: scoring-core.compact line 82 char 10:
+  cast from Field or Uint value to smaller Uint value failed: 1 is greater than 0
+```
+
+"1 is greater than 0" for a cast whose declared target is `Uint<0..1>`. Nothing rejects it
+earlier: `compact compile`, `compact compile --skip-zk`, full ZK key generation and
+`compact format` all accept the source without a word. There is no diagnostic, no warning, and
+the generated `.zkir` is well-formed — the defect surfaces only when a circuit is executed.
+
+**Root cause.** In this compiler the range spelling `Uint<a..b>` is **exclusive** of `b`, so
+`Uint<0..N>` is `{0 … N−1}` and `Uint<0..1>` is the single-value type `{0}`. The documentation
+says the opposite — that `Uint<8>` and `Uint<0..255>` are the same type and the range is
+inclusive.
+
+Every observation is consistent with the exclusive reading, and inconsistent with the
+documented one. `contract/repro/bug10-uint-range-upper-bound.compact` emits these bound checks
+(read them out of the generated `contract/index.js`):
+
+| Target spelling | Documented max | Emitted check | Executes 255/3/1? | Verdict          |
+| --------------- | -------------: | ------------- | ----------------- | ---------------- |
+| `Uint<1>`       |              1 | `t1 > 1n`     | 1 → `1`           | correct          |
+| `Uint<0..1>`    |              1 | `t1 > 0n`     | 1 → **throws**    | off by one       |
+| `Uint<0..3>`    |              3 | `t1 > 2n`     | 3 → **throws**    | off by one       |
+| `Uint<8>`       |            255 | `t1 > 255n`   | 255 → `255`       | correct          |
+| `Uint<0..256>`  |            255 | `t1 > 255n`   | 255 → `255`       | **= `Uint<8>`**  |
+
+Two independent confirmations that this is the type and not the cast:
+
+- `return 255;` in a circuit declared `Uint<0..255>` **does not compile**:
+  `mismatch between actual return type Uint<8> and declared return type Uint<0..255>`. The
+  compiler itself does not believe the two are the same type. Declared `Uint<0..256>`, the same
+  `return 255;` compiles and returns 255.
+- `1 as Uint<0..1>` on a literal — a value the compiler could constant-fold — still emits the
+  run-time check and still throws. So the bound is wrong at the type level, not in a
+  cast-specific code path, and constant folding does not happen early enough to turn it into a
+  compile error where it would at least be visible.
+
+Whether the compiler or the documentation is wrong is upstream's call. The hazard is the same
+either way, and it is sharpened by the fact that `Uint<0..1>` is the *natural* spelling for a
+selector in a sum-of-products circuit — the shape bugs-found #1 forces on anyone writing a
+multi-way dispatch. Cost here: the whole scoring core was written with it, and only the first
+execution of the cross-check test found it.
+
+**Workaround — worked-around.** **Use the bit-width spelling.** `Uint<1>` is correct, and for a
+`Boolean` source the cast is recognised as statically safe so no check is emitted at all.
+`contract/src/scoring-core.compact`'s `flag` carries a comment saying so, because the wrong
+spelling looks more correct. Never write `Uint<a..b>` in this compiler; `Uint<N>` covers every
+power-of-two bound, and a non-power-of-two bound is not worth the risk.
+
+A silent bonus: the bogus checks were not free. Removing them cut **64 instructions** from
+`takeTurn` (1 868 → 1 804) and 64 from `scoreTurn` (643 → 579) — about 10% of each — because
+each one was a real `assert` in the circuit.
+
+**Intended upstream action.** Issue against `LFDT-Minokawa/compact` with the repro, which is
+self-contained and reads its own answer out of the generated JavaScript, so it needs no runtime
+to demonstrate. Three asks: (1) fix the bound so `Uint<0..N>` includes `N`, or (2) if exclusive
+is intended, say so in the documentation and fix the claim that `Uint<8>` is `Uint<0..255>`;
+(3) either way, reject a statically-impossible cast (`1 as Uint<0..1>`, `true as Uint<0..1>`) at
+compile time instead of emitting a check that can never pass — an unsatisfiable range cast is
+always a bug in the source, and the compiler has the information to say so.

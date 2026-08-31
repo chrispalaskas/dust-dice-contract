@@ -1,0 +1,186 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// Yahtzee scoring, standalone, for measurement.
+//
+// This contract is never deployed. It exists so the scoring half of `Table.takeTurn` is
+// measured before it is built on -- the dice half was measured first in dice.compact and
+// turn.compact (docs/dice-circuit.md), and this is the other half of the same question.
+//
+// The scoring logic itself lives in `scoring-core.compact` and is entirely `pure`. A `pure`
+// exported circuit gets NO prover key, NO verifier key and NO zkir -- it lands in the
+// generated `pureCircuits` object as plain JavaScript, and does not count against the deploy
+// circuit-count ceiling (docs/dice-circuit.md §6.2). That is the right answer for scoring:
+// it is a function of public inputs, so it needs no proof of its own, and the real
+// `Table.takeTurn` will inline it. It also means it CANNOT BE MEASURED directly, so the
+// circuits below are thin impure wrappers whose only job is a ledger write.
+//
+// The wrappers form a cost-attribution ladder, same idea as dice.compact's:
+//
+//   probeCardWrite   -- read the scorecard, write it back unchanged. The floor.
+//   probeRawScore    -- + rawScore for one category.
+//   scoreTurn        -- + full joker-rule placement, scorecard update and grand total.
+//                       This is the shape `Table.takeTurn`'s scoring path will have.
+//   settleTable      -- winner tie-break over 6 seats + the rake assertion. Once per game.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+include "scoring-core";
+
+/** One player's card. The real `Table` holds six of these; one is enough to price the path. */
+export ledger card: Scorecard;
+
+/** Last settlement result, so `settleTable` has something impure to do. */
+export ledger lastWinnerSeat: Uint<8>;
+
+/** Last grand total written, so `scoreTurn` publishes the number a spectator wants. */
+export ledger lastTotal: Uint<16>;
+
+// ---------------------------------------------------------------------------------------
+// The measured scoring path
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Apply a turn's final dice to the ledger scorecard. THE measured circuit.
+ *
+ * Shaped like `Table.takeTurn`'s scoring path: read the card from state, run the official
+ * joker rules against it, reject an illegal placement, write the updated card back, and
+ * publish the running grand total. What it does not have is seats, turn order, the pot, or
+ * the dice derivation -- so its cost is the scoring half of `takeTurn` and nothing else.
+ * `takeTurn.compact` measures the two halves together.
+ *
+ * The dice are range-checked. In the live game they come from `deriveDice` and are 1..6 by
+ * construction, but here they are a circuit argument, and `applyScore` reads `d[0]` as "the
+ * face of a Yahtzee" -- a caller passing 0 or 7 would be scoring against a histogram that
+ * cannot occur. Six comparisons is a cheap way to make the argument version behave like the
+ * derived one.
+ *
+ * `disclose` publishes the updated card and the total. Both are public game state: a
+ * scorecard is the public record of a game of Yahtzee and a spectator has to see it. What is
+ * NOT disclosed is anything else -- there is no witness in this contract at all, and the
+ * `disclose` is required only because Compact treats an exported circuit's PARAMETERS as
+ * private inputs to the proof, exactly like witness results (docs/dice-circuit.md §6.3).
+ */
+export circuit scoreTurn(category: Uint<8>, d: Vector<5, Uint<8>>): ScoreOutcome {
+  assertDiceInRange(d);
+
+  const before = card;
+  const outcome = applyScore(category, d, before.filled, before.scores[11]);
+  assert(outcome.validPlacement, "illegal placement: box taken, or joker rules violated");
+
+  const after = placeScore(before, category, d);
+  card = disclose(after);
+  // `totalAfterPlacing`, not `cardTotal(after)`: the two agree (pinned by the tests) but the
+  // incremental form reads the new score twice instead of nineteen times. It makes no
+  // difference here, where the dice are a fresh circuit argument, and all the difference in
+  // takeTurn.compact, where they are conditionally merged. Same form in both so the two
+  // instruction counts are comparable.
+  lastTotal = disclose(totalAfterPlacing(before, category, outcome.score, outcome.bonusEarned));
+  return disclose(outcome);
+}
+
+/** Every die in 1..6. */
+pure circuit assertDiceInRange(d: Vector<5, Uint<8>>): [] {
+  assert(d[0] >= 1 && d[0] <= 6, "die 0 out of range");
+  assert(d[1] >= 1 && d[1] <= 6, "die 1 out of range");
+  assert(d[2] >= 1 && d[2] <= 6, "die 2 out of range");
+  assert(d[3] >= 1 && d[3] <= 6, "die 3 out of range");
+  assert(d[4] >= 1 && d[4] <= 6, "die 4 out of range");
+}
+
+/**
+ * Reset the card to all-open. Needed because there is no constructor: a ledger `Scorecard`
+ * starts at its default (all zeros, all `false`), which happens to be an empty card already,
+ * but the tests replay many independent scorecards through one simulator and need to get
+ * back there.
+ */
+export circuit resetCard(): [] {
+  card = emptyScorecard();
+  lastTotal = 0;
+}
+
+/**
+ * Fill the card from arguments, so a test can put an arbitrary mid-game scorecard on-chain
+ * without playing thirteen legal turns into it.
+ *
+ * Test-only, and it is why this contract is not deployable: it lets anyone write any card.
+ * `Table` must only ever reach a scorecard through `scoreTurn`.
+ */
+export circuit loadCard(c: Scorecard): [] {
+  card = disclose(c);
+  lastTotal = disclose(cardTotal(c));
+}
+
+// ---------------------------------------------------------------------------------------
+// Settlement
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Winner selection plus the rake assertion -- the once-per-game settlement path.
+ *
+ * Both halves are here because both are settlement: `winnerOfSeats` decides who is paid and
+ * `splitPot` decides how much, and neither is worth a transaction of its own.
+ *
+ * `seatCount >= 2` is asserted rather than assumed: `winnerSeat` returns seat 0 when no row
+ * is active, which would silently pay a seat that does not exist.
+ */
+export circuit settleTable(
+                 totals: Vector<6, Uint<16>>,
+                 finishedAtTurn: Vector<6, Uint<16>>,
+                 seatCount: Uint<8>,
+                 pot: Uint<64>,
+                 q: Uint<64>,
+                 r: Uint<64>,
+                 ): Vector<3, Uint<64>> {
+  assert(seatCount >= 2 && seatCount <= maxSeats(), "seat count must be 2..6");
+  const winner = winnerOfSeats(totals, finishedAtTurn, seatCount);
+  const split = splitPot(pot, q, r);
+  lastWinnerSeat = disclose(winner);
+  return disclose([winner as Uint<64>, split[0], split[1]]);
+}
+
+// ---------------------------------------------------------------------------------------
+// Cost attribution probes
+// ---------------------------------------------------------------------------------------
+
+/** Read the card and write it back unchanged. The floor every other wrapper sits on. */
+export circuit probeCardWrite(): Uint<16> {
+  const before = card;
+  card = before;
+  lastTotal = disclose(cardTotal(before));
+  return disclose(cardTotal(before));
+}
+
+/** The floor plus `rawScore` for one category. `scoreTurn` minus this is the joker rules. */
+export circuit probeRawScore(category: Uint<8>, d: Vector<5, Uint<8>>): Uint<8> {
+  const s = rawScore(category, d);
+  lastTotal = disclose(s as Uint<16>);
+  return disclose(s);
+}
+
+/** The floor plus the joker-rule decision, without the scorecard update or the totals. */
+export circuit probeApplyScore(category: Uint<8>, d: Vector<5, Uint<8>>): ScoreOutcome {
+  const outcome = applyScore(category, d, card.filled, card.scores[11]);
+  lastTotal = disclose(outcome.score as Uint<16>);
+  return disclose(outcome);
+}
+
+/** The winner tie-break alone, so the 36 pairwise comparisons can be priced. */
+export circuit probeWinner(
+                 totals: Vector<6, Uint<16>>,
+                 finishedAtTurn: Vector<6, Uint<16>>,
+                 seatCount: Uint<8>,
+                 ): Uint<8> {
+  const winner = winnerOfSeats(totals, finishedAtTurn, seatCount);
+  lastWinnerSeat = disclose(winner);
+  return disclose(winner);
+}
+
+/** The rake assertion alone. */
+export circuit probeRake(pot: Uint<64>, q: Uint<64>, r: Uint<64>): Vector<2, Uint<64>> {
+  const split = splitPot(pot, q, r);
+  lastWinnerSeat = 0;
+  return disclose(split);
+}

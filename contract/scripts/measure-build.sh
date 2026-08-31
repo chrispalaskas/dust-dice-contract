@@ -37,7 +37,9 @@ compile_one() {
   echo "[$name/$mode] exit=$rc $(echo "$end - $start" | bc)s"
 }
 
-for name in dice turn; do
+CONTRACTS=(dice turn scoring takeTurn)
+
+for name in "${CONTRACTS[@]}"; do
   compile_one "$name" skipzk "--skip-zk"
   compile_one "$name" zk ""
 done
@@ -45,7 +47,7 @@ done
 echo "=== artifact sizes ==="
 {
   printf 'contract\tcircuit\tartifact\tbytes\n'
-  for name in dice turn; do
+  for name in "${CONTRACTS[@]}"; do
     d="$OUT/$name-zk"
     for f in "$d"/keys/* "$d"/zkir/*; do
       [ -f "$f" ] || continue

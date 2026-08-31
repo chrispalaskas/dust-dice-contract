@@ -36,7 +36,22 @@ import {
   ledger as turnLedger,
   type Ledger as TurnLedgerType,
 } from '../managed/turn/contract/index.js';
+import {
+  Contract as ScoringContract,
+  ledger as scoringLedger,
+  type Ledger as ScoringLedgerType,
+  type Scorecard,
+  type ScoreOutcome,
+} from '../managed/scoring/contract/index.js';
+import {
+  Contract as TakeTurnContract,
+  ledger as takeTurnLedger,
+  type Ledger as TakeTurnLedgerType,
+  type TurnOutcome,
+} from '../managed/takeTurn/contract/index.js';
 import { diceWitnesses, type DicePrivateState } from '../witnesses.ts';
+
+export type { Scorecard, ScoreOutcome, TurnOutcome };
 
 const COIN_PUBLIC_KEY = '0'.repeat(64);
 
@@ -217,5 +232,105 @@ export class TurnSimulator extends BaseSimulator {
     return this.run('resolveTurn', (ctx) =>
       this.turn.impureCircuits.resolveTurn(ctx, tableId, playerEntropy, round, policy),
     );
+  }
+}
+
+/**
+ * scoring.compact. No witnesses of its own -- every input is a circuit argument -- but the
+ * generated `Contract` still wants a witnesses object, and `diceWitnesses` satisfies the
+ * empty interface it declares.
+ */
+export class ScoringSimulator extends BaseSimulator {
+  scoring: ScoringContract<DicePrivateState>;
+
+  constructor(privateState: DicePrivateState) {
+    const contract = new ScoringContract<DicePrivateState>(diceWitnesses);
+    super(contract as unknown as AnyContract, privateState);
+    this.scoring = contract;
+  }
+
+  static async create(privateState: DicePrivateState): Promise<ScoringSimulator> {
+    const sim = new ScoringSimulator(privateState);
+    await sim.init();
+    return sim;
+  }
+
+  getLedger(): ScoringLedgerType {
+    return scoringLedger(this.state);
+  }
+
+  scoreTurn(category: bigint, dice: bigint[]): Promise<ScoreOutcome> {
+    return this.run('scoreTurn', (ctx) =>
+      this.scoring.impureCircuits.scoreTurn(ctx, category, dice),
+    );
+  }
+
+  loadCard(card: Scorecard): Promise<[]> {
+    return this.run('loadCard', (ctx) => this.scoring.impureCircuits.loadCard(ctx, card));
+  }
+
+  resetCard(): Promise<[]> {
+    return this.run('resetCard', (ctx) => this.scoring.impureCircuits.resetCard(ctx));
+  }
+
+  settleTable(
+    totals: bigint[],
+    finishedAtTurn: bigint[],
+    seatCount: bigint,
+    pot: bigint,
+    q: bigint,
+    r: bigint,
+  ): Promise<bigint[]> {
+    return this.run('settleTable', (ctx) =>
+      this.scoring.impureCircuits.settleTable(ctx, totals, finishedAtTurn, seatCount, pot, q, r),
+    );
+  }
+}
+
+/** takeTurn.compact: dice derivation and scoring in one circuit. */
+export class TakeTurnSimulator extends BaseSimulator {
+  takeTurnContract: TakeTurnContract<DicePrivateState>;
+
+  constructor(privateState: DicePrivateState) {
+    const contract = new TakeTurnContract<DicePrivateState>(diceWitnesses);
+    super(contract as unknown as AnyContract, privateState);
+    this.takeTurnContract = contract;
+  }
+
+  static async create(privateState: DicePrivateState): Promise<TakeTurnSimulator> {
+    const sim = new TakeTurnSimulator(privateState);
+    await sim.init();
+    return sim;
+  }
+
+  getLedger(): TakeTurnLedgerType {
+    return takeTurnLedger(this.state);
+  }
+
+  takeTurn(
+    tableId: Uint8Array,
+    playerEntropy: Uint8Array,
+    round: bigint,
+    policy: number,
+    category: bigint,
+  ): Promise<TurnOutcome> {
+    return this.run('takeTurn', (ctx) =>
+      this.takeTurnContract.impureCircuits.takeTurn(
+        ctx,
+        tableId,
+        playerEntropy,
+        round,
+        policy,
+        category,
+      ),
+    );
+  }
+
+  loadCard(card: Scorecard): Promise<[]> {
+    return this.run('loadCard', (ctx) => this.takeTurnContract.impureCircuits.loadCard(ctx, card));
+  }
+
+  resetCard(): Promise<[]> {
+    return this.run('resetCard', (ctx) => this.takeTurnContract.impureCircuits.resetCard(ctx));
   }
 }

@@ -1,0 +1,708 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// Yahtzee scoring core: rawScore, joker-rule placement, totals, winner tie-break, rake.
+//
+// `include`d verbatim by scoring.compact and takeTurn.compact, so this file carries NO
+// pragma and NO import of its own -- the including file supplies both. Same convention as
+// dice-core.compact. Editing this file changes the verifier keys of every contract that
+// includes it (see docs/architecture.md, "Deployment pinning").
+//
+// ---------------------------------------------------------------------------------------
+// The reference this mirrors
+// ---------------------------------------------------------------------------------------
+// api/src/rules.ts is contract-canonical. Every number and every branch below is a
+// transliteration of it, and src/test/scoring.test.ts cross-checks the compiled circuits
+// against it over the whole category x dice x scorecard space it can reach. If the two
+// disagree the circuit is wrong, not rules.ts.
+//
+// Category indices are the ones in `rules.ts`'s `Category` enum and appear on-chain:
+//
+//   0 Ones  1 Twos  2 Threes  3 Fours  4 Fives  5 Sixes
+//   6 ThreeOfAKind  7 FourOfAKind  8 FullHouse  9 SmallStraight
+//   10 LargeStraight  11 Yahtzee  12 Chance
+//
+// They are a `Uint<8>`, not a Compact `enum`, on purpose: the joker rules compute a category
+// arithmetically (`upperCat = face - 1`) and compare it against the requested one. An enum
+// value cannot be produced by arithmetic, so an enum would force a six-way ladder for what
+// is one comparison.
+//
+// ---------------------------------------------------------------------------------------
+// Why this is written as sums of products and not as if/else
+// ---------------------------------------------------------------------------------------
+// docs/bugs-found.md #1: compactc 0.34.0 does not share `const`-bound subexpressions, so a
+// value read M times costs M expansions of its whole DAG -- and where that DAG contains
+// another re-read value, the factors multiply. A 13-way category dispatch written as a ternary
+// ladder is the bad case twice over: thirteen nested conditionals whose operands (`hasThree ?
+// total : 0` and friends) are themselves conditional results, each re-reading the dice.
+//
+// So there is no dispatch here at all. Every category's value is computed unconditionally
+// and multiplied by a 0/1 selector, and the thirteen products are SUMMED:
+//
+//     score = sum over c of  (category == c) * value(c)
+//
+// Exactly one selector is 1, so the sum is the score. Every operand is read once, and a
+// circuit has no branches anyway, so computing all thirteen values costs nothing over a
+// ladder that would also have computed all thirteen. The same rewrite is applied to the
+// joker-rule placement test (flattened to a disjunction by Boolean algebra rather than nested
+// if/else) and to the winner tie-break (all 36 pairwise comparisons rather than a running
+// max). It works: nine circuits here compile in 0.64 s, against turn.compact's two in 7.97 s.
+//
+// It is NOT sufficient on its own -- reading a dice-derived value forty times still blows up
+// when the dice themselves are conditionally merged, which is what shapes takeTurn.compact and
+// what `totalAfterPlacing` below exists to avoid. Measured cost, compile times and the
+// corrected diagnosis of bugs-found.md #1: docs/scoring-circuit.md §§4-6.
+
+// ---------------------------------------------------------------------------------------
+// Constants of the game
+// ---------------------------------------------------------------------------------------
+
+/** Upper-section total at or above which the 35-point bonus is earned. */
+pure circuit upperBonusThreshold(): Uint<8> {
+  return 63;
+}
+
+/** The upper-section bonus itself. */
+pure circuit upperBonusValue(): Uint<8> {
+  return 35;
+}
+
+/** Bonus per extra Yahtzee, when the Yahtzee box holds 50. */
+pure circuit yahtzeeBonusValue(): Uint<8> {
+  return 100;
+}
+
+/** Number of scorecard categories. */
+pure circuit categoryCount(): Uint<8> {
+  return 13;
+}
+
+/**
+ * `Boolean` as a tight 0/1 integer. The selector in every sum-of-products below.
+ *
+ * `Uint<1>`, NOT `Uint<0..1>`. They should be the same type and they are not: in compactc
+ * 0.34.0 the range spelling `Uint<a..b>` EXCLUDES `b`, so `Uint<0..1>` is the single-value
+ * type {0} and `x as Uint<0..1>` throws at run time for every `true`. It compiles silently --
+ * the failure only appears on execution. docs/bugs-found.md #10 has the evidence and the
+ * minimal repro; this comment exists because the wrong spelling looks more correct.
+ *
+ * `x as Uint<8>` would also work, but types every product as `Uint<0..65025>` and forces a
+ * checked narrowing cast at each step. `Uint<1>` keeps the intermediate widths honest, so the
+ * only narrowing assertions in this file are the final ones on a score.
+ */
+pure circuit flag(x: Boolean): Uint<1> {
+  return x as Uint<1>;
+}
+
+// ---------------------------------------------------------------------------------------
+// Dice counts
+// ---------------------------------------------------------------------------------------
+
+/** How many of the five dice show face `f`. */
+pure circuit faceCount(d: Vector<5, Uint<8>>, f: Uint<8>): Uint<8> {
+  return (((d[0] == f) as Uint<8>) +
+          ((d[1] == f) as Uint<8>) +
+          ((d[2] == f) as Uint<8>) +
+          ((d[3] == f) as Uint<8>) +
+          ((d[4] == f) as Uint<8>))
+         as Uint<8>;
+}
+
+/** Pip total of the five dice. At most 30, so it fits a `Uint<8>`. */
+pure circuit diceSum(d: Vector<5, Uint<8>>): Uint<8> {
+  return (d[0] + d[1] + d[2] + d[3] + d[4]) as Uint<8>;
+}
+
+/**
+ * The face histogram plus the pip total, computed once per scoring call.
+ *
+ * `rules.ts` builds a 7-element array indexed 1..6; this is the same thing with the unused
+ * slot 0 dropped. Every predicate below reads only this struct, so the five dice are
+ * inspected exactly six times, not once per category.
+ */
+struct Counts {
+  c1: Uint<8>,
+  c2: Uint<8>,
+  c3: Uint<8>,
+  c4: Uint<8>,
+  c5: Uint<8>,
+  c6: Uint<8>,
+  total: Uint<8>,
+}
+
+pure circuit countsOf(d: Vector<5, Uint<8>>): Counts {
+  return Counts { c1: faceCount(d, 1),
+                  c2: faceCount(d, 2),
+                  c3: faceCount(d, 3),
+                  c4: faceCount(d, 4),
+                  c5: faceCount(d, 5),
+                  c6: faceCount(d, 6),
+                  total: diceSum(d), };
+}
+
+/** Some face appears at least `n` times. */
+pure circuit anyCountAtLeast(k: Counts, n: Uint<8>): Boolean {
+  return k.c1 >= n || k.c2 >= n || k.c3 >= n || k.c4 >= n || k.c5 >= n || k.c6 >= n;
+}
+
+/** Some face appears exactly `n` times -- `rules.ts`'s `c.includes(n)`. */
+pure circuit anyCountExactly(k: Counts, n: Uint<8>): Boolean {
+  return k.c1 == n || k.c2 == n || k.c3 == n || k.c4 == n || k.c5 == n || k.c6 == n;
+}
+
+/**
+ * Five of a kind.
+ *
+ * `rules.ts` spells this `counts(dice).some(n => n === 5)`. For dice in 1..6 that is the
+ * same predicate as "all five dice are equal"; the histogram form is kept so the two
+ * implementations read alike, and the four-comparison form is not cheaper once the
+ * histogram exists anyway.
+ */
+export pure circuit isYahtzee(d: Vector<5, Uint<8>>): Boolean {
+  return anyCountExactly(countsOf(d), 5);
+}
+
+// ---------------------------------------------------------------------------------------
+// rawScore
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Face-value score of `d` in `category`, with no joker considerations.
+ *
+ * Mirrors `rawScore` in api/src/rules.ts, including the two cases that surprise people:
+ * a five-of-a-kind scores 25 as a Full House (`c.includes(5)`), and it also satisfies
+ * three- and four-of-a-kind (so scores the pip total there).
+ *
+ * Returns 0 for any `category` outside 0..12 -- no selector matches, so the sum is empty.
+ * `applyScore` rejects such a category separately; a bare `rawScore` never asserts on the
+ * category.
+ *
+ * PRECONDITION: every die is in 1..6. It holds automatically where the dice come from
+ * `deriveDice`, and `scoreTurn` in scoring.compact asserts it where they come from a circuit
+ * argument. It is not re-checked here, because a check on every scoring call would be paid on
+ * the derived path too. Violating it aborts rather than misscoring: `diceSum` of five 255s is
+ * 1 275, and the narrowing cast on the return refuses it. `rules.ts` has no such guard -- its
+ * `counts` array is indexed by face, so a die outside 1..6 corrupts the histogram silently.
+ * The circuit is the stricter of the two, which is the right way round.
+ */
+export pure circuit rawScore(category: Uint<8>, d: Vector<5, Uint<8>>): Uint<8> {
+  const k = countsOf(d);
+
+  const h1 = k.c1 > 0;
+  const h2 = k.c2 > 0;
+  const h3 = k.c3 > 0;
+  const h4 = k.c4 > 0;
+  const h5 = k.c5 > 0;
+  const h6 = k.c6 > 0;
+
+  const five = anyCountExactly(k, 5);
+  const threeKind = anyCountAtLeast(k, 3);
+  const fourKind = anyCountAtLeast(k, 4);
+  const fullHouse = (anyCountExactly(k, 3) && anyCountExactly(k, 2)) || five;
+  const smallStraight = (h1 && h2 && h3 && h4) || (h2 && h3 && h4 && h5) || (h3 && h4 && h5 && h6);
+  const largeStraight = (h1 && h2 && h3 && h4 && h5) || (h2 && h3 && h4 && h5 && h6);
+
+  // One selector is 1 and the other twelve are 0, so this sum is the score. At most 50.
+  return (flag(category == 0) * k.c1 +
+          flag(category == 1) * (k.c2 * 2) +
+          flag(category == 2) * (k.c3 * 3) +
+          flag(category == 3) * (k.c4 * 4) +
+          flag(category == 4) * (k.c5 * 5) +
+          flag(category == 5) * (k.c6 * 6) +
+          flag(category == 6) * (flag(threeKind) * k.total) +
+          flag(category == 7) * (flag(fourKind) * k.total) +
+          flag(category == 8) * (flag(fullHouse) * 25) +
+          flag(category == 9) * (flag(smallStraight) * 30) +
+          flag(category == 10) * (flag(largeStraight) * 40) +
+          flag(category == 11) * (flag(five) * 50) +
+          flag(category == 12) * k.total)
+         as Uint<8>;
+}
+
+// ---------------------------------------------------------------------------------------
+// Scorecard shape
+// ---------------------------------------------------------------------------------------
+
+/**
+ * One player's scorecard, in ledger/return shape.
+ *
+ * `rules.ts` uses `number | null` per category; a circuit has no null, so the two are split:
+ * `filled[c]` says whether category `c` has been taken, `scores[c]` is 0 until it is. A
+ * legitimately-zero score (a scratched category) is therefore `filled = true, score = 0`,
+ * which is exactly what `null` versus `0` distinguishes in the reference.
+ *
+ * `yahtzeeBonuses` counts earned +100 bonuses, matching the reference field of the same name.
+ * Fixed width, so the ledger-write cost is constant.
+ */
+export struct Scorecard {
+  scores: Vector<13, Uint<8>>,
+  filled: Vector<13, Boolean>,
+  yahtzeeBonuses: Uint<8>,
+}
+
+/** An all-open scorecard. Used by constructors and by the tests' starting state. */
+export pure circuit emptyScorecard(): Scorecard {
+  return Scorecard { scores: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                     filled: [false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false],
+                     yahtzeeBonuses: 0, };
+}
+
+/**
+ * `filled[category]` with a run-time `category`.
+ *
+ * A `Vector` index must be a compile-time constant, so a run-time lookup is a disjunction
+ * over the thirteen positions. Flat -- thirteen ANDs ORed together, nesting depth 1.
+ */
+pure circuit filledAt(filled: Vector<13, Boolean>, category: Uint<8>): Boolean {
+  return (category == 0 && filled[0]) ||
+         (category == 1 && filled[1]) ||
+         (category == 2 && filled[2]) ||
+         (category == 3 && filled[3]) ||
+         (category == 4 && filled[4]) ||
+         (category == 5 && filled[5]) ||
+         (category == 6 && filled[6]) ||
+         (category == 7 && filled[7]) ||
+         (category == 8 && filled[8]) ||
+         (category == 9 && filled[9]) ||
+         (category == 10 && filled[10]) ||
+         (category == 11 && filled[11]) ||
+         (category == 12 && filled[12]);
+}
+
+/** `filled[face - 1]`, i.e. is the upper box matching `face` (1..6) already taken. */
+pure circuit upperFilledForFace(filled: Vector<13, Boolean>, face: Uint<8>): Boolean {
+  return (face == 1 && filled[0]) ||
+         (face == 2 && filled[1]) ||
+         (face == 3 && filled[2]) ||
+         (face == 4 && filled[3]) ||
+         (face == 5 && filled[4]) ||
+         (face == 6 && filled[5]);
+}
+
+/** Write `value` into position `category` of `v`, leaving the rest alone. */
+pure circuit setScoreAt(
+               v: Vector<13, Uint<8>>,
+               category: Uint<8>,
+               value: Uint<8>,
+               ): Vector<13, Uint<8>> {
+  return [category == 0 ? value : v[0],
+          category == 1 ? value : v[1],
+          category == 2 ? value : v[2],
+          category == 3 ? value : v[3],
+          category == 4 ? value : v[4],
+          category == 5 ? value : v[5],
+          category == 6 ? value : v[6],
+          category == 7 ? value : v[7],
+          category == 8 ? value : v[8],
+          category == 9 ? value : v[9],
+          category == 10 ? value : v[10],
+          category == 11 ? value : v[11],
+          category == 12 ? value : v[12],];
+}
+
+/** Mark position `category` of `v` as taken. */
+pure circuit setFilledAt(v: Vector<13, Boolean>, category: Uint<8>,): Vector<13, Boolean> {
+  return [category == 0 || v[0],
+          category == 1 || v[1],
+          category == 2 || v[2],
+          category == 3 || v[3],
+          category == 4 || v[4],
+          category == 5 || v[5],
+          category == 6 || v[6],
+          category == 7 || v[7],
+          category == 8 || v[8],
+          category == 9 || v[9],
+          category == 10 || v[10],
+          category == 11 || v[11],
+          category == 12 || v[12],];
+}
+
+// ---------------------------------------------------------------------------------------
+// applyScore -- official joker rules
+// ---------------------------------------------------------------------------------------
+
+/** What `applyScore` decides. `rules.ts` throws where this returns `validPlacement: false`. */
+export struct ScoreOutcome {
+  /** Points the category is worth for these dice, joker value included. */
+  score: Uint<8>,
+  /** False where `rules.ts` raises `RuleViolation` -- box taken, or joker forcing violated. */
+  validPlacement: Boolean,
+  /** True when an extra Yahtzee earns the +100 (Yahtzee box holds 50). */
+  bonusEarned: Boolean,
+}
+
+/**
+ * Score `d` into `category` against a scorecard, enforcing the official joker rules.
+ *
+ * Transliterated from `applyScore` in api/src/rules.ts. That function's control flow is
+ * three nested branches; here it is flattened to two Boolean expressions and one select,
+ * for the reason in the header comment. The rules it encodes, unchanged:
+ *
+ *  * Normal case -- the category must be open; score is `rawScore`.
+ *  * Joker case (the dice are a Yahtzee AND the Yahtzee box is already taken):
+ *      - the matching upper box (`face - 1`) is OPEN => that box is FORCED, nothing else is
+ *        legal, and it scores `rawScore` (which is `5 * face`);
+ *      - it is filled and some lower box is open => any OPEN lower box is legal, at full
+ *        joker value: Full House 25, Small Straight 30, Large Straight 40, everything else
+ *        `rawScore`;
+ *      - it is filled and every lower box is filled => any open box is legal at face value,
+ *        which for a non-matching upper box is 0.
+ *  * The +100 bonus is earned in every joker case, but only if the Yahtzee box holds 50 --
+ *    a scratched (0) Yahtzee box still forces placement and still pays nothing.
+ *
+ * `yahtzeeBoxScore` is `scores[11]`; it is only consulted when `filled[11]` is set, so an
+ * open Yahtzee box may pass 0.
+ *
+ * Note the ordering that matters: the "already filled" test wins over the joker tests, so a
+ * joker whose forced upper box happens to be the requested-but-taken category is invalid for
+ * the ordinary reason. That is `rules.ts`'s order too -- it throws on `scores[category] !==
+ * null` before looking at jokers.
+ */
+export pure circuit applyScore(
+                      category: Uint<8>,
+                      d: Vector<5, Uint<8>>,
+                      filled: Vector<13, Boolean>,
+                      yahtzeeBoxScore: Uint<8>,
+                      ): ScoreOutcome {
+  const raw = rawScore(category, d);
+  const joker = isYahtzee(d) && filled[11];
+
+  // All five dice are equal in a joker situation, so `d[0]` is the face -- `rules.ts` reads
+  // `dice[0]` for exactly this reason.
+  const face = d[0];
+  const upperCat = (face - 1) as Uint<8>;
+  const upperOpen = joker && !upperFilledForFace(filled, face);
+
+  // The six categories `rules.ts` lists as "lower" for joker purposes. Yahtzee (11) is not
+  // among them: in a joker situation it is filled by definition.
+  const lowerOpen =
+          !filled[6] || !filled[7] || !filled[8] || !filled[9] || !filled[10] || !filled[12];
+  const catIsLower =
+          category == 6 ||
+          category == 7 ||
+          category == 8 ||
+          category == 9 ||
+          category == 10 ||
+          category == 12;
+
+  const open = category < categoryCount() && !filledAt(filled, category);
+
+  // The three joker branches, as a disjunction rather than nested if/else. `!joker` covers
+  // the normal case; the branches are mutually exclusive on (upperOpen, lowerOpen).
+  const jokerOk = !joker ||
+                  (upperOpen && category == upperCat) ||
+                  (!upperOpen && lowerOpen && catIsLower) ||
+                  (!upperOpen && !lowerOpen);
+
+  // Full joker value applies only in the middle branch.
+  const useJokerValue = joker && !upperOpen && lowerOpen;
+  const isFullHouse = category == 8;
+  const isSmallStraight = category == 9;
+  const isLargeStraight = category == 10;
+  const overridden = isFullHouse || isSmallStraight || isLargeStraight;
+  const jokerValue =
+          (flag(isFullHouse) * 25 +
+           flag(isSmallStraight) * 30 +
+           flag(isLargeStraight) * 40 +
+           flag(!overridden) * raw)
+          as Uint<8>;
+
+  return ScoreOutcome { score: (flag(useJokerValue) * jokerValue + flag(!useJokerValue) * raw)
+                               as Uint<8>,
+                        validPlacement: open && jokerOk,
+                        bonusEarned: joker && yahtzeeBoxScore == 50, };
+}
+
+/**
+ * `applyScore` plus the scorecard update -- the whole of `rules.ts`'s `applyScore` return.
+ *
+ * Returns the card unchanged when the placement is illegal; callers assert on
+ * `outcome.validPlacement` and must not use the card if it is false.
+ */
+export pure circuit placeScore(
+                      card: Scorecard,
+                      category: Uint<8>,
+                      d: Vector<5, Uint<8>>,
+                      ): Scorecard {
+  const outcome = applyScore(category, d, card.filled, card.scores[11]);
+  return Scorecard { scores: setScoreAt(card.scores, category, outcome.score),
+                     filled: setFilledAt(card.filled, category),
+                     yahtzeeBonuses: (card.yahtzeeBonuses + flag(outcome.bonusEarned)) as Uint<8>, };
+}
+
+// ---------------------------------------------------------------------------------------
+// Totals
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Upper-section total (categories 0..5). At most 5+10+15+20+25+30 = 105.
+ *
+ * Unfilled categories hold 0, which is what `rules.ts`'s `?? 0` does.
+ */
+export pure circuit upperTotal(scores: Vector<13, Uint<8>>): Uint<16> {
+  return (scores[0] + scores[1] + scores[2] + scores[3] + scores[4] + scores[5]) as Uint<16>;
+}
+
+/** 35 at or above 63, else 0. */
+export pure circuit upperBonus(scores: Vector<13, Uint<8>>): Uint<8> {
+  return (flag(upperTotal(scores) >= upperBonusThreshold() as Uint<16>) * upperBonusValue())
+         as Uint<8>;
+}
+
+/**
+ * Grand total: every filled score, plus the upper bonus, plus 100 per Yahtzee bonus.
+ *
+ * Ceiling is 340 (all categories at max) + 35 + 12 x 100 = 1 575, so `Uint<16>`.
+ */
+export pure circuit grandTotal(scores: Vector<13, Uint<8>>, yahtzeeBonuses: Uint<8>,): Uint<16> {
+  const boxes = (scores[0] +
+                 scores[1] +
+                 scores[2] +
+                 scores[3] +
+                 scores[4] +
+                 scores[5] +
+                 scores[6] +
+                 scores[7] +
+                 scores[8] +
+                 scores[9] +
+                 scores[10] +
+                 scores[11] +
+                 scores[12])
+                as Uint<16>;
+  return (boxes + upperBonus(scores) + yahtzeeBonuses * yahtzeeBonusValue()) as Uint<16>;
+}
+
+/** Grand total of a whole card. */
+export pure circuit cardTotal(card: Scorecard): Uint<16> {
+  return grandTotal(card.scores, card.yahtzeeBonuses);
+}
+
+/**
+ * The grand total a card WILL have once `score` is placed in `category`, computed from the
+ * card as it stands. Equal to `cardTotal(placeScore(card, category, dice))` -- pinned by
+ * src/test/scoring.test.ts over the whole cross-check corpus.
+ *
+ * This exists for one reason, and it is a compiler reason. `cardTotal(placeScore(...))` reads
+ * the newly-placed score NINETEEN times: `setScoreAt` writes it conditionally into all
+ * thirteen slots, `grandTotal` then sums all thirteen and `upperBonus` re-sums the first six.
+ * Where the score derives from conditionally-merged dice -- which is exactly
+ * `takeTurn.compact` -- each of those reads re-expands the whole dice DAG, and the compile
+ * goes from 12 s to 187 s (docs/scoring-circuit.md §5). This form reads `score` TWICE: once
+ * for the box total, once for the upper-section total.
+ *
+ * `card.scores` is read many times either way, but it comes straight off the ledger, so its
+ * leaves are public inputs and re-reading them is free.
+ */
+export pure circuit totalAfterPlacing(
+                      card: Scorecard,
+                      category: Uint<8>,
+                      score: Uint<8>,
+                      bonusEarned: Boolean,
+                      ): Uint<16> {
+  const boxes = (card.scores[0] +
+                 card.scores[1] +
+                 card.scores[2] +
+                 card.scores[3] +
+                 card.scores[4] +
+                 card.scores[5] +
+                 card.scores[6] +
+                 card.scores[7] +
+                 card.scores[8] +
+                 card.scores[9] +
+                 card.scores[10] +
+                 card.scores[11] +
+                 card.scores[12] +
+                 score)
+                as Uint<16>;
+  const upper = (upperTotal(card.scores) + flag(category < 6) * score) as Uint<16>;
+  const bonuses = (card.yahtzeeBonuses + flag(bonusEarned)) as Uint<8>;
+  return (boxes +
+          flag(upper >= upperBonusThreshold() as Uint<16>) * upperBonusValue() +
+          bonuses * yahtzeeBonusValue())
+         as Uint<16>;
+}
+
+/** Every category taken. */
+export pure circuit isComplete(card: Scorecard): Boolean {
+  return card.filled[0] &&
+         card.filled[1] &&
+         card.filled[2] &&
+         card.filled[3] &&
+         card.filled[4] &&
+         card.filled[5] &&
+         card.filled[6] &&
+         card.filled[7] &&
+         card.filled[8] &&
+         card.filled[9] &&
+         card.filled[10] &&
+         card.filled[11] &&
+         card.filled[12];
+}
+
+// ---------------------------------------------------------------------------------------
+// Winner and tie-break
+// ---------------------------------------------------------------------------------------
+
+/**
+ * One seat's settlement inputs.
+ *
+ * `finishedAtTurn` is the global turn index at which the seat took its thirteenth category;
+ * lower is earlier. `rules.ts` gives a forfeited seat `Infinity`; a circuit has no infinity,
+ * so pass `noFinish()` -- 65 535, unreachable by a real game of 6 x 13 = 78 turns.
+ *
+ * `active` is false for seats that do not exist at this table. An inactive seat can never
+ * win, whatever its numbers.
+ */
+export struct SeatTotal {
+  seat: Uint<8>,
+  total: Uint<16>,
+  finishedAtTurn: Uint<16>,
+  active: Boolean,
+}
+
+/** The "never finished" sentinel that stands in for `rules.ts`'s `Infinity`. */
+export pure circuit noFinish(): Uint<16> {
+  return 65535;
+}
+
+/** Maximum seats at a table. */
+export pure circuit maxSeats(): Uint<8> {
+  return 6;
+}
+
+/**
+ * Does `a` win against `b`? Vacuously true when `b` is inactive or is `a` itself.
+ *
+ * The order is `rules.ts`'s: higher total, then earlier `finishedAtTurn`, then lower seat
+ * index. `winnerSeat` there scans for STRICT improvement, so on a full tie the earliest seat
+ * in the scan keeps the win -- which is the same as making the seat index the last
+ * tie-breaker, and it makes the order total. That totality is what licenses the rewrite
+ * below.
+ */
+pure circuit seatBeats(a: SeatTotal, b: SeatTotal): Boolean {
+  return !b.active ||
+         a.seat == b.seat ||
+         a.total > b.total ||
+         (a.total == b.total && a.finishedAtTurn < b.finishedAtTurn) ||
+         (a.total == b.total && a.finishedAtTurn == b.finishedAtTurn && a.seat < b.seat);
+}
+
+/**
+ * Is `a` the maximum of `rows` under that order?
+ *
+ * `rules.ts` computes the winner with a running scan. A running scan is a chain of
+ * conditionals whose operands are earlier conditionals' results -- precisely the shape that
+ * trips docs/bugs-found.md #1 (it is the same shape as `modalFace` in turn.compact, which
+ * cannot be nested twice). Since the order is total, "the maximum" is equivalently "the one
+ * element that beats all the others", and that is 36 independent flat comparisons with no
+ * chaining at all. Costlier in instructions, immune to the compiler defect, and the whole
+ * thing is `pure` so it carries no prover key either way.
+ */
+pure circuit isBestSeat(a: SeatTotal, rows: Vector<6, SeatTotal>): Boolean {
+  return a.active &&
+         seatBeats(a, rows[0]) &&
+         seatBeats(a, rows[1]) &&
+         seatBeats(a, rows[2]) &&
+         seatBeats(a, rows[3]) &&
+         seatBeats(a, rows[4]) &&
+         seatBeats(a, rows[5]);
+}
+
+/**
+ * The winning seat index. Exactly one row is best (the order is total over distinct seat
+ * indices), so summing `index * isBest` selects it.
+ *
+ * Returns 0 if no row is active, which a caller must rule out -- `rules.ts` throws on an
+ * empty seat list, and `settleTable` in scoring.compact asserts `seatCount >= 2`.
+ */
+export pure circuit winnerSeat(rows: Vector<6, SeatTotal>): Uint<8> {
+  return (flag(isBestSeat(rows[1], rows)) +
+          flag(isBestSeat(rows[2], rows)) * 2 +
+          flag(isBestSeat(rows[3], rows)) * 3 +
+          flag(isBestSeat(rows[4], rows)) * 4 +
+          flag(isBestSeat(rows[5], rows)) * 5)
+         as Uint<8>;
+}
+
+/** One seat row, with `active` derived from the table's seat count. */
+pure circuit seatRow(seat: Uint<8>,
+                     total: Uint<16>,
+                     finishedAtTurn: Uint<16>,
+                     seatCount: Uint<8>,
+                     ): SeatTotal {
+  return SeatTotal { seat: seat,
+                     total: total,
+                     finishedAtTurn: finishedAtTurn,
+                     active: seat < seatCount, };
+}
+
+/**
+ * `winnerSeat` over parallel arrays, the shape settlement actually holds them in.
+ *
+ * Seats at or above `seatCount` are ignored, so a 2-player table passes six rows and gets
+ * the same answer `rules.ts` gives for a 2-element array.
+ */
+export pure circuit winnerOfSeats(
+                      totals: Vector<6, Uint<16>>,
+                      finishedAtTurn: Vector<6, Uint<16>>,
+                      seatCount: Uint<8>,
+                      ): Uint<8> {
+  return winnerSeat(
+           [seatRow(0, totals[0], finishedAtTurn[0], seatCount),
+            seatRow(1, totals[1], finishedAtTurn[1], seatCount),
+            seatRow(2, totals[2], finishedAtTurn[2], seatCount),
+            seatRow(3, totals[3], finishedAtTurn[3], seatCount),
+            seatRow(4, totals[4], finishedAtTurn[4], seatCount),
+            seatRow(5, totals[5], finishedAtTurn[5], seatCount),]
+           );
+}
+
+// ---------------------------------------------------------------------------------------
+// Rake
+// ---------------------------------------------------------------------------------------
+
+/**
+ * The 1% rake, checked rather than computed.
+ *
+ * Language 0.26 has no division (docs/bugs-found.md #2), so `pot / 100` cannot be evaluated
+ * in-circuit. Instead the quotient and remainder are supplied by the caller and the circuit
+ * checks the Euclidean identity, which pins them uniquely:
+ *
+ *     q * 100 + r == pot   and   r < 100     =>   q == floor(pot/100), r == pot mod 100
+ *
+ * Uniqueness is what makes this safe: there is exactly one (q, r) satisfying both, so an
+ * operator cannot inflate the rake by choosing a different pair. `q` and `r` are supplied,
+ * not trusted.
+ *
+ * `rake = q` and `winnerPayout = pot - q`, so the remainder `r` goes to the winner. That is
+ * `splitPot` in api/src/rules.ts.
+ */
+export pure circuit rakeIsValid(pot: Uint<64>, q: Uint<64>, r: Uint<64>): Boolean {
+  // `q * 100 + r` widens past Uint<64>, and `pot` is a subtype of the wider type, so the
+  // comparison needs no cast -- and must not have one, since a checked narrowing cast here
+  // would abort instead of returning false on an over-large `q`.
+  return (q * 100 + r == pot) && (r < 100);
+}
+
+/**
+ * The rake split, asserted. Returns `[winnerPayout, rake]`.
+ *
+ * The assertion is the whole point: a caller that supplies a wrong `q` cannot get a
+ * transaction through.
+ */
+export pure circuit splitPot(pot: Uint<64>, q: Uint<64>, r: Uint<64>): Vector<2, Uint<64>> {
+  assert(rakeIsValid(pot, q, r), "rake split must satisfy q*100 + r == pot with r < 100");
+  return [(pot - q) as Uint<64>, q];
+}

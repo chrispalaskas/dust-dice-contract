@@ -1,0 +1,141 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// bugs-found.md #1, CONTROL CASE. Compiles in under a second.
+//
+// One of three files identical except for the body of `mask`, marked below.
+//
+// The three files together isolate the variable that drives compactc 0.34.0's exponential
+// compile time. It is NOT the nesting depth of conditionals (bugs-found.md #1's original
+// diagnosis): both files have the same nesting depth, the same instruction count to within a
+// few per cent, and the same number of conditionals. The only difference is how many LEAF
+// INPUTS each element of `merged` depends on -- three here, fifteen there.
+//
+// Structure, in both files:
+//
+//   * `ladder` turns one byte into a value 1..6 with a five-comparison threshold ladder.
+//     Stands in for any nontrivial per-position derivation.
+//   * `merged` chains two selects over three groups of five laddered bytes: for each of five
+//     positions, keep the earlier value if `mask` says so, else take the fresh one.
+//   * `reuse` re-reads each element of `merged` six times (six `faceCount` calls).
+//
+//   narrow      mask[i] reads group0[i] only         fan-in  3   cheap mask  (this file)
+//   wide-cheap  mask[i] reads all of group0          fan-in 15   cheap mask
+//   wide-modal  mask[i] reads all of group0          fan-in 15   running-max mask
+//
+// Run all three:
+//
+//   for v in narrow wide-cheap wide-modal; do
+//     /usr/bin/time -f "$v TIME %e s MAXRSS %M KB" \
+//       timeout 240 compact compile --skip-zk repro/bug1-fanin-$v.compact /tmp/f-$v
+//   done
+//
+// Not part of the build; nothing includes this file.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+export ledger out: Uint<8>;
+
+/** "First accepting candidate wins" accumulator. */
+struct Pick {
+  found: Boolean,
+  die: Uint<8>,
+}
+
+/**
+ * One rejection-ladder candidate. `acc` is read TWICE inside a conditional whose own operand
+ * is a conditional -- this is the shape bugs-found.md #1 originally identified, and it is
+ * what makes a single leaf expensive to re-expand. Four of these chained is one leaf.
+ */
+pure circuit candidate(acc: Pick, b: Uint<8>): Pick {
+  const die = (1 +
+               ((b >= 42) as Uint<8>) +
+               ((b >= 84) as Uint<8>) +
+               ((b >= 126) as Uint<8>) +
+               ((b >= 168) as Uint<8>) +
+               ((b >= 210) as Uint<8>))
+              as Uint<8>;
+  return acc.found ? acc : (b < 252 ? Pick { found: true, die: die } : acc);
+}
+
+/** One value in 1..6 from four candidate bytes. THE LEAF. */
+pure circuit ladder(cands: Vector<4, Uint<8>>): Uint<8> {
+  const p = fold((acc: Pick, b: Uint<8>) => candidate(acc, b),
+                 Pick { found: false, die: 1 },
+                 cands);
+  return p.die;
+}
+
+/** Five leaves from one 32-byte input; leaf i consumes bytes 4i..4i+3. */
+pure circuit group(v: Vector<32, Uint<8>>): Vector<5, Uint<8>> {
+  return [ladder([v[0], v[1], v[2], v[3]]),
+          ladder([v[4], v[5], v[6], v[7]]),
+          ladder([v[8], v[9], v[10], v[11]]),
+          ladder([v[12], v[13], v[14], v[15]]),
+          ladder([v[16], v[17], v[18], v[19]]),];
+}
+
+/** How many of the five values equal `f`. Reads every element of `d` once. */
+pure circuit faceCount(d: Vector<5, Uint<8>>, f: Uint<8>): Uint<8> {
+  return (((d[0] == f) as Uint<8>) +
+          ((d[1] == f) as Uint<8>) +
+          ((d[2] == f) as Uint<8>) +
+          ((d[3] == f) as Uint<8>) +
+          ((d[4] == f) as Uint<8>))
+         as Uint<8>;
+}
+
+// vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+// THE ONLY DIFFERENCE BETWEEN THE THREE bug1-fanin-* FILES.
+//
+// NARROW: each mask bit reads its own position only. An element of `merged` therefore
+// depends on three leaves: its own byte in each of the three groups.
+pure circuit mask(d: Vector<5, Uint<8>>): Vector<5, Boolean> {
+  return [d[0] >= 4, d[1] >= 4, d[2] >= 4, d[3] >= 4, d[4] >= 4];
+}
+// ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+pure circuit merge(
+               hold: Vector<5, Boolean>,
+               kept: Vector<5, Uint<8>>,
+               fresh: Vector<5, Uint<8>>,
+               ): Vector<5, Uint<8>> {
+  return [hold[0] ? kept[0] : fresh[0],
+          hold[1] ? kept[1] : fresh[1],
+          hold[2] ? kept[2] : fresh[2],
+          hold[3] ? kept[3] : fresh[3],
+          hold[4] ? kept[4] : fresh[4],];
+}
+
+/** Two chained merges under one latched mask. */
+pure circuit merged(
+               a: Vector<32, Uint<8>>,
+               b: Vector<32, Uint<8>>,
+               c: Vector<32, Uint<8>>,
+               ): Vector<5, Uint<8>> {
+  const g0 = group(a);
+  const m = mask(g0);
+  const g1 = merge(m, g0, group(b));
+  return merge(m, g1, group(c));
+}
+
+/** Re-reads each element of `d` six times. This is the multiplier. */
+pure circuit reuse(d: Vector<5, Uint<8>>): Uint<8> {
+  return (faceCount(d, 1) +
+          faceCount(d, 2) +
+          faceCount(d, 3) +
+          faceCount(d, 4) +
+          faceCount(d, 5) +
+          faceCount(d, 6))
+         as Uint<8>;
+}
+
+export circuit probe(h0: Bytes<32>, h1: Bytes<32>, h2: Bytes<32>): Uint<8> {
+  const r = reuse(merged(h0 as Vector<32, Uint<8>>,
+                         h1 as Vector<32, Uint<8>>,
+                         h2 as Vector<32, Uint<8>>));
+  out = disclose(r);
+  return disclose(r);
+}

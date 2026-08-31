@@ -1,0 +1,237 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// The two halves together: three rolls of five dice, then score them into a scorecard.
+//
+// dice.compact priced one roll, turn.compact priced a three-roll turn, scoring.compact
+// priced the scoring path against a scorecard. This contract is the only one that puts the
+// dice and the scoring in ONE circuit -- the shape `Table.takeTurn` will have -- and so the
+// only measurement that can say whether the sum of the halves is the cost of the whole.
+// docs/bugs-found.md #1 warned that it might not even compile:
+//
+//   "Any future Table.takeTurn that adds scoring on top of merged dice should expect to meet
+//    this again."
+//
+// IT DOES, AND IT SHAPES THIS FILE. `keepModalFace` is not available here. See below and
+// docs/scoring-circuit.md §5.
+//
+// Still not deployable: no seats, no turn order, no pot, no commitment binding the operator's
+// seed (see the warning in src/witnesses.ts). It is a cost shape, not a game.
+//
+// ---------------------------------------------------------------------------------------
+// Why the hold policy must be PER-DIE
+// ---------------------------------------------------------------------------------------
+// bugs-found.md #1 described the compiler's exponential blowup as depth-driven ("keep chains
+// of comparisons whose operands are themselves conditional results one level deep"). Building
+// this contract showed that depth is not the variable that matters. Rewriting `modalFace`
+// from a 5-step running max into a flat argmax -- no chained conditionals at all -- does not
+// help in the slightest.
+//
+// What matters is how many LEAF INPUTS a value that is re-read carries, times how many times
+// it is re-read. `--skip-zk`, three rolls, scoring on the final merged dice, measured:
+//
+//   hold mask                          merged-die fan-in   uses of each merged die   compile
+//   -------------------------------------------------------------------------------------
+//   die >= 4 (per-die)                 3                   ~40 (full applyScore)     10.2 s
+//   die == d[0] (fan-in 2)             4                   ~40 (full applyScore)      8.9 s
+//   die == modalFace(roll1)            15                  1  (diceSum)               5.0 s
+//   die == modalFace(roll1)            15                  6  (isYahtzee)             45.5 s
+//   die == modalFace(roll1)            15                  7  (rawScore)             >150 s
+//   die == modalFace(roll1)            15                  ~40 (full applyScore)     >200 s
+//
+// A per-die hold predicate makes a merged die depend on three leaves (its own die in each of
+// the three rolls), and forty re-reads of a three-leaf value is free. A whole-hand predicate
+// makes EVERY merged die depend on all fifteen ladder outputs, and the compiler re-expands
+// all fifteen on every re-read. Flattening `modalFace` does not change its fan-in, which is
+// why flattening does not help.
+//
+// So this contract offers `keepNone` and `keepGe4` -- both per-die -- and asserts against
+// `keepModalFace`. The enum keeps turn.compact's variant order so the two are wire-compatible
+// and the same mirror checks both.
+//
+// The fallback for a game that wants `keepModalFace`: split the turn across two transactions,
+// `resolveTurn` (turn.compact, 1 447 instructions, dice to the ledger) then `scoreTurn`
+// (scoring.compact, 636, dice read back as an input). A ledger read or a circuit argument is
+// a fresh leaf, so the DAG is cut and the blowup cannot happen. Both halves are measured, so
+// that route is priced -- it costs a second transaction per turn, which bugs-found.md §0 #21
+// says is the safe shape anyway.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+include "dice-core";
+
+include "scoring-core";
+
+/**
+ * The hold policies, variant order copied from turn.compact so the two enums agree on the
+ * wire and `resolveTurnTs` in src/dice-mirror.ts mirrors both.
+ *
+ * `keepModalFace` is DECLARED BUT NOT IMPLEMENTED here: `takeTurn` asserts against it, and
+ * `holdOne` has no modal branch at all -- not an unused branch, an absent one. Removing the
+ * variant instead would renumber `keepGe4` and silently break the mirror cross-check, which
+ * is a worse trade than a declared-and-rejected variant.
+ */
+export enum HoldPolicy {
+  keepNone,
+  keepModalFace,
+  keepGe4,
+}
+
+/** The operator's roll seed, held off-chain until settlement. */
+witness rollSeed(): Bytes<32>;
+
+/** The scorecard being played into. One seat; `Table` will hold six. */
+export ledger card: Scorecard;
+
+/** The dice the turn ended on, published for spectators. */
+export ledger lastDice: Dice;
+
+/** The player's grand total after this turn. */
+export ledger lastTotal: Uint<16>;
+
+// ---------------------------------------------------------------------------------------
+// Hold policy -- per-die only
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Whether one die is held, from that die alone.
+ *
+ * This signature is the constraint: no parameter carries the other four dice, so a merged
+ * die's fan-in stays at three leaves however many rolls are chained. `keepModalFace` cannot
+ * be expressed against it, which is the point -- the type makes the compiler-imposed rule
+ * visible instead of leaving it to a comment.
+ */
+pure circuit holdOne(policy: HoldPolicy, die: Uint<8>): Boolean {
+  return policy == HoldPolicy.keepGe4 ? die >= 4 : false;
+}
+
+/** Which dice the policy keeps. Latched: called once per turn, on roll 1. */
+pure circuit holdMask(policy: HoldPolicy, d: Vector<5, Uint<8>>): Vector<5, Boolean> {
+  return [holdOne(policy, d[0]),
+          holdOne(policy, d[1]),
+          holdOne(policy, d[2]),
+          holdOne(policy, d[3]),
+          holdOne(policy, d[4]),];
+}
+
+/** Per-position select: keep the held die, take the freshly derived one otherwise. */
+pure circuit mergeDice(
+               hold: Vector<5, Boolean>,
+               kept: Vector<5, Uint<8>>,
+               fresh: Vector<5, Uint<8>>,
+               ): Vector<5, Uint<8>> {
+  return [hold[0] ? kept[0] : fresh[0],
+          hold[1] ? kept[1] : fresh[1],
+          hold[2] ? kept[2] : fresh[2],
+          hold[3] ? kept[3] : fresh[3],
+          hold[4] ? kept[4] : fresh[4],];
+}
+
+/**
+ * Three rolls, one latched hold mask. Identical dice to turn.compact's `resolveTurnPure` for
+ * `keepNone` and `keepGe4`, which is what src/test/scoring.test.ts checks against the mirror.
+ */
+export pure circuit finalDice(
+                      tableId: Bytes<32>,
+                      seed: Bytes<32>,
+                      playerEntropy: Bytes<32>,
+                      round: Uint<8>,
+                      policy: HoldPolicy,
+                      ): Vector<5, Uint<8>> {
+  const r0 = deriveDice(rollContext(tableId, seed, playerEntropy, round, 0));
+  const hold = holdMask(policy, r0);
+  const r1 = mergeDice(hold, r0, deriveDice(rollContext(tableId, seed, playerEntropy, round, 1)));
+  return mergeDice(hold, r1, deriveDice(rollContext(tableId, seed, playerEntropy, round, 2)));
+}
+
+// ---------------------------------------------------------------------------------------
+// The combined turn
+// ---------------------------------------------------------------------------------------
+
+/** Everything one turn produces. */
+export struct TurnOutcome {
+  dice: Dice,
+  score: Uint<8>,
+  bonusEarned: Boolean,
+  total: Uint<16>,
+}
+
+/**
+ * Roll three times under `policy`, then score the result into `category`. THE combined
+ * measurement.
+ *
+ * No dice range check, unlike `scoreTurn` in scoring.compact: these dice come out of
+ * `deriveDice`, whose byte ladder cannot produce anything but 1..6. Dropping the six
+ * comparisons is the one place the combined circuit is cheaper than the sum of the halves.
+ *
+ * `validPlacement` is asserted rather than returned. In the live game the player picks the
+ * category after seeing the dice, so an illegal pick is a client bug or an attack, not a game
+ * state -- there is nothing sensible for the contract to do but reject the transaction.
+ *
+ * `disclose` publishes the dice, the updated card and the total. All three are the public
+ * record of a turn. The operator's `rollSeed` is never written; recovering it from five dice
+ * means inverting `persistentHash` over a 32-byte preimage.
+ */
+export circuit takeTurn(
+                 tableId: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 policy: HoldPolicy,
+                 category: Uint<8>,
+                 ): TurnOutcome {
+  assert(policy != HoldPolicy.keepModalFace,
+         "keepModalFace is not available in the combined circuit; see the file header"
+         );
+
+  const d = finalDice(tableId, rollSeed(), playerEntropy, round, policy);
+
+  const before = card;
+  const outcome = applyScore(category, d, before.filled, before.scores[11]);
+  assert(outcome.validPlacement, "illegal placement: box taken, or joker rules violated");
+
+  const after = placeScore(before, category, d);
+  // NOT `cardTotal(after)` -- that reads the new score nineteen times and takes the compile
+  // from 12 s to 187 s. See `totalAfterPlacing` in scoring-core.compact.
+  const total = totalAfterPlacing(before, category, outcome.score, outcome.bonusEarned);
+
+  card = disclose(after);
+  lastDice = disclose(toDice(d));
+  lastTotal = disclose(total);
+  return disclose(TurnOutcome { dice: toDice(d),
+                                score: outcome.score,
+                                bonusEarned: outcome.bonusEarned,
+                                total: total, });
+}
+
+/**
+ * The three rolls with no scoring, in this contract rather than turn.compact.
+ *
+ * turn.compact's `resolveTurn` writes all three rolls to the ledger and evaluates all three
+ * policies; this writes one roll and evaluates a per-die policy. So `takeTurn` minus this is
+ * the scoring cost inside the combined circuit, measured against the same baseline rather
+ * than across two contracts.
+ */
+export circuit probeRollsOnly(
+                 tableId: Bytes<32>,
+                 playerEntropy: Bytes<32>,
+                 round: Uint<8>,
+                 policy: HoldPolicy,
+                 ): Dice {
+  const d = toDice(finalDice(tableId, rollSeed(), playerEntropy, round, policy));
+  lastDice = disclose(d);
+  return disclose(d);
+}
+
+/** Reset the card, so the tests can replay independent games through one simulator. */
+export circuit resetCard(): [] {
+  card = emptyScorecard();
+  lastTotal = 0;
+}
+
+/** Put an arbitrary mid-game scorecard on-chain. Test-only, see scoring.compact's copy. */
+export circuit loadCard(c: Scorecard): [] {
+  card = disclose(c);
+  lastTotal = disclose(cardTotal(c));
+}
