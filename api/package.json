@@ -3,15 +3,38 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Contract interaction layer + pure game rules. No React imports — framework-swap seam.",
+  "description": "Contract interaction layer + pure game rules. No React imports — framework-swap seam. The './node' entry carries wallet/provider plumbing and must never be imported from browser code.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node/index.d.ts",
+      "default": "./dist/node/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@midnight-ntwrk/midnight-js-contracts": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-network-id": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-protocol": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-types": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-utils": "5.0.0-beta.7",
+    "@midnight-ntwrk/wallet-sdk": "2.0.0-beta.2",
+    "rxjs": "^7.8.1"
+  },
   "devDependencies": {
+    "@types/node": "^22.10.0",
     "vitest": "^3.0.0"
   }
 }
