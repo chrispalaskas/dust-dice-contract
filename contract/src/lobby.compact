@@ -1,0 +1,164 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// ===========================================================================================
+// Midnight Yahtzee -- the Lobby. A registry, and nothing else.
+// ===========================================================================================
+//
+// One deployment for the whole site. Per stake tier it records which Table contract is
+// currently open for joining, how many have been opened and closed, and the address of the
+// most recently closed one. That is all it does.
+//
+// -------------------------------------------------------------------------------------------
+// The trust story, stated honestly
+// -------------------------------------------------------------------------------------------
+// THE LOBBY IS A CONVENIENCE INDEX. THE TABLES ARE THE SECURITY BOUNDARY.
+//
+// It holds no funds, makes no cross-contract calls, and has no authority over any table. A
+// player who joins a table is trusting THAT table's constructor arguments -- its tier, its
+// seed commitment, its rake address, its timeouts -- all of which are readable directly from
+// the table's own ledger state. Nothing in this contract can change them, and nothing in this
+// contract is consulted by `table.compact`.
+//
+// So the worst a compromised operator key does here is misdirect: point `openTable` at a
+// hostile or non-existent address, hide a real table, or lie about the counts. It cannot make
+// a table it does not control take a player's money, and it cannot alter a table it does
+// control after deployment (editing a Compact source changes its verifier keys, so a deployed
+// table's rules are frozen). The client's obligation, and the reason this is acceptable:
+// **a client must read the tier, seed commitment and timeouts off the table itself before
+// staking, never off the lobby.** A lobby entry is a hint about where to look.
+//
+// Authorisation is a commitment to an operator secret rather than an address, matching
+// `table.compact`: `H(operatorSecret) == operatorCommitment`, checked in-circuit. Chosen over
+// an address check for two reasons -- a circuit cannot learn its caller at all
+// (docs/gate0-report.md), so an address would have to be an unauthenticated argument; and it
+// keeps the whole project on one authorisation idiom, so there is one thing to get right.
+// The commitment is `sealed`, so the operator key cannot be rotated without redeploying the
+// lobby. That is the cost of keeping this contract this small, and it is the right trade for
+// an index whose worst failure is a bad hyperlink.
+//
+// Every circuit is padded for the same admission-floor reason as `table.compact` -- these are
+// the smallest circuits in the project and would otherwise be rejected outright by the node.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+/** Stake tiers. Four, fixed: an index into every map below, so it is never renumbered. */
+pure circuit tierCount(): Uint<8> {
+  return 4;
+}
+
+/** `H(operatorSecret)`, fixed at deployment. Knowledge of the preimage is the only authority. */
+export sealed ledger operatorCommitment: Bytes<32>;
+
+/** The table currently open for joining in each tier. Meaningful only where `hasOpen` is set. */
+export ledger openTable: Map<Uint<8>, ContractAddress>;
+
+/** Whether `openTable[tier]` names a real table. */
+export ledger hasOpen: Map<Uint<8>, Boolean>;
+
+/** The most recently filled-or-closed table per tier -- a one-entry history. */
+export ledger lastClosed: Map<Uint<8>, ContractAddress>;
+
+/** How many tables this lobby has ever announced per tier. */
+export ledger openedCount: Map<Uint<8>, Uint<32>>;
+
+/** How many have since been closed per tier. `openedCount - closedCount` is 0 or 1. */
+export ledger closedCount: Map<Uint<8>, Uint<32>>;
+
+/** Sink for the transaction padding. Same lever as `table.compact`; see its decision 8. */
+export ledger padStore: LobbyPadding;
+
+/** 2 KB of public padding, written after `kernel.checkpoint()` so it grows bytes, not cost. */
+export struct LobbyPadding {
+  words: Vector<64, Bytes<32>>,
+}
+
+/** The operator's key. Never disclosed; only the equality against the commitment is. */
+witness operatorSecret(): Bytes<32>;
+
+/**
+ * Exported because the operator needs it OUTSIDE a transaction: the commitment is a
+ * constructor argument, so it has to be computed before the lobby exists. A deploy script
+ * calling this pure circuit is one fewer hand-written hash to get wrong.
+ */
+export pure circuit operatorCommitmentOf(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "yahtzee:v1:lobbyop"), sk]);
+}
+
+/** Prove the caller holds the operator key. The whole of this contract's access control. */
+circuit requireOperator(): [] {
+  assert(disclose(operatorCommitmentOf(operatorSecret()) == operatorCommitment),
+         "lobby: not the operator"
+         );
+}
+
+circuit padTransaction(p: LobbyPadding): [] {
+  kernel.checkpoint();
+  padStore = disclose(p);
+}
+
+/**
+ * Initialise every tier to "nothing open".
+ *
+ * All four slots are pre-inserted for the same reason `table.compact` pre-inserts its six
+ * seats: a ledger `Map.lookup` of an absent key aborts, and pre-inserting makes every read
+ * total so no circuit needs a `member` guard.
+ */
+constructor(operatorCommit: Bytes<32>) {
+  operatorCommitment = disclose(operatorCommit);
+  for (const t of 0..4) {
+    openTable.insert(t as Uint<8>, default<ContractAddress>);
+    hasOpen.insert(t as Uint<8>, false);
+    lastClosed.insert(t as Uint<8>, default<ContractAddress>);
+    openedCount.insert(t as Uint<8>, 0);
+    closedCount.insert(t as Uint<8>, 0);
+  }
+}
+
+/**
+ * Announce a freshly deployed Table as the open one for `tier`.
+ *
+ * Refuses to overwrite a tier that already has an open table, so the "currently open" slot
+ * cannot silently orphan a table players may already be sitting at -- the operator must call
+ * `tableFilled` first. That ordering is the only invariant this contract enforces, and it is
+ * enforced because losing a table's address here means the UI cannot find it, even though the
+ * table itself keeps working and its timeout paths keep protecting the stakes.
+ */
+export circuit openTableAt(tier: Uint<8>, address: ContractAddress, p: LobbyPadding): [] {
+  requireOperator();
+  const t = disclose(tier);
+  assert(t < tierCount(), "lobby: unknown tier");
+  assert(!hasOpen.lookup(t), "lobby: this tier already has an open table");
+
+  openTable.insert(t, disclose(address));
+  hasOpen.insert(t, true);
+  openedCount.insert(t, (openedCount.lookup(t) + 1) as Uint<32>);
+
+  padTransaction(p);
+}
+
+/**
+ * Retire the open table of `tier` -- it filled up, settled, or was aborted.
+ *
+ * Deliberately one circuit for all three outcomes. The lobby has no way to check which
+ * happened (no cross-contract calls, by design), so distinguishing them here would be
+ * recording the operator's claim as if it were a fact. A client that wants to know how a table
+ * ended reads that table's own `phase`.
+ */
+export circuit tableFilled(tier: Uint<8>, p: LobbyPadding): [] {
+  requireOperator();
+  const t = disclose(tier);
+  assert(t < tierCount(), "lobby: unknown tier");
+  assert(hasOpen.lookup(t), "lobby: this tier has no open table");
+
+  lastClosed.insert(t, openTable.lookup(t));
+  hasOpen.insert(t, false);
+  openTable.insert(t, default<ContractAddress>);
+  closedCount.insert(t, (closedCount.lookup(t) + 1) as Uint<32>);
+
+  padTransaction(p);
+}
+
+export { ContractAddress, UserAddress };

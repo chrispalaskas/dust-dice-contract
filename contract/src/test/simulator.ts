@@ -2,13 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Minimal testbeds for the two measurement contracts.
+ * Testbeds for every contract in this package.
  *
- * Neither contract has a constructor, cross-contract calls, or any time dependence, so
- * these are much smaller than a real simulator: they hold the ledger state and the private
- * state, and build a fresh `CircuitContext` per call. A `CircuitContext` models a whole
- * call tree rather than one contract's execution, so it is not a thing to carry between
- * calls.
+ * The four measurement contracts (dice, turn, scoring, takeTurn) have no constructor and no
+ * time dependence, so their simulators are tiny: hold the ledger state and the private state,
+ * and build a fresh `CircuitContext` per call. A `CircuitContext` models a whole call tree
+ * rather than one contract's execution, so it is not a thing to carry between calls.
+ *
+ * `TableSimulator` and `LobbySimulator` need two things the others do not.
+ *
+ * BLOCK TIME IS ALWAYS EXPLICIT. `createCircuitContext` defaults its `time` argument to
+ * `Math.floor(Date.now() / 1000)`, so a contract with block-time predicates gets a different
+ * answer on every run and a timeout test that passes today fails at some future wall-clock
+ * date. Every simulator here therefore pins `time` -- to `DEFAULT_BLOCK_TIME` unless a test
+ * sets it -- and the table's timeout tests set it deliberately. Nothing in this file may call
+ * `createCircuitContext` without a time.
+ *
+ * THE ACTING PARTY IS SWAPPABLE. The table's three witnesses belong to two different parties
+ * (see src/table-witnesses.ts) and in production never share a private state. One simulator
+ * process has to play all of them, so `asOperator` / `asPlayer` swap the private state between
+ * calls -- which is also how "wrong secret" is tested: act as the wrong player and watch the
+ * commitment assert fire.
  *
  * Circuits are async because the generated bindings return promises.
  *
@@ -49,11 +63,42 @@ import {
   type Ledger as TakeTurnLedgerType,
   type TurnOutcome,
 } from '../managed/takeTurn/contract/index.js';
+import {
+  Contract as TableContract,
+  ledger as tableLedger,
+  type Dice as TableDice,
+  type Ledger as TableLedgerType,
+  type Padding as TablePadding,
+  type UserAddress,
+} from '../managed/table/contract/index.js';
+import {
+  Contract as LobbyContract,
+  ledger as lobbyLedger,
+  type ContractAddress as LobbyContractAddress,
+  type Ledger as LobbyLedgerType,
+  type LobbyPadding,
+} from '../managed/lobby/contract/index.js';
 import { diceWitnesses, type DicePrivateState } from '../witnesses.ts';
+import {
+  createLobbyPrivateState,
+  createTablePrivateState,
+  lobbyWitnesses,
+  tableWitnesses,
+  type LobbyPrivateState,
+  type TablePrivateState,
+} from '../table-witnesses.ts';
 
-export type { Scorecard, ScoreOutcome, TurnOutcome };
+export type { Scorecard, ScoreOutcome, TurnOutcome, TableLedgerType, UserAddress };
 
 const COIN_PUBLIC_KEY = '0'.repeat(64);
+
+/**
+ * Block time used when a test does not care, in seconds since epoch.
+ *
+ * A fixed value and not `Date.now()`: see the file header. Chosen well clear of zero so that
+ * `lastActionAt + timeout` arithmetic in the table never has to reason about an epoch boundary.
+ */
+export const DEFAULT_BLOCK_TIME = 1_700_000_000;
 
 /** The `Dice` struct as the generated bindings spell it: five bigints. */
 export type DiceStruct = { d0: bigint; d1: bigint; d2: bigint; d3: bigint; d4: bigint };
@@ -69,57 +114,73 @@ export function diceToArray(d: DiceStruct): number[] {
  * `context` -- a `CircuitContext` holds a `queryContexts` map keyed by contract address for
  * the whole call tree, and `callContext` is the currently executing contract's view of it.
  */
-type CircuitResult<R> = {
+type CircuitResult<PS, R> = {
   result: R;
   context: {
     callContext: {
       currentQueryContext: { state: ChargedState };
-      currentPrivateState?: DicePrivateState;
+      currentPrivateState?: PS;
     };
   };
 };
 
-/** The two generated contract classes, in the shape this simulator needs. */
-type AnyContract = {
-  initialState(ctx: never): Promise<{
-    currentContractState: { data: ChargedState };
-    currentPrivateState: DicePrivateState;
-  }>;
+/** The generated `initialState` result, in the shape this simulator needs. */
+type InitialState<PS> = {
+  currentContractState: { data: ChargedState };
+  currentPrivateState: PS;
 };
 
-class BaseSimulator {
+/** A generated contract class with a no-argument constructor. */
+type AnyContract<PS> = {
+  initialState(ctx: never): Promise<InitialState<PS>>;
+};
+
+class BaseSimulator<PS> {
   address: ContractAddress = sampleContractAddress();
   state!: ChargedState;
-  privateState: DicePrivateState;
-  contract: AnyContract;
+  privateState: PS;
 
-  constructor(contract: AnyContract, privateState: DicePrivateState) {
-    this.contract = contract;
+  /**
+   * Block time the next circuit call sees, in seconds since epoch.
+   *
+   * Always set. The runtime would otherwise default it to wall-clock time and make every
+   * block-time predicate non-reproducible; see the file header.
+   */
+  blockTime: number = DEFAULT_BLOCK_TIME;
+
+  constructor(privateState: PS) {
     this.privateState = privateState;
   }
 
-  async init(): Promise<void> {
-    const { currentContractState, currentPrivateState } = await this.contract.initialState(
-      createConstructorContext(this.privateState, COIN_PUBLIC_KEY) as never,
-    );
+  /** Adopt the result of a generated `initialState` call. */
+  async adopt(pending: Promise<InitialState<PS>>): Promise<void> {
+    const { currentContractState, currentPrivateState } = await pending;
     this.state = currentContractState.data;
     this.privateState = currentPrivateState;
   }
 
+  constructorContext() {
+    return createConstructorContext(this.privateState, COIN_PUBLIC_KEY) as never;
+  }
+
   context(circuitId: string) {
-    return createCircuitContext<DicePrivateState>(
+    return createCircuitContext<PS>(
       circuitId,
       this.address,
       COIN_PUBLIC_KEY,
       this.state,
       this.privateState,
+      undefined,
+      undefined,
+      undefined,
+      this.blockTime,
     );
   }
 
   /** Run a generated circuit and commit its resulting ledger and private state. */
   async run<R>(
     circuitId: string,
-    call: (ctx: ReturnType<BaseSimulator['context']>) => Promise<CircuitResult<R>>,
+    call: (ctx: ReturnType<BaseSimulator<PS>['context']>) => Promise<CircuitResult<PS, R>>,
   ): Promise<R> {
     const res = await call(this.context(circuitId));
     this.state = res.context.callContext.currentQueryContext.state;
@@ -130,12 +191,26 @@ class BaseSimulator {
   }
 }
 
-export class DiceSimulator extends BaseSimulator {
+/** A simulator for a contract whose constructor takes no arguments. */
+class SimpleSimulator<PS> extends BaseSimulator<PS> {
+  contract: AnyContract<PS>;
+
+  constructor(contract: AnyContract<PS>, privateState: PS) {
+    super(privateState);
+    this.contract = contract;
+  }
+
+  async init(): Promise<void> {
+    await this.adopt(this.contract.initialState(this.constructorContext()));
+  }
+}
+
+export class DiceSimulator extends SimpleSimulator<DicePrivateState> {
   dice: DiceContract<DicePrivateState>;
 
   constructor(privateState: DicePrivateState) {
     const contract = new DiceContract<DicePrivateState>(diceWitnesses);
-    super(contract as unknown as AnyContract, privateState);
+    super(contract as unknown as AnyContract<DicePrivateState>, privateState);
     this.dice = contract;
   }
 
@@ -204,12 +279,12 @@ export class DiceSimulator extends BaseSimulator {
   }
 }
 
-export class TurnSimulator extends BaseSimulator {
+export class TurnSimulator extends SimpleSimulator<DicePrivateState> {
   turn: TurnContract<DicePrivateState>;
 
   constructor(privateState: DicePrivateState) {
     const contract = new TurnContract<DicePrivateState>(diceWitnesses);
-    super(contract as unknown as AnyContract, privateState);
+    super(contract as unknown as AnyContract<DicePrivateState>, privateState);
     this.turn = contract;
   }
 
@@ -240,12 +315,12 @@ export class TurnSimulator extends BaseSimulator {
  * generated `Contract` still wants a witnesses object, and `diceWitnesses` satisfies the
  * empty interface it declares.
  */
-export class ScoringSimulator extends BaseSimulator {
+export class ScoringSimulator extends SimpleSimulator<DicePrivateState> {
   scoring: ScoringContract<DicePrivateState>;
 
   constructor(privateState: DicePrivateState) {
     const contract = new ScoringContract<DicePrivateState>(diceWitnesses);
-    super(contract as unknown as AnyContract, privateState);
+    super(contract as unknown as AnyContract<DicePrivateState>, privateState);
     this.scoring = contract;
   }
 
@@ -288,12 +363,12 @@ export class ScoringSimulator extends BaseSimulator {
 }
 
 /** takeTurn.compact: dice derivation and scoring in one circuit. */
-export class TakeTurnSimulator extends BaseSimulator {
+export class TakeTurnSimulator extends SimpleSimulator<DicePrivateState> {
   takeTurnContract: TakeTurnContract<DicePrivateState>;
 
   constructor(privateState: DicePrivateState) {
     const contract = new TakeTurnContract<DicePrivateState>(diceWitnesses);
-    super(contract as unknown as AnyContract, privateState);
+    super(contract as unknown as AnyContract<DicePrivateState>, privateState);
     this.takeTurnContract = contract;
   }
 
@@ -332,5 +407,210 @@ export class TakeTurnSimulator extends BaseSimulator {
 
   resetCard(): Promise<[]> {
     return this.run('resetCard', (ctx) => this.takeTurnContract.impureCircuits.resetCard(ctx));
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// table.compact
+// ---------------------------------------------------------------------------------------
+
+/** The padding argument every exported circuit takes. See table.compact, decision 8. */
+export const PADDING_WORDS = 64;
+
+/**
+ * A zero-filled `Padding`.
+ *
+ * The bytes are never read by any circuit -- the struct exists only to grow the transaction
+ * past the node's admission floor -- so their value is irrelevant to correctness and zeros
+ * keep the tests readable. On devnet the operator can put anything here; the size is what
+ * matters, and the size is fixed by the type.
+ */
+export function zeroPadding(): TablePadding {
+  return { words: Array.from({ length: PADDING_WORDS }, () => new Uint8Array(32)) };
+}
+
+/** A `UserAddress` from a single repeated byte -- distinct, readable test addresses. */
+export function userAddress(fill: number): UserAddress {
+  return { bytes: new Uint8Array(32).fill(fill) };
+}
+
+/** Constructor arguments for a table. */
+export type TableConfig = {
+  tableId: Uint8Array;
+  tier: bigint;
+  seats: bigint;
+  rakeAddress: UserAddress;
+  /** The operator's roll seed. Its commitment is what reaches the constructor. */
+  seed: Uint8Array;
+  /** Committed seed hash. Defaults to `seedCommitmentTs(seed)`; override to test rejection. */
+  seedCommitment: Uint8Array;
+  turnTimeoutSecs: bigint;
+  tableTimeoutSecs: bigint;
+};
+
+/**
+ * Testbed for table.compact.
+ *
+ * Every mutating method takes `now` (the value the circuit is TOLD the time is) and optionally
+ * `blockTime` (what the chain says it is). They default to the same value, which is the honest
+ * case; passing them apart is how the `stampTime` sandwich is tested, and it is the only way to
+ * exercise a caller lying about the clock.
+ */
+export class TableSimulator extends BaseSimulator<TablePrivateState> {
+  table: TableContract<TablePrivateState>;
+  config: TableConfig;
+
+  constructor(config: TableConfig) {
+    // The constructor is the operator's transaction: it holds the seed, and no player exists
+    // yet.
+    super(createTablePrivateState({ rollSeed: config.seed }));
+    this.table = new TableContract<TablePrivateState>(tableWitnesses);
+    this.config = config;
+  }
+
+  static async create(
+    config: TableConfig,
+    blockTime = DEFAULT_BLOCK_TIME,
+  ): Promise<TableSimulator> {
+    const sim = new TableSimulator(config);
+    sim.blockTime = blockTime;
+    await sim.adopt(
+      sim.table.initialState(
+        sim.constructorContext(),
+        config.tableId,
+        config.tier,
+        config.seats,
+        config.rakeAddress,
+        config.seedCommitment,
+        config.turnTimeoutSecs,
+        config.tableTimeoutSecs,
+      ),
+    );
+    return sim;
+  }
+
+  getLedger(): TableLedgerType {
+    return tableLedger(this.state);
+  }
+
+  /** Act as the operator: the seed is available, no player secret is. */
+  asOperator(): void {
+    this.privateState = createTablePrivateState({ rollSeed: this.config.seed });
+  }
+
+  /** Act as the player holding `sk`. The seed is deliberately NOT available. */
+  asPlayer(sk: Uint8Array): void {
+    this.privateState = createTablePrivateState({ playerSecret: sk });
+  }
+
+  join(payoutTo: UserAddress, now: number, blockTime = now): Promise<bigint> {
+    this.blockTime = blockTime;
+    return this.run('join', (ctx) =>
+      this.table.impureCircuits.join(ctx, payoutTo, BigInt(now), zeroPadding()),
+    );
+  }
+
+  takeTurn(
+    entropy: Uint8Array,
+    policy: number,
+    param: number,
+    category: number,
+    now: number,
+    blockTime = now,
+  ): Promise<[]> {
+    this.blockTime = blockTime;
+    return this.run('takeTurn', (ctx) =>
+      this.table.impureCircuits.takeTurn(
+        ctx,
+        entropy,
+        BigInt(policy),
+        BigInt(param),
+        BigInt(category),
+        BigInt(now),
+        zeroPadding(),
+      ),
+    );
+  }
+
+  resolveTurn(now: number, blockTime = now): Promise<TableDice> {
+    this.blockTime = blockTime;
+    return this.run('resolveTurn', (ctx) =>
+      this.table.impureCircuits.resolveTurn(ctx, BigInt(now), zeroPadding()),
+    );
+  }
+
+  /** `settle` needs no time: no deadline is involved and the outcome is already determined. */
+  settle(seed: Uint8Array, q: bigint, r: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+    this.blockTime = blockTime;
+    return this.run('settle', (ctx) =>
+      this.table.impureCircuits.settle(ctx, seed, q, r, zeroPadding()),
+    );
+  }
+
+  claimTimeout(now: number, blockTime = now): Promise<bigint> {
+    this.blockTime = blockTime;
+    return this.run('claimTimeout', (ctx) =>
+      this.table.impureCircuits.claimTimeout(ctx, BigInt(now), zeroPadding()),
+    );
+  }
+
+  abortTable(now: number, blockTime = now): Promise<bigint> {
+    this.blockTime = blockTime;
+    return this.run('abortTable', (ctx) =>
+      this.table.impureCircuits.abortTable(ctx, BigInt(now), zeroPadding()),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// lobby.compact
+// ---------------------------------------------------------------------------------------
+
+export function zeroLobbyPadding(): LobbyPadding {
+  return { words: Array.from({ length: PADDING_WORDS }, () => new Uint8Array(32)) };
+}
+
+/** A `ContractAddress` from a single repeated byte. */
+export function contractAddress(fill: number): LobbyContractAddress {
+  return { bytes: new Uint8Array(32).fill(fill) };
+}
+
+/** Testbed for lobby.compact. No time dependence -- it holds no deadlines and no funds. */
+export class LobbySimulator extends BaseSimulator<LobbyPrivateState> {
+  lobby: LobbyContract<LobbyPrivateState>;
+
+  constructor(operatorSecret: Uint8Array) {
+    super(createLobbyPrivateState(operatorSecret));
+    this.lobby = new LobbyContract<LobbyPrivateState>(lobbyWitnesses);
+  }
+
+  static async create(
+    operatorSecret: Uint8Array,
+    operatorCommitment: Uint8Array,
+  ): Promise<LobbySimulator> {
+    const sim = new LobbySimulator(operatorSecret);
+    await sim.adopt(sim.lobby.initialState(sim.constructorContext(), operatorCommitment));
+    return sim;
+  }
+
+  getLedger(): LobbyLedgerType {
+    return lobbyLedger(this.state);
+  }
+
+  /** Swap in a different operator key, to test that the commitment check bites. */
+  asOperator(secret: Uint8Array): void {
+    this.privateState = createLobbyPrivateState(secret);
+  }
+
+  openTableAt(tier: number, address: LobbyContractAddress): Promise<[]> {
+    return this.run('openTableAt', (ctx) =>
+      this.lobby.impureCircuits.openTableAt(ctx, BigInt(tier), address, zeroLobbyPadding()),
+    );
+  }
+
+  tableFilled(tier: number): Promise<[]> {
+    return this.run('tableFilled', (ctx) =>
+      this.lobby.impureCircuits.tableFilled(ctx, BigInt(tier), zeroLobbyPadding()),
+    );
   }
 }

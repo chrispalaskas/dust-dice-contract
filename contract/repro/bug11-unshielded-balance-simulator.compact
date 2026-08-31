@@ -1,0 +1,41 @@
+// Reproduction for docs/bugs-found.md #11.
+//
+// compactc 0.34.0 / language 0.26.0, @midnight-ntwrk/compact-runtime 0.19.0.
+//
+// `unshieldedBalance` reports 0 under the simulator no matter what `receiveUnshielded` was
+// handed, in the SAME circuit call. Compile this and execute `probe(500)`; the returned
+// triple is [before, after, gte] and it comes back [0, 0, 0] where a ledger that tracked the
+// balance would give [0, 500, 1].
+//
+//   compact compile --skip-zk repro/bug11-unshielded-balance-simulator.compact /tmp/b11
+//
+// then run the generated contract with compact-runtime:
+//
+//   const c = new Contract({});
+//   const init = await c.initialState(createConstructorContext({}, '0'.repeat(64)));
+//   const ctx  = createCircuitContext('probe', sampleContractAddress(), '0'.repeat(64),
+//                                     init.currentContractState.data, {},
+//                                     undefined, undefined, undefined, 1000);
+//   (await c.impureCircuits.probe(ctx, 500n)).result   // => [0n, 0n, 0n]
+//
+// The consequence is not that the numbers are wrong -- it is that a contract guarding a payout
+// with `assert(unshieldedBalanceGte(...))` cannot be tested offline at all: the assert fails
+// for every honest call, so the guard has to be removed to get a green test suite, and its
+// absence is then invisible until devnet.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+/** Written so the receive cannot be optimised away. */
+export ledger seen: Uint<64>;
+
+/** Returns [balance before receive, balance after receive, unshieldedBalanceGte(amount)]. */
+export circuit probe(amount: Uint<64>): Vector<3, Uint<64>> {
+  const amt = disclose(amount);
+  const before = unshieldedBalance(nativeToken()) as Uint<64>;
+  receiveUnshielded(nativeToken(), amt as Uint<128>);
+  const after = unshieldedBalance(nativeToken()) as Uint<64>;
+  seen = after;
+  return [before, after, unshieldedBalanceGte(nativeToken(), amt as Uint<128>) as Uint<64>];
+}

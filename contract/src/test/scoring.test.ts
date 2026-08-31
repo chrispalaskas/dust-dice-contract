@@ -42,11 +42,16 @@ import {
   UPPER_BONUS,
   winnerSeat as refWinnerSeat,
   YAHTZEE_BONUS,
-} from '@yahtzee/api/src/rules.ts';
-import {
-  pureCircuits as scoringPure,
-  type Scorecard,
-} from '../managed/scoring/contract/index.js';
+  // Relative, not '@yahtzee/api/src/rules.ts'. That specifier does not resolve: api's
+  // package.json declares an `exports` map with only '.' and './node', so Node rejects the
+  // subpath outright (ERR_PACKAGE_PATH_NOT_EXPORTED) and this whole file fails to load --
+  // taking its tests with it, silently, because a load failure counts as one failing file
+  // rather than 35 failing tests. The exports map is deliberate (it keeps wallet plumbing out
+  // of browser bundles), so the right long-term fix is a './rules' subpath export in
+  // api/package.json pointing at the built rules module; until that exists, reaching for the
+  // source directly is what actually runs.
+} from '../../../api/src/rules.ts';
+import { pureCircuits as scoringPure, type Scorecard } from '../managed/scoring/contract/index.js';
 import { pureCircuits as takeTurnPure } from '../managed/takeTurn/contract/index.js';
 import { HoldPolicy, resolveTurnTs, type HoldPolicyValue } from '../dice-mirror.ts';
 import { createDicePrivateState } from '../witnesses.ts';
@@ -127,8 +132,7 @@ function allHands(): number[][] {
   for (let a = 1; a <= 6; a++)
     for (let b = 1; b <= 6; b++)
       for (let c = 1; c <= 6; c++)
-        for (let d = 1; d <= 6; d++)
-          for (let e = 1; e <= 6; e++) out.push([a, b, c, d, e]);
+        for (let d = 1; d <= 6; d++) for (let e = 1; e <= 6; e++) out.push([a, b, c, d, e]);
   return out;
 }
 
@@ -211,10 +215,15 @@ describe('rawScore matches api/src/rules.ts', () => {
     // The documented precondition, made visible. `rules.ts` has no equivalent guard -- it
     // indexes its histogram by face and corrupts it silently -- so the circuit being the
     // stricter of the two is deliberate, and `scoreTurn` is where the check is paid for.
-    assert.throws(() => scoringPure.rawScore(BigInt(Category.Chance), toCircuitDice([255, 255, 255, 255, 255])));
+    assert.throws(() =>
+      scoringPure.rawScore(BigInt(Category.Chance), toCircuitDice([255, 255, 255, 255, 255])),
+    );
     // A single out-of-range die that keeps the pip total under 256 scores as if that die were
     // simply not any face: no abort, and the upper categories are unaffected.
-    assert.equal(Number(scoringPure.rawScore(BigInt(Category.Ones), toCircuitDice([1, 1, 7, 7, 7]))), 2);
+    assert.equal(
+      Number(scoringPure.rawScore(BigInt(Category.Ones), toCircuitDice([1, 1, 7, 7, 7]))),
+      2,
+    );
   });
 
   it('isYahtzee agrees on every hand', () => {
@@ -453,10 +462,7 @@ describe('totals match api/src/rules.ts', () => {
     for (const { card } of makeCorpus()) {
       const c = toCircuitCard(card);
       assert.equal(Number(scoringPure.upperTotal(c.scores)), refUpperTotal(card));
-      assert.equal(
-        Number(scoringPure.grandTotal(c.scores, c.yahtzeeBonuses)),
-        refGrandTotal(card),
-      );
+      assert.equal(Number(scoringPure.grandTotal(c.scores, c.yahtzeeBonuses)), refGrandTotal(card));
     }
   });
 
@@ -486,7 +492,11 @@ describe('totals match api/src/rules.ts', () => {
   it('isComplete is true only for a card with all 13 boxes taken', () => {
     const empty = scoringPure.emptyScorecard();
     assert.equal(scoringPure.isComplete(empty), false);
-    const full: Scorecard = { scores: empty.scores, filled: empty.filled.map(() => true), yahtzeeBonuses: 0n };
+    const full: Scorecard = {
+      scores: empty.scores,
+      filled: empty.filled.map(() => true),
+      yahtzeeBonuses: 0n,
+    };
     assert.equal(scoringPure.isComplete(full), true);
     for (let i = 0; i < CATEGORY_COUNT; i++) {
       const oneOpen: Scorecard = {
@@ -516,11 +526,7 @@ describe('winner tie-break matches api/src/rules.ts', () => {
 
   const circuitWinner = (totals: readonly number[], fins: readonly number[]): number =>
     Number(
-      scoringPure.winnerOfSeats(
-        pad6(totals, 65535),
-        pad6(fins, NO_FINISH),
-        BigInt(totals.length),
-      ),
+      scoringPure.winnerOfSeats(pad6(totals, 65535), pad6(fins, NO_FINISH), BigInt(totals.length)),
     );
 
   it('the three cases from api/src/rules.test.ts', () => {
@@ -725,10 +731,7 @@ describe('scoreTurn executes against a ledger', () => {
     assert.equal(rake, 300n);
     assert.equal(Number(sim.getLedger().lastWinnerSeat), 2);
 
-    await assert.rejects(
-      () => sim.settleTable(totals, fins, 3n, 30_000n, 400n, 0n),
-      /rake split/,
-    );
+    await assert.rejects(() => sim.settleTable(totals, fins, 3n, 30_000n, 400n, 0n), /rake split/);
     await assert.rejects(() => sim.settleTable(totals, fins, 1n, 100n, 1n, 0n), /seat count/);
     await assert.rejects(() => sim.settleTable(totals, fins, 7n, 100n, 1n, 0n), /seat count/);
   });

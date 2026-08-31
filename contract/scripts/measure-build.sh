@@ -2,7 +2,7 @@
 # Copyright (C) Shielded Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Compile dice.compact and turn.compact four ways and record wall time and artifact sizes.
+# Compile every contract twice (--skip-zk and full ZK) and record wall time and artifact sizes.
 #
 # Always compiles into a FRESH directory: a stale managed/ tree keeps serving the previous
 # interface, and a partial key set from an interrupted run reads as a successful build with
@@ -28,7 +28,9 @@ compile_one() {
   local start end rc
   start=$(date +%s.%N)
   # shellcheck disable=SC2086
-  compact compile $flags "$HERE/src/$name.compact" "$target" \
+  # COMPACT_PATH so `include "policy-core"` (and dice-core / scoring-core) resolve when the
+  # compiler is invoked from anywhere but src/.
+  COMPACT_PATH="$HERE/src" compact compile $flags "$HERE/src/$name.compact" "$target" \
     >"$OUT/$name-$mode.log" 2>&1
   rc=$?
   end=$(date +%s.%N)
@@ -37,7 +39,7 @@ compile_one() {
   echo "[$name/$mode] exit=$rc $(echo "$end - $start" | bc)s"
 }
 
-CONTRACTS=(dice turn scoring takeTurn)
+CONTRACTS=(dice turn scoring takeTurn table lobby)
 
 for name in "${CONTRACTS[@]}"; do
   compile_one "$name" skipzk "--skip-zk"

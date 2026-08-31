@@ -133,9 +133,9 @@ for the three-line body of `mask`, and their instruction counts agree to within 
 
 | Repro variant | `mask` reads    | `mask` cost   | reuse=6 | reuse=12 | reuse=18 |
 | ------------- | --------------- | ------------- | ------: | -------: | -------: |
-| `narrow`      | own position    | 1 comparison  | 0.43 s  | 0.48 s   | 0.57 s   |
-| `wide-cheap`  | all 5 positions | 1 `faceCount` | 0.45 s  | —        | —        |
-| `wide-modal`  | all 5 positions | running max   | 3.89 s  | 25.5 s   | 51.6 s   |
+| `narrow`      | own position    | 1 comparison  |  0.43 s |   0.48 s |   0.57 s |
+| `wide-cheap`  | all 5 positions | 1 `faceCount` |  0.45 s |        — |        — |
+| `wide-modal`  | all 5 positions | running max   |  3.89 s |   25.5 s |   51.6 s |
 
 `narrow` is flat in the reuse count; `wide-modal` is not, at equal instruction counts.
 
@@ -146,12 +146,12 @@ depends only on what it needs. Three applications in this repo:
 
 | Shape                                                     | `--skip-zk` compile |
 | --------------------------------------------------------- | ------------------- |
-| `turn.compact`, hold mask latched from roll 1              | **2.65 s**          |
-| `turn.compact`, hold mask re-evaluated each roll           | **never completes** |
-| `takeTurn.compact`, per-die hold policy                    | **22.9 s**          |
-| `takeTurn.compact`, `keepModalFace`                        | **never completes** |
-| `takeTurn`, incremental `totalAfterPlacing`                | **22.9 s**          |
-| `takeTurn`, `cardTotal(placeScore(...))` — 19 reads not 2  | **187 s**           |
+| `turn.compact`, hold mask latched from roll 1             | **2.65 s**          |
+| `turn.compact`, hold mask re-evaluated each roll          | **never completes** |
+| `takeTurn.compact`, per-die hold policy                   | **22.9 s**          |
+| `takeTurn.compact`, `keepModalFace`                       | **never completes** |
+| `takeTurn`, incremental `totalAfterPlacing`               | **22.9 s**          |
+| `takeTurn`, `cardTotal(placeScore(...))` — 19 reads not 2 | **187 s**           |
 
 `takeTurn.compact` ships with a `holdOne(policy, die)` signature that cannot see the other four
 dice, so the constraint is enforced by the type rather than by a comment. The cost to the game
@@ -477,13 +477,13 @@ Every observation is consistent with the exclusive reading, and inconsistent wit
 documented one. `contract/repro/bug10-uint-range-upper-bound.compact` emits these bound checks
 (read them out of the generated `contract/index.js`):
 
-| Target spelling | Documented max | Emitted check | Executes 255/3/1? | Verdict          |
-| --------------- | -------------: | ------------- | ----------------- | ---------------- |
-| `Uint<1>`       |              1 | `t1 > 1n`     | 1 → `1`           | correct          |
-| `Uint<0..1>`    |              1 | `t1 > 0n`     | 1 → **throws**    | off by one       |
-| `Uint<0..3>`    |              3 | `t1 > 2n`     | 3 → **throws**    | off by one       |
-| `Uint<8>`       |            255 | `t1 > 255n`   | 255 → `255`       | correct          |
-| `Uint<0..256>`  |            255 | `t1 > 255n`   | 255 → `255`       | **= `Uint<8>`**  |
+| Target spelling | Documented max | Emitted check | Executes 255/3/1? | Verdict         |
+| --------------- | -------------: | ------------- | ----------------- | --------------- |
+| `Uint<1>`       |              1 | `t1 > 1n`     | 1 → `1`           | correct         |
+| `Uint<0..1>`    |              1 | `t1 > 0n`     | 1 → **throws**    | off by one      |
+| `Uint<0..3>`    |              3 | `t1 > 2n`     | 3 → **throws**    | off by one      |
+| `Uint<8>`       |            255 | `t1 > 255n`   | 255 → `255`       | correct         |
+| `Uint<0..256>`  |            255 | `t1 > 255n`   | 255 → `255`       | **= `Uint<8>`** |
 
 Two independent confirmations that this is the type and not the cast:
 
@@ -497,7 +497,7 @@ Two independent confirmations that this is the type and not the cast:
   compile error where it would at least be visible.
 
 Whether the compiler or the documentation is wrong is upstream's call. The hazard is the same
-either way, and it is sharpened by the fact that `Uint<0..1>` is the *natural* spelling for a
+either way, and it is sharpened by the fact that `Uint<0..1>` is the _natural_ spelling for a
 selector in a sum-of-products circuit — the shape bugs-found #1 forces on anyone writing a
 multi-way dispatch. Cost here: the whole scoring core was written with it, and only the first
 execution of the cross-check test found it.
@@ -519,3 +519,116 @@ is intended, say so in the documentation and fix the claim that `Uint<8>` is `Ui
 (3) either way, reject a statically-impossible cast (`1 as Uint<0..1>`, `true as Uint<0..1>`) at
 compile time instead of emitting a check that can never pass — an unsatisfiable range cast is
 always a bug in the source, and the compiler has the information to say so.
+
+## 11. compact-runtime 0.19.0: the simulator does not model a contract's unshielded balance, so every balance guard is untestable — **worked-around**
+
+**Symptom.** `unshieldedBalance(nativeToken())` returns **0** inside a circuit that has just
+called `receiveUnshielded(nativeToken(), 500)` in the same call. Not a stale read — the receive
+and both reads are three consecutive statements:
+
+```compact
+const before = unshieldedBalance(nativeToken()) as Uint<64>;   // 0, correctly
+receiveUnshielded(nativeToken(), amt as Uint<128>);
+const after  = unshieldedBalance(nativeToken()) as Uint<64>;   // 0, wrongly
+```
+
+`probe(500)` returns `[0n, 0n, 0n]` where a ledger that tracked the balance gives
+`[0n, 500n, 1n]`; the third element is `unshieldedBalanceGte(nativeToken(), 500)`, which is
+likewise **false immediately after receiving 500**. Repro:
+`contract/repro/bug11-unshielded-balance-simulator.compact`, which carries the runner snippet.
+
+Nothing reports a problem. `receiveUnshielded` and `sendUnshielded` both _succeed_; they simply
+move nothing that any offline read can observe, and a contract can `sendUnshielded` an amount it
+never received without the simulator objecting.
+
+**Root cause.** `receiveUnshielded` / `sendUnshielded` lower to `kernel.incUnshieldedInputs` and
+`kernel.incUnshieldedOutputs` + `kernel.claimUnshieldedCoinSpend`, and `unshieldedBalance` lowers
+to `kernel.balance` (signatures in docs/gate0-report.md, Q1). The first two are _declarations
+about the surrounding transaction_ — the real accounting is the ledger's transaction-wide
+per-token balance check at admission (`ledger/src/verify.rs:820-888`), which is exactly the part
+a local `CircuitContext` does not run. `kernel.balance` is served from a query context that no
+in-circuit declaration ever updates, so it stays at its initial 0 for the whole simulated life of
+the contract.
+
+So this is arguably "working as specified" at the VM level, and it is still a defect at the tool
+level: the same API is offered to a circuit as both an _effect_ and an _observation_, and only the
+effect is modelled. Nothing in the type system, the docs or the runtime says the observation is
+inert offline.
+
+**Why it matters more than it looks.** The natural way to write a pot is the way
+`probes/gate0/src/pot.compact` writes it:
+
+```compact
+assert(unshieldedBalanceGte(nativeToken(), total), "payOut: ledger balance too low");
+```
+
+That guard is **false for every honest call under the simulator**, so a test suite that exercises
+a payout cannot go green while it is present. The only ways forward are to delete the guard or to
+skip the tests, and both end with a contract whose custody invariant is first exercised on a real
+node. The failure mode is inverted from the usual one: the safety check is what breaks, so the
+pressure is to remove it.
+
+**Workaround — worked-around.** `contract/src/table.compact` keeps its own `pot: Uint<64>` ledger
+field, asserts against **that** everywhere, and never calls `unshieldedBalance`. Decision 4 in its
+header says so and says why. The contract-vs-ledger cross-check does not disappear; it moves to
+the E2E devnet run, where it is done from the indexer's per-transaction UTXO movement
+(`probes/gate0/tools/utxo-audit.mjs`) rather than in-circuit — which Gate 0 already established is
+the only trustworthy measure anyway (§9). `src/test/table.test.ts` names, in a comment on the
+`token custody` block, exactly which four properties the simulator cannot check.
+
+Note the residual risk this leaves, since it is the whole point of the entry: **no offline test in
+this repo can fail if `receiveUnshielded` or `sendUnshielded` is given the wrong amount, the wrong
+colour, or the wrong recipient.** Only devnet can.
+
+**Intended upstream action.** Issue against `midnightntwrk/midnight-js` (compact-runtime). Two
+asks, in order of preference: (1) have the simulator maintain a per-token unshielded balance from
+the `incUnshieldedInputs` / `incUnshieldedOutputs` declarations it already executes, so
+`kernel.balance` answers consistently with them — this is bookkeeping the runtime has all the
+inputs for, and it would make custody logic testable offline; (2) failing that, document
+prominently that `unshieldedBalance` is inert outside a real transaction, and consider making it
+_throw_ under a simulated context rather than returning a plausible 0, since a wrong number that
+looks right is worse than an unavailable one.
+
+## 12. compact-runtime 0.19.0: `createCircuitContext` defaults block time to wall-clock, making every time-dependent test non-reproducible — **worked-around**
+
+**Symptom.** A contract using the kernel's block-time predicates behaves differently on every run
+and differently on every machine, with nothing in the test naming time as an input.
+`createCircuitContext`'s ninth parameter is optional:
+
+```js
+const time = maybeTime ?? Math.floor(Date.now() / 1_000); // circuit-context.js:171
+```
+
+so a test that omits it silently pins the contract's clock to _now_. A timeout test written
+against absolute seconds passes or fails depending on when it is run; one written against
+`Date.now()` passes for the wrong reason and stops proving anything.
+
+**Root cause.** The default is a convenience for the common case (a client building a real
+transaction, where wall clock is the right guess) applied to an API that is also the only way to
+execute a circuit in a test. There is no separate test constructor and no deterministic default.
+
+This compounds with a second gap that is not a defect but shapes any contract with deadlines:
+**the kernel exposes block-time PREDICATES and no accessor.** `blockTimeGt`, `blockTimeGte`,
+`blockTimeLt` and `blockTimeLte` all exist with signature `(Uint<64>): Boolean` and are strict and
+seconds-based (probed against compactc 0.34.0 and confirmed by execution: at block time 1000,
+`blockTimeGt(999)` is true and `blockTimeGt(1000)` is false). There is no `blockTime()`, and
+`kernel.blockTime` does not exist — `operation blockTime undefined for ledger field type Kernel`.
+A contract that must _record_ when something happened therefore cannot read the clock; it has to
+be told the time and pin the claim between two predicates. `table.compact`'s `stampTime` does
+exactly that, and the pin is only meaningful if tests can set both sides of it — which is what
+the default above quietly takes away.
+
+**Workaround — worked-around.** Every simulator in `contract/src/test/simulator.ts` passes `time`
+explicitly, defaulting to a fixed `DEFAULT_BLOCK_TIME`; the file header states that nothing in it
+may call `createCircuitContext` without a time. `TableSimulator`'s mutating methods take the
+declared `now` and the block time as **separate** arguments that default to being equal, so the
+honest case is the easy one and the dishonest case — a caller lying about the clock — is
+expressible. That is what `describe('the declared-time sandwich')` in `src/test/table.test.ts`
+tests, on both sides of each boundary.
+
+**Intended upstream action.** Issue against `midnightntwrk/midnight-js` (compact-runtime). Ask
+that `time` be required, or that a `createTestCircuitContext` with a fixed default exist, or at
+minimum that the JSDoc on `createCircuitContext` say the parameter defaults to wall clock and that
+omitting it makes block-time-dependent execution non-reproducible. The parameter is currently
+documented as "The current time. Used to execute the block time related kernel operations", which
+does not hint that leaving it out is a correctness hazard in a test.
