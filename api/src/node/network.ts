@@ -13,15 +13,20 @@ export interface NetworkConfig {
 }
 
 /**
- * The local ledger-9 devnet from this repo's docker-compose.yml. Host ports are offset
- * (9954/8098/6310) so the stack coexists with the shielded-dapp-template devnet.
+ * The local ledger-9 devnet from this repo's docker-compose.yml, on the standard host ports.
+ *
+ * These are exactly the endpoints the Moth wallet's built-in `undeployed` preset expects,
+ * which is what lets a browser wallet reach this stack with no custom network configuration.
+ * Moving them is not free: Moth's ledger-version probe reads its *static* preset and caches
+ * the answer keyed on network id, so a relocated stack gets keys derived under the wrong
+ * ledger generation and fails at the WASM boundary rather than saying "wrong port".
  */
 export const UNDEPLOYED: NetworkConfig = {
   networkId: 'undeployed',
-  indexer: 'http://127.0.0.1:8098/api/v4/graphql',
-  indexerWS: 'ws://127.0.0.1:8098/api/v4/graphql/ws',
-  node: 'ws://127.0.0.1:9954',
-  proofServer: 'http://127.0.0.1:6310',
+  indexer: 'http://127.0.0.1:8088/api/v4/graphql',
+  indexerWS: 'ws://127.0.0.1:8088/api/v4/graphql/ws',
+  node: 'ws://127.0.0.1:9944',
+  proofServer: 'http://127.0.0.1:6300',
 };
 
 /**
