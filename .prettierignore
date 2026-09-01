@@ -7,3 +7,6 @@ contract/build/
 **/managed/
 probes/*/.run/
 package-lock.json
+
+# Next.js regenerates this on every dev/build run; formatting it is a losing battle
+ui/next-env.d.ts
