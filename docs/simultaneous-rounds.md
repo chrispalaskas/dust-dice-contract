@@ -163,3 +163,43 @@ The cost is latency for the eliminated player: someone knocked out in round 2 wa
 to end before withdrawing. Accepted deliberately — the alternative needs per-seat withdrawal
 history and delta payments, which is more state and more ways to get custody wrong, for money
 that is not at risk either way.
+
+## Future version: off-chain interactivity, one settlement transaction per turn
+
+Sketched by the product owner and analysed here so v1 keeps the seam for it. The goal: the
+player's whole turn — both hold decisions and the category — lands on chain as **one**
+transaction instead of four.
+
+Why one transaction cannot simply carry the hold masks today: the second mask must be **bound
+before roll 3 is revealed**, and roll 2 must be revealed before the first mask can be chosen.
+A list like `[mask1, mask2, category]` cannot be written before the information it reacts to
+exists — the transactions in v1 are not an encoding, they are the interaction itself.
+
+The v2 shape moves that interaction off-chain and keeps only settlement on-chain:
+
+1. Player opens the turn on-chain (entropy commitment, as today).
+2. Off-chain, with the operator: player sends `C1 = commit(mask1)` (a hash commitment — a full
+   ZK proof per step is unnecessary weight; the one settlement proof verifies every opening);
+   operator replies with roll 2; player sends `C2`; operator replies with roll 3.
+3. Player submits ONE transaction opening `C1, C2` plus the category; the operator's resolves
+   verify the dice against those masks exactly as v1's do.
+
+What makes it sound, and what it leans on:
+
+- **The operator's one-shot reveal discipline is load-bearing.** Roll 2's values depend on
+  which positions mask1 rerolls, so a player allowed to probe multiple masks reconstructs the
+  whole stream and plays perfectly. An honest operator reveals once per commitment; a colluding
+  operator could allow probing — but a colluding operator can already leak the seed outright,
+  which is strictly stronger, so this adds nothing NEW to the collusion residual.
+- **Deception at decision time** (operator shows false dice off-chain; the on-chain truth then
+  makes the player's committed masks retroactively bad) is the new vector. Two mitigations, in
+  order of strength: have the operator hand over the same ZK proof it will later submit, and
+  verify it locally in the browser before deciding (trustless, but needs browser-side proof
+  verification — the real engineering cost of v2); or accept operator honesty here with
+  after-the-fact detectability, which is weaker than v1 and must be said plainly if chosen.
+- Cost: full turn drops from 4 player + 3 operator to **2 player + 3 operator**, and the
+  interactive part becomes instant instead of ~19 s per step. The operator's three resolves
+  remain the floor; they no longer interleave with the player.
+
+v1 keeps the seam deliberately: hold masks live in the seat's own ledger cells and the resolves
+read them from there, so v2 replaces one player circuit and touches nothing else.
