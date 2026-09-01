@@ -28,3 +28,13 @@ coverage/
 
 # cli run state (contract addresses, throwaway seeds, timings — regenerated per run)
 cli/.run/
+
+# Next 16 writes these into the workspace unless agentRules is disabled
+ui/AGENTS.md
+ui/CLAUDE.md
+
+# Operator seeds and the table registry. LOAD-BEARING: operator-state.json holds every open
+# table's roll seed — committing it would publish the secret the commit-reveal scheme depends
+# on, letting anyone precompute that table's dice. See service/README.md.
+service/.state/
+service/.state-smoke-*/
