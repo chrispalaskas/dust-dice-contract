@@ -379,6 +379,19 @@ Read with a one-shot `queryContractState`, never `contractStateObservable`, for 
 
 `seatTurn[seat].roll` is the current dice at stages 2, 4 and 6.
 
+Three details a client will otherwise only find by reading the Compact:
+
+- **`seatProgress.dice` is written only by a score move** — never by `resolveRoll*`. During a
+  turn the live dice are `seatTurn.roll`; `seatProgress.dice` is the hand the seat _banked_ for
+  the round, which is what the round-digest fold and the verifier consume.
+- **`seatProgress.finishedAtRound` is a round index**, despite any older `finishedAtTurn`
+  naming that survives in mirrors: there is no turn index in this model. `65535` = never
+  finished.
+- **The winner tie-break excludes eliminated seats entirely** (in-circuit `survivorRow`:
+  `s < seatCount && !eliminated`). `api`'s `winnerSeat` predates eliminations and is NOT a
+  drop-in replacement for settlement prediction once any seat has been eliminated — compute the
+  winner over survivors only.
+
 ---
 
 ## 9. Transaction cost
