@@ -399,11 +399,13 @@ The honest arithmetic, measured by the test suite
 
 | table   |  every turn full | every turn stops after roll 1 |
 | ------- | ---------------: | ----------------------------: |
-| 2 seats | 104 + 2 + 13 + 1 |               52 + 2 + 13 + 1 |
+| 2 seats | 182 + 2 + 13 + 1 |               78 + 2 + 13 + 1 |
 | 6 seats | 546 + 6 + 13 + 1 |              234 + 6 + 13 + 1 |
 
-At six seats: **552 transactions** if every player takes all three rolls, **240** if every player
-stops after roll 1.
+At two seats: **198 transactions** all-full, **94** all-stop-early. At six seats: **566** and
+**254**. (The 2-seat row originally read `104 + …`, computed from the player-only count of 4
+per turn instead of the 7-transaction total the 6-seat row uses — caught by the UI port, which
+now derives its estimates from the per-turn table above rather than these aggregates.)
 
 **Early scoring is the player's lever over the length of the game, and it is a big one** — a
 table where everyone stops after roll 1 is well under half the traffic of one where everyone
