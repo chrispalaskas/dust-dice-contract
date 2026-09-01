@@ -493,6 +493,17 @@ export ledger padStore: Bytes<4096>;
  * write it once, because `pad`'s length argument must be a literal. Keep the two in step by
  * hand; a mismatch is a compile error, not a silent shrink.
  *
+ * CORRECTION, from live play: THIS LEVER DOES NOT WORK. Raising it 2 KB -> 4 KB grew the
+ * transaction by a few hundred bytes, not 2,048, and `claimTimeout` still fails admission at
+ * 7,455-7,463 bytes against a required 8,269. `pad(n, "...")` is a short tag followed by zero
+ * fill, which costs almost nothing once serialised. What actually sizes these transactions is
+ * the PROOF, and proof size scales with the circuit's PLONK domain: `claimTimeout` (k=11) is
+ * the only circuit that has ever hit the floor, while `abortTable` (k=12) and everything above
+ * never do. The floor is a proof-size floor. The fix is to give an under-sized circuit real
+ * work until it clears k=12 with margin -- see docs/simultaneous-rounds.md. The padding below
+ * is retained because it is harmless, not because it is doing the job it was added for.
+ *
+ * Original (mistaken) rationale, kept so the reasoning error is legible:
  * RAISED FROM 2 KB after a real rejection, not a measurement: with 2 KB the operator's
  * `claimTimeout` was refused by the node with `OutsideTimeToDismiss` (client error 231) on a
  * live table, even though the E2E run had measured every circuit clearing the floor. Nothing

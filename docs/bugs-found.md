@@ -738,3 +738,84 @@ explicitly that exported-circuit parameters are public inputs and that their **w
 proving domain, with the per-word figure. Ideally the compiler would also warn when public inputs
 dominate a circuit's domain — it is the one cost that is entirely invisible in the source and
 entirely avoidable.
+
+## 15. node 2.0.0-rc.4 / ledger 9.1: a devnet can stop accepting every fee-paying transaction, permanently, reporting only client error 170 — **open**
+
+**Symptom.** A devnet that had been serving a live game for five hours stopped including
+transactions entirely. From block **3116** (2026-09-01 18:36:00 UTC) to the end of the session —
+170+ blocks, ~17 minutes, verified by querying every block in the range through the indexer — the
+chain contained **zero** transactions. Blocks continued to be produced on schedule.
+
+Every submission after that point failed, from every wallet, regardless of what it was:
+
+| Attempt                                  | Wallet             | Result                      |
+| ---------------------------------------- | ------------------ | --------------------------- |
+| contract deploy (15,462 B), x6           | genesis            | `1010: … Custom error: 170` |
+| contract deploy, x6 (fresh process each) | fresh probe wallet | `1010: … Custom error: 170` |
+| plain 1-NIGHT transfer                   | genesis            | `1010: … Custom error: 170` |
+| plain 1-NIGHT transfer                   | fresh probe wallet | `1010: … Custom error: 170` |
+
+The same genesis wallet had completed a transfer of the same shape **20 minutes earlier**, and
+the same probe wallet had been funded and DUST-registered successfully at 18:35–18:36 — those
+four transactions are the last four the chain ever accepted. The node log gives §6's message
+every time:
+
+```
+Transaction malformed: dust spend proof failed to verify; this is just as likely a disagreement
+on dust state on the declared time (Timestamp(1788288738)) as the proof being invalid: DustSpend { … }
+Rejected transaction … : Transaction Error: Malformed(InvalidDustSpendProof)
+```
+
+The wallet was not short of DUST: the rejected deploy declared `v_fee: 6853510813656816`
+(~6.9e15) against a wallet balance of 7.9e19, four orders of magnitude of headroom, and the
+balance was growing throughout.
+
+**Root cause.** Not established. This is the third distinct condition behind client error 170
+(§0 #8/#22 lists the ledger-tag mismatch and the single-wallet spend race; §6 documents the
+1-in-3 transient) and the only one that is **absorbing** — nothing clears it. The correlation
+available is that it began immediately after two large NIGHT UTXOs were newly registered for DUST
+generation on a chain that had also been under a sustained retry load: a client was re-submitting
+into it at ~6 rejections per 35 s throughout. Whether either is causal or both are coincident
+with something else is untested.
+
+**Why it is worse than §6.** §6's transient is recoverable by retrying; this is not, and the two
+are indistinguishable from the client, which sees the identical `1010: … Custom error: 170` in
+both cases. Six retries with 12 s backoff, then across fresh processes, then from a different
+wallet, all failed identically. A retry loop written against §6 will therefore spin forever
+against this, and the operator gets no signal that the chain — rather than the transaction — is
+what is broken.
+
+**Workaround — worked-around.** Only a fresh chain clears it, which §0 #8/#22 already said and
+this confirms with a clean before/after: an identical deploy from an identical wallet succeeded
+on the **first attempt** on a newly started node with the same image and the same code.
+
+Because tearing down the wedged stack would have destroyed the live game running on it,
+`probes/concurrency/docker-compose.yml` instead brings up a second, isolated stack on host
+ports offset by 10 (9954 / 8098 / 6310). Any probe that must be able to trust its own results
+should default to a chain it owns; that probe's `src/config.ts` does, rather than making it an
+opt-in flag, since a wedged chain otherwise renders as a result.
+
+**Detection.** Cheaper than reading the node log: ask the indexer whether any block in the recent
+range contains a transaction.
+
+```graphql
+{
+  block(offset: { height: N }) {
+    height
+    transactions {
+      hash
+    }
+  }
+}
+```
+
+A run of empty blocks spanning several minutes on a chain that is being written to means the
+chain is wedged, not that the transaction is malformed.
+
+**Intended upstream action.** Issue against `midnightntwrk/midnight-node` / `midnight-ledger`
+with the block range and the log excerpt: (a) `InvalidDustSpendProof` needs to distinguish "this
+proof is wrong" from "the node's dust state cannot be reconciled with any client's", because as
+it stands one error code covers a retryable race, a configuration mismatch and an unrecoverable
+chain state; (b) a node whose dust state has diverged such that no wallet can pay a fee should
+say so once at the node level rather than only per-rejected-transaction. Supersedes nothing —
+§6's transient is real and separate.

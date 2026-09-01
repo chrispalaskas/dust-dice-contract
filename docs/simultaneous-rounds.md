@@ -43,7 +43,12 @@ concurrency, not a lock: if what the transcript depended on has moved, the trans
 Two consequences, and only the first is the platform's:
 
 - **Binding granularity** decides whether two seats writing different map keys collide.
-  Measured by probe: [concurrency-probe.md](concurrency-probe.md).
+  **Measured** ([concurrency-probe.md](concurrency-probe.md)): binding is **per-read** — a
+  transaction is rejected only if a ledger value its transcript actually _read_ has changed
+  since it was proved. Six wallets writing six different map keys all landed in a single block.
+  A blind write binds to nothing; a read-modify-write on a shared scalar binds to that scalar
+  and exactly one of the racers survives (`ReadMismatch`); a `Counter.increment` commutes and
+  both land.
 - **Shared cells collide regardless of granularity.** If two players' turns both write "how many
   seats have finished this round", they conflict no matter how fine the binding is. That part is
   ours to design away, and it is why the layout below has no shared mutable cell on the player's
@@ -53,12 +58,25 @@ Two consequences, and only the first is the platform's:
 
 **A player's `takeTurn` writes only that seat's own entries, and reads shared state read-only.**
 
-- No `roundDoneCount`. The round is **derived**: `min(seatRound[s])` over seats that are still
-  active. Six reads, no write.
+- No `roundDoneCount`. **And the round is NOT derived by reading every seat** — that was the
+  first draft of this note and the probe shows it is wrong: `Map.lookup` binds exactly as a
+  scalar read does, so a turn that reads all six seats' progress collides with all five other
+  turns. Instead the open round is a single scalar written **only** by `closeRound`. Reading a
+  shared value is free of conflict as long as it does not change during the round — which is
+  precisely the property `openRound`, `roundDigest` and `roundDeadline` have.
 - No digest fold on the player path. The once-per-round fold is the operator's (see below), and
   the operator is serialised on one wallet anyway.
 - `pot` is not touched by `takeTurn`; stakes move only at `join`, `eliminate`, `settle` and
   `redeem`.
+- Nothing on the player path may read-modify-write a shared scalar. `stampTime()` does exactly
+  that to `lastActionAt` today, in 7 of 8 circuits, and would serialise every turn on its own.
+  The per-round `roundDeadline`, written once by `closeRound`, replaces it.
+- Where a shared accumulator is genuinely wanted, use `Counter` — measured to commute, because
+  it compiles to a native add that never reads the value back.
+
+**One silent hazard:** two transactions writing the _same_ map key both land, last-write-wins,
+with no error — a lost move rather than a rejection. Seat keys must therefore be derived from
+the actor's proven secret, never from anything two actors could compute identically.
 
 ## The operator can no longer choose the dice
 
@@ -102,6 +120,25 @@ real but tight, and it is a reason not to add an eleventh casually.
 `resolveRoll1/2/3` already sit at **k=15 with zero headroom**, and the proof server has no SRS
 above 15. Anything that grows the roll path makes the contract unprovable rather than slow.
 Measure `k` for every circuit before writing the rest of this.
+
+### Every circuit has a k FLOOR as well as a ceiling
+
+Found the hard way in live play, and it invalidates the advice previously written into
+`table.compact`'s decision 8. `claimTimeout` (k=11) is rejected by the node with
+`OutsideTimeToDismiss`: measured at 7,455–7,463 bytes against a required 8,269. Nothing else
+ever fails — `abortTable` at k=12 and everything above land every time — and across the whole
+run `claimTimeout` is the _only_ circuit that has ever hit the floor, 1,610 times.
+
+**Raising the ledger padding does not fix it.** It was raised 2 KB → 4 KB and the transaction
+grew by a few hundred bytes, not 2,048: `pad(n, "…")` is a short tag followed by zero fill, so
+it costs almost nothing once serialised. The byte that matters is the **proof**, whose size
+scales with k. The admission floor is therefore effectively a _proof-size_ floor, and the only
+reliable lever is k — give a too-small circuit real cryptographic work until it clears k=12,
+with margin, while staying at or under 15.
+
+For this redesign: `eliminate` and `redeem` are both small circuits doing little work, exactly
+the shape that lands under the floor. Measure their k before assuming they are fine, and give
+them ballast if they come in below 13.
 
 ## Timeouts
 
