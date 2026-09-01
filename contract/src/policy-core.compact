@@ -1,7 +1,8 @@
 // Copyright (C) Shielded Technologies
 // SPDX-License-Identifier: Apache-2.0
 //
-// Hold policies and the three-roll turn resolution -- the dice half of Table.resolveTurn.
+// The entropy scheme and the reroll merge -- the dice half of a turn, minus the dice ladder
+// itself, which is dice-core.compact's.
 //
 // `include`d verbatim by table.compact (and by the measurement probes), so this file carries
 // NO pragma and NO import of its own -- the including file supplies both, and must also
@@ -10,296 +11,65 @@
 // verifier keys of every contract that includes it.
 //
 // ---------------------------------------------------------------------------------------
-// The reference this mirrors
-// ---------------------------------------------------------------------------------------
-// api/src/policies.ts is contract-canonical. Policy codes are ITS numbers and appear
-// on-chain; never reorder them:
-//
-//   0 Stand  1 RerollAll  2 KeepModal  3 KeepFace(param 1..6)  4 ChaseStraight
-//   5 KeepPairsPlus
-//
-// A `Uint<8>` and not a Compact `enum`, for the same reason category indices are: the codes
-// are compared arithmetically inside a sum-of-products selector, and an enum value cannot be
-// produced by arithmetic. `holdPolicyCount()` bounds them.
-//
-// ---------------------------------------------------------------------------------------
-// Why KeepModal is witnessed and the other five are not
-// ---------------------------------------------------------------------------------------
-// docs/bugs-found.md #1: compile time scales as (times a value is re-read) x (size of that
-// value's expression DAG). A hold mask sits at the worst possible place for this -- every
-// merged die reads it, and it is read again by the second merge -- so the mask's fan-in is
-// the variable that decides whether this file compiles at all. Measured in
-// docs/scoring-circuit.md §5:
-//
-//   mask fan-in   uses of each merged die       compile
-//   -----------------------------------------------------
-//   3 leaves      ~40 (dice + full applyScore)   10.2 s
-//   15 leaves     1 (diceSum)                     5.0 s
-//   15 leaves     6 (isYahtzee)                  45.5 s
-//   15 leaves     ~40 (full applyScore)         >200 s
-//
-// Two consequences shape this file.
-//
-// FIRST: resolveTurn must not score. It derives dice and writes them to the ledger (one use
-// of each merged die); takeTurn reads them back as a ledger leaf and scores them. That is the
-// two-transaction split docs/table-contract.md already mandates for game reasons, and it is
-// also the only split under which a whole-hand hold mask compiles.
-//
-// SECOND: `modalFace` is the one predicate that cannot be computed here even so. It is not
-// its fan-in that kills it (`ChaseStraight` and `KeepPairsPlus` below have the same fan-in
-// and compile fine) but its DAG: a 6-way argmax over six face counts, each of which reads all
-// five dice, re-expanded on every one of the ten mask reads. So the operator WITNESSES the
-// modal face `m` and the circuit VERIFIES it (`isCanonicalModal`, six comparisons over the
-// same six counts, read once each). The mask predicate is then `die == m` with `m` a fresh
-// leaf. Verification pins `m` uniquely, so witnessing it grants the operator nothing:
-// `docs/table-contract.md` calls this the witness-the-answer trick.
-//
-// `ChaseStraight` and `KeepPairsPlus` ARE computed in-circuit. Both are count-shaped, so both
-// push every mask bit's fan-in to all five roll-1 dice (20 hash-byte leaves) -- the 15-leaf
-// row above -- and both were measured before being kept. See docs/table-circuit.md.
-
-// ---------------------------------------------------------------------------------------
-// Policy codes
-// ---------------------------------------------------------------------------------------
-
-/** Mirrors `HoldPolicy` in api/src/policies.ts. Contract-canonical; never reorder. */
-pure circuit policyStand(): Uint<8> {
-  return 0;
-}
-
-pure circuit policyRerollAll(): Uint<8> {
-  return 1;
-}
-
-pure circuit policyKeepModal(): Uint<8> {
-  return 2;
-}
-
-pure circuit policyKeepFace(): Uint<8> {
-  return 3;
-}
-
-pure circuit policyChaseStraight(): Uint<8> {
-  return 4;
-}
-
-pure circuit policyKeepPairsPlus(): Uint<8> {
-  return 5;
-}
-
-/** One past the last valid policy code. */
-export pure circuit holdPolicyCount(): Uint<8> {
-  return 6;
-}
-
-/**
- * Is `(policy, param)` the canonical encoding of a choice?
- *
- * Mirrors `validatePolicy` in api/src/policies.ts exactly: `KeepFace` carries a face 1..6 and
- * every other policy carries 0. Canonicity matters because the pair is written to the ledger
- * and replayed by the settlement verifier -- two encodings of the same choice would make the
- * on-chain log ambiguous.
- */
-export pure circuit isValidPolicy(policy: Uint<8>, param: Uint<8>): Boolean {
-  return policy < holdPolicyCount() &&
-         (policy == policyKeepFace() ? (param >= 1 && param <= 6) : param == 0);
-}
-
-// ---------------------------------------------------------------------------------------
-// Face counts (local copy)
+// WHAT THE INTERACTIVE-HOLD REDESIGN REMOVED FROM THIS FILE
 // ---------------------------------------------------------------------------------------
 //
-// scoring-core.compact has `faceCount`/`countsOf` already, but this file is included by
-// probes that do not need the scoring core, and a textual `include` makes the ordering
-// load-bearing. So the two counting helpers are duplicated under distinct names rather than
-// creating an include-order dependency between two include files. Six lines, no coupling.
-
-/** How many of the five dice show face `f`. */
-pure circuit pFaceCount(d: Vector<5, Uint<8>>, f: Uint<8>): Uint<8> {
-  return (((d[0] == f) as Uint<8>) +
-          ((d[1] == f) as Uint<8>) +
-          ((d[2] == f) as Uint<8>) +
-          ((d[3] == f) as Uint<8>) +
-          ((d[4] == f) as Uint<8>))
-         as Uint<8>;
-}
-
-/**
- * `Boolean` as a tight 0/1 integer.
- *
- * `Uint<1>`, NOT `Uint<0..1>` -- the range spelling excludes its upper bound in compactc
- * 0.34.0, so `Uint<0..1>` is the single-value type {0} and the cast throws on every `true`.
- * docs/bugs-found.md #10. Same note as `flag` in scoring-core.compact, repeated because this
- * file is included independently of it.
- */
-pure circuit pFlag(x: Boolean): Uint<1> {
-  return x as Uint<1>;
-}
+// Everything to do with PRE-DECLARED HOLD POLICIES. The player used to choose one of six
+// deterministic rules (Stand, RerollAll, KeepModal, KeepFace, ChaseStraight, KeepPairsPlus)
+// before any dice existed, and the circuit computed a mask from it -- including the
+// witness-the-answer `isCanonicalModal` machinery, which existed only because a 6-way argmax
+// over face counts could not be computed in-circuit without tripping docs/bugs-found.md #1.
+//
+// The player now sees each roll and names the dice to keep, so the mask arrives as five
+// explicit bits and there is nothing to compute. Deleted: the policy codes, `isValidPolicy`,
+// `pFaceCount`, `pFlag`, `modalOkAt`, `isCanonicalModal`, `DiePredicates`, `predicates0..4`,
+// `holdBit`, `holdMaskOf`, `resolveDice`, `resolveDiceChecked`, `firstRollChecked` and the
+// `modalFaceHint` witness they were all in service of.
+//
+// api/src/policies.ts is no longer contract-canonical for anything. It is left in place
+// because the site still imports its type, and it now describes a game nobody plays.
+//
+// WHAT SURVIVED, and why each piece is still load-bearing:
+//
+//   forcedEntropy         a player still cannot choose their per-round entropy
+//   entropyKeyCommitment  a seat's join-time authorisation key
+//   seedCommitmentOf      the operator's commit-reveal
+//   mixEntropy            folds the FROZEN round digest into a seat's entropy
+//   firstRoll             roll 1, with no mask to latch
+//   rerollUnderMask       rolls 2 and 3, under a mask the PLAYER supplied
+//
+// ---------------------------------------------------------------------------------------
+// The reroll merge changed shape, and the change is visible on chain
+// ---------------------------------------------------------------------------------------
+//
+// The old `mergeHeld` was POSITIONAL: die `i` of a reroll came from byte positions `4i..4i+3`
+// of that roll's hash whether or not positions before it were rerolled. The new `mergeStream`
+// is a STREAM: the fresh roll is consumed LEFT TO RIGHT over the rerolled positions only, so
+// if a player holds positions 0 and 3, the two dice they get back are `fresh[0]` and
+// `fresh[1]`, not `fresh[1]` and `fresh[2]`.
+//
+// This is the model api/src/policies.ts always used and the circuit did not, and the
+// divergence was documented in src/policy-mirror.ts as a deliberate one. Now they agree.
+// It costs ten conditional selects -- position `i` can only draw from `fresh[0..i]`, so the
+// mux widths are 1, 2, 3, 4 and 5 -- and the cost was measured before being accepted, because
+// `resolveRoll2` and `resolveRoll3` sit at the SRS ceiling with no headroom at all.
 
 // ---------------------------------------------------------------------------------------
-// KeepModal: verify the witnessed answer
-// ---------------------------------------------------------------------------------------
-
-/**
- * Is face `m` correct at face `f`, under "highest face among those with the maximal count"?
- *
- * `holdMask`'s `KeepModal` branch in api/src/policies.ts scans `f = 2..6` and takes `f` when
- * `counts[f] >= counts[modal]`, so ties go to the HIGHER face. Equivalently, `m` is the modal
- * face iff its count strictly beats every higher face and weakly beats every lower one. That
- * equivalence is what turns a 6-way argmax into six independent comparisons.
- */
-pure circuit modalOkAt(m: Uint<8>, cm: Uint<8>, f: Uint<8>, cf: Uint<8>): Boolean {
-  return (f == m) || (f < m && cm >= cf) || (f > m && cm > cf);
-}
-
-/**
- * Does `m` equal `modalFace(d)` as api/src/policies.ts computes it?
- *
- * The whole point of this circuit: it is the CHECK, not the computation. The operator supplies
- * `m` (it holds the seed, so it knows the dice); this pins `m` to the single correct face, so
- * supplying a different one cannot produce a transaction. Six counts, each read twice (once to
- * select `cm`, once to compare) -- and the result is used only inside an `assert`, never inside
- * the mask, so none of this DAG reaches a merged die.
- */
-export pure circuit isCanonicalModal(d: Vector<5, Uint<8>>, m: Uint<8>): Boolean {
-  const c1 = pFaceCount(d, 1);
-  const c2 = pFaceCount(d, 2);
-  const c3 = pFaceCount(d, 3);
-  const c4 = pFaceCount(d, 4);
-  const c5 = pFaceCount(d, 5);
-  const c6 = pFaceCount(d, 6);
-  const cm = (pFlag(m == 1) * c1 +
-              pFlag(m == 2) * c2 +
-              pFlag(m == 3) * c3 +
-              pFlag(m == 4) * c4 +
-              pFlag(m == 5) * c5 +
-              pFlag(m == 6) * c6)
-             as Uint<8>;
-  return m >= 1 &&
-         m <= 6 &&
-         modalOkAt(m, cm, 1, c1) &&
-         modalOkAt(m, cm, 2, c2) &&
-         modalOkAt(m, cm, 3, c3) &&
-         modalOkAt(m, cm, 4, c4) &&
-         modalOkAt(m, cm, 5, c5) &&
-         modalOkAt(m, cm, 6, c6);
-}
-
-// ---------------------------------------------------------------------------------------
-// The hold mask
-// ---------------------------------------------------------------------------------------
-
-/**
- * The two count-shaped predicates for one die position, precomputed from roll 1.
- *
- * `firstOccurrence` is `ChaseStraight`: keep the LOWEST-indexed die of each distinct face and
- * reroll the duplicates (api/src/policies.ts walks a `seen` array left to right, which is the
- * same thing). `duplicated` is `KeepPairsPlus`: keep every die whose face appears at least
- * twice.
- *
- * Bundled into a struct so `holdBit` takes them as two Booleans and never sees the other four
- * dice. That keeps the fan-in visible in the signature rather than buried in a call.
- */
-struct DiePredicates {
-  firstOccurrence: Boolean,
-  duplicated: Boolean,
-}
-
-/** `DiePredicates` for position 0. Position 0 is always the first occurrence of its face. */
-pure circuit predicates0(d: Vector<5, Uint<8>>): DiePredicates {
-  return DiePredicates { firstOccurrence: true,
-                         duplicated: d[0] == d[1] || d[0] == d[2] || d[0] == d[3] || d[0] == d[4], };
-}
-
-pure circuit predicates1(d: Vector<5, Uint<8>>): DiePredicates {
-  return DiePredicates { firstOccurrence: d[1] != d[0],
-                         duplicated: d[1] == d[0] || d[1] == d[2] || d[1] == d[3] || d[1] == d[4], };
-}
-
-pure circuit predicates2(d: Vector<5, Uint<8>>): DiePredicates {
-  return DiePredicates { firstOccurrence: d[2] != d[0] && d[2] != d[1],
-                         duplicated: d[2] == d[0] || d[2] == d[1] || d[2] == d[3] || d[2] == d[4], };
-}
-
-pure circuit predicates3(d: Vector<5, Uint<8>>): DiePredicates {
-  return DiePredicates { firstOccurrence: d[3] != d[0] && d[3] != d[1] && d[3] != d[2],
-                         duplicated: d[3] == d[0] || d[3] == d[1] || d[3] == d[2] || d[3] == d[4], };
-}
-
-pure circuit predicates4(d: Vector<5, Uint<8>>): DiePredicates {
-  return DiePredicates { firstOccurrence: d[4] != d[0] &&
-                                          d[4] != d[1] &&
-                                          d[4] != d[2] &&
-                                          d[4] != d[3],
-                         duplicated: d[4] == d[0] || d[4] == d[1] || d[4] == d[2] || d[4] == d[3], };
-}
-
-/**
- * Whether one die is held. Sum of products over the six policies, exactly one of which
- * selects.
- *
- * `RerollAll` contributes no term at all -- its mask is all-false, so its product is
- * identically zero and writing it out would only add a comparison. Same for a policy code out
- * of range, which `isValidPolicy` rejects separately.
- */
-pure circuit holdBit(policy: Uint<8>,
-                     param: Uint<8>,
-                     modal: Uint<8>,
-                     die: Uint<8>,
-                     pred: DiePredicates,
-                     ): Boolean {
-  return (policy == policyStand()) ||
-         (policy == policyKeepModal() && die == modal) ||
-         (policy == policyKeepFace() && die == param) ||
-         (policy == policyChaseStraight() && pred.firstOccurrence) ||
-         (policy == policyKeepPairsPlus() && pred.duplicated);
-}
-
-/**
- * Which dice the policy keeps. Latched: computed once, from roll 1, and reused for BOTH
- * rerolls.
- *
- * Latching is a compiler constraint promoted to a game rule (api/src/policies.ts says so in
- * its own words): re-deriving the mask from roll 2 would make roll 3's dice depend on a second
- * whole-hand DAG. The consequence a player must be told: a die your roll-1 mask did not hold
- * is rerolled in both rerolls, even if roll 2 turned it into the face you were chasing.
- */
-export pure circuit holdMaskOf(
-                      policy: Uint<8>,
-                      param: Uint<8>,
-                      modal: Uint<8>,
-                      d: Vector<5, Uint<8>>,
-                      ): Vector<5, Boolean> {
-  return [holdBit(policy, param, modal, d[0], predicates0(d)),
-          holdBit(policy, param, modal, d[1], predicates1(d)),
-          holdBit(policy, param, modal, d[2], predicates2(d)),
-          holdBit(policy, param, modal, d[3], predicates3(d)),
-          holdBit(policy, param, modal, d[4], predicates4(d)),];
-}
-
-/** Per-position select: keep the held die, take the freshly derived one otherwise. */
-pure circuit mergeHeld(
-               hold: Vector<5, Boolean>,
-               kept: Vector<5, Uint<8>>,
-               fresh: Vector<5, Uint<8>>,
-               ): Vector<5, Uint<8>> {
-  return [hold[0] ? kept[0] : fresh[0],
-          hold[1] ? kept[1] : fresh[1],
-          hold[2] ? kept[2] : fresh[2],
-          hold[3] ? kept[3] : fresh[3],
-          hold[4] ? kept[4] : fresh[4],];
-}
-
-// ---------------------------------------------------------------------------------------
-// Entropy mixing
+// Entropy, commitments, mixing
 // ---------------------------------------------------------------------------------------
 
 /**
  * The player's per-round entropy, forced: `entropy_s(r) = H(sk_s, tableId, r)`.
  *
  * A player cannot pick this at turn time -- it is a function of the secret they committed to at
- * `join` and the round number. That closes the operator-player collusion grind in
- * docs/table-contract.md: knowing the seed buys nothing if you cannot vary your own input.
+ * `join` and the round number. That closes the operator-player collusion grind for ENTROPY:
+ * knowing the seed buys nothing if you cannot vary your own input.
+ *
+ * It is also what makes every seat's dice stream distinct, which matters more under
+ * simultaneous rounds than it did under the cursor. `RollContext` has no seat field -- the
+ * separation comes entirely from `playerEntropy`, which is a hash of `sk_s`. Two seats can
+ * only collide by sharing a secret, and `join` refuses a second seat for a `C_s` already
+ * registered.
  */
 export pure circuit forcedEntropy(sk: Bytes<32>, tableId: Bytes<32>, round: Uint<8>): Bytes<32> {
   return persistentHash<EntropyContext>(
@@ -323,9 +93,7 @@ export struct EntropyContext {
  * `tableId` IS PART OF THE COMMITMENT, and the reason is linkability rather than dice fairness:
  * without it, a client that reuses one `sk_s` across two tables publishes the same `C_s` at both,
  * and an observer can join the two seats up. `forcedEntropy` already re-binds `tableId`, so the
- * dice were never at risk -- this closes the identifier, not the randomness. The client rule
- * (docs/client-rules.md) still says one fresh secret per table; this makes the reuse case merely
- * wasteful rather than de-anonymising.
+ * dice were never at risk -- this closes the identifier, not the randomness.
  */
 export pure circuit entropyKeyCommitment(tableId: Bytes<32>, sk: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:entkey"), tableId, sk]);
@@ -337,10 +105,7 @@ export pure circuit entropyKeyCommitment(tableId: Bytes<32>, sk: Bytes<32>): Byt
  * `tableId` IS PART OF THE COMMITMENT, and here it is a real security property rather than a
  * tidiness one. `settle` reveals the seed by design. If the same seed were ever reused for two
  * tables, both would carry the SAME commitment, and the first table's settlement would hand any
- * observer the second, still-live table's entire future randomness. Binding `tableId` in means a
- * reused seed produces two unrelated commitments and the reveal at one table says nothing about
- * the other. The operator is still told to use a fresh seed per table; this makes a slip
- * survivable instead of catastrophic.
+ * observer the second, still-live table's entire future randomness.
  */
 export pure circuit seedCommitmentOf(tableId: Bytes<32>, seed: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:seed"), tableId, seed]);
@@ -348,61 +113,117 @@ export pure circuit seedCommitmentOf(tableId: Bytes<32>, seed: Bytes<32>): Bytes
 
 /**
  * The player entropy that actually feeds the roll hash: the forced entropy folded together
- * with the running game digest.
+ * with the round digest.
  *
- * docs/table-contract.md specifies the roll input as
- * `H(seed, entropy_s(r), gameDigest, tableId, r, rollIndex)`. This implementation reaches the
- * same set of inputs one hash earlier, by mixing `gameDigest` into the entropy and handing the
- * result to `dice-core.compact`'s existing `RollContext` as `playerEntropy`:
- *
- *     mixed  = H("mix", entropy_s(r), gameDigest)
+ *     mixed  = H("mix", entropy_s(r), roundDigest_r)
  *     roll   = H("roll", tableId, seed, mixed, r, rollIndex)
  *
- * Substituting, every input the spec names is present and each occupies a fixed-width field of
- * a single hash, so nothing can be slid between fields. The reason for the indirection is that
+ * Every input docs/table-contract.md names is present and each occupies a fixed-width field of
+ * a single hash, so nothing can be slid between fields. The indirection exists because
  * `RollContext` is already deployed in three measured contracts and mirrored byte-for-byte by
- * src/dice-mirror.ts; adding a field would change the dice of every existing artifact and
- * invalidate the cross-check corpus. Recorded as a deliberate deviation in the table.compact
- * header.
+ * src/dice-mirror.ts; adding a field would change the dice of every existing artifact.
  *
- * What the digest buys: because seat order is join order and the digest absorbs every join and
- * every resolution, a player choosing `sk_s` at join time cannot know which digest their later
- * rolls will hash against. Grinding `sk_s` therefore does not let even a seed-knowing player
- * steer their own dice, unless they control every seat at the table.
+ * `roundDigest_r` IS FROZEN FOR THE WHOLE ROUND. Under simultaneous rounds that is a security
+ * requirement rather than a convenience: a digest that advanced per resolve would let the
+ * operator choose everybody's dice by choosing the order it resolved six seats in. See section
+ * 2 of table.compact's header.
  */
-export pure circuit mixEntropy(entropy: Bytes<32>, gameDigest: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:mix"), entropy, gameDigest]);
+export pure circuit mixEntropy(entropy: Bytes<32>, roundDigest: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:mix"), entropy, roundDigest]);
 }
 
 // ---------------------------------------------------------------------------------------
-// The three-roll turn
+// The reroll merge -- left-to-right over rerolled positions
+// ---------------------------------------------------------------------------------------
+
+/** `Boolean` as a tight 0/1 integer. `Uint<1>`, never `Uint<0..1>` -- docs/bugs-found.md #10. */
+pure circuit pFlag(x: Boolean): Uint<1> {
+  return x as Uint<1>;
+}
+
+/**
+ * How many of the positions before `i` are being rerolled -- i.e. which die of the fresh roll
+ * position `i` draws.
+ *
+ * Written as five separate one-line circuits rather than a loop with a runtime bound because a
+ * `Vector` index must be a compile-time constant, and written as a flat sum rather than a
+ * running accumulator because a chain of conditionals over the same operands is the shape
+ * docs/bugs-found.md #1 punishes.
+ */
+pure circuit rank1(h: Vector<5, Boolean>): Uint<8> {
+  return (1 - pFlag(h[0])) as Uint<8>;
+}
+
+pure circuit rank2(h: Vector<5, Boolean>): Uint<8> {
+  return (2 - pFlag(h[0]) - pFlag(h[1])) as Uint<8>;
+}
+
+pure circuit rank3(h: Vector<5, Boolean>): Uint<8> {
+  return (3 - pFlag(h[0]) - pFlag(h[1]) - pFlag(h[2])) as Uint<8>;
+}
+
+pure circuit rank4(h: Vector<5, Boolean>): Uint<8> {
+  return (4 - pFlag(h[0]) - pFlag(h[1]) - pFlag(h[2]) - pFlag(h[3])) as Uint<8>;
+}
+
+/**
+ * The freshly rolled die that lands at position `i`, given how many earlier positions were
+ * rerolled.
+ *
+ * Position `i` can only ever draw from `fresh[0..i]` -- at most `i` positions precede it -- so
+ * the mux widths are 1, 2, 3, 4 and 5 rather than 5, 5, 5, 5, 5. Ten selects in total. Each
+ * candidate is a leaf of the fresh roll, so no merged die is ever re-read and
+ * docs/bugs-found.md #1 does not bite.
+ */
+pure circuit pick2(f: Vector<5, Uint<8>>, r: Uint<8>): Uint<8> {
+  return r == 0 ? f[0] : f[1];
+}
+
+pure circuit pick3(f: Vector<5, Uint<8>>, r: Uint<8>): Uint<8> {
+  return r == 0 ? f[0] : (r == 1 ? f[1] : f[2]);
+}
+
+pure circuit pick4(f: Vector<5, Uint<8>>, r: Uint<8>): Uint<8> {
+  return r == 0 ? f[0] : (r == 1 ? f[1] : (r == 2 ? f[2] : f[3]));
+}
+
+pure circuit pick5(f: Vector<5, Uint<8>>, r: Uint<8>): Uint<8> {
+  return r == 0 ? f[0] : (r == 1 ? f[1] : (r == 2 ? f[2] : (r == 3 ? f[3] : f[4])));
+}
+
+/**
+ * Keep the held dice; fill the rerolled positions from the fresh roll, LEFT TO RIGHT.
+ *
+ * Mirrored exactly by `mergeStreamTs` in src/policy-mirror.ts. The settlement verifier replays
+ * every roll of every game through that mirror, so a divergence here is a game nobody can check.
+ *
+ * Position 0 is a special case only in that its rank is always 0: if it is rerolled it takes
+ * `fresh[0]`, because no position precedes it.
+ */
+export pure circuit mergeStream(
+                      hold: Vector<5, Boolean>,
+                      kept: Vector<5, Uint<8>>,
+                      fresh: Vector<5, Uint<8>>,
+                      ): Vector<5, Uint<8>> {
+  return [hold[0] ? kept[0] : fresh[0],
+          hold[1] ? kept[1] : pick2(fresh, rank1(hold)),
+          hold[2] ? kept[2] : pick3(fresh, rank2(hold)),
+          hold[3] ? kept[3] : pick4(fresh, rank3(hold)),
+          hold[4] ? kept[4] : pick5(fresh, rank4(hold)),];
+}
+
+// ---------------------------------------------------------------------------------------
+// The two roll steps
 // ---------------------------------------------------------------------------------------
 
 /**
- * THE dice derivation for one turn: roll, latch the mask, reroll twice.
+ * Roll 1: five fresh dice, no mask, nothing held.
  *
- * `mixed` is `mixEntropy`'s output, not the raw forced entropy -- the caller mixes, so that
- * this circuit stays a pure function of things a verifier can see on-chain.
- *
- * Mirrored by `resolveDiceTs` in src/dice-mirror.ts. Any edit here must be made there too, or
- * the settlement verifier disagrees with the chain.
+ * There is nothing to latch any more. Under pre-declared policies this step also computed the
+ * hold mask from roll 1 and wrote it to the ledger, because the mask was a function of the dice;
+ * an interactive hold arrives as an argument one transaction later, so roll 1 is now purely a
+ * derivation.
  */
-export pure circuit resolveDice(
-                      tableId: Bytes<32>,
-                      seed: Bytes<32>,
-                      mixed: Bytes<32>,
-                      round: Uint<8>,
-                      policy: Uint<8>,
-                      param: Uint<8>,
-                      modal: Uint<8>,
-                      ): Vector<5, Uint<8>> {
-  const r0 = deriveDice(rollContext(tableId, seed, mixed, round, 0));
-  const hold = holdMaskOf(policy, param, modal, r0);
-  const r1 = mergeHeld(hold, r0, deriveDice(rollContext(tableId, seed, mixed, round, 1)));
-  return mergeHeld(hold, r1, deriveDice(rollContext(tableId, seed, mixed, round, 2)));
-}
-
-/** Roll 1 alone -- what `isCanonicalModal` and the witnessed modal face are checked against. */
 export pure circuit firstRoll(
                       tableId: Bytes<32>,
                       seed: Bytes<32>,
@@ -413,96 +234,10 @@ export pure circuit firstRoll(
 }
 
 /**
- * `resolveDice` with the witnessed modal face checked against roll 1 in the same circuit.
+ * Rolls 2 and 3: reroll exactly the positions the player did not hold.
  *
- * THE circuit `Table.resolveTurn` calls. It exists separately from `resolveDice` so that roll 1
- * is derived ONCE and shared between the modality check and the mask -- calling `firstRoll` and
- * `resolveDice` side by side would derive it twice and pay for the whole ladder again.
- *
- * The check is guarded on the policy, so the other five policies do not have to supply a
- * meaningful `modal`. The guard is not a branch a prover can dodge: `policy` is public ledger
- * state, so exactly one side of it is live for any given transaction.
- */
-export pure circuit resolveDiceChecked(
-                      tableId: Bytes<32>,
-                      seed: Bytes<32>,
-                      mixed: Bytes<32>,
-                      round: Uint<8>,
-                      policy: Uint<8>,
-                      param: Uint<8>,
-                      modal: Uint<8>,
-                      ): Vector<5, Uint<8>> {
-  const r0 = deriveDice(rollContext(tableId, seed, mixed, round, 0));
-  assert(disclose(policy != policyKeepModal() || isCanonicalModal(r0, modal)),
-         "resolveTurn: witnessed modal face is not the modal face of roll 1"
-         );
-  const hold = holdMaskOf(policy, param, modal, r0);
-  const r1 = mergeHeld(hold, r0, deriveDice(rollContext(tableId, seed, mixed, round, 1)));
-  return mergeHeld(hold, r1, deriveDice(rollContext(tableId, seed, mixed, round, 2)));
-}
-
-// ---------------------------------------------------------------------------------------
-// The three-roll turn, SPLIT ACROSS THREE TRANSACTIONS
-// ---------------------------------------------------------------------------------------
-//
-// `resolveDiceChecked` above is the whole turn in one circuit. It is correct, it is what
-// docs/table-circuit.md measured, and it CANNOT BE PROVED on this platform: the exported
-// circuit built on it compiles to a PLONK domain of k=17, and the proof server bundles only
-// `bls_midnight_2p9` .. `2p15` with no route to fetch more (docs/e2e-report.md). Every other
-// circuit in the project lands at exactly k=15 -- the ceiling, with no headroom.
-//
-// The two circuits below are the same computation cut so that EACH TRANSACTION DERIVES EXACTLY
-// ONE ROLL. One roll is `dice/rollDice`, measured at k=15; two rolls is `turn/probeTwoRolls`,
-// measured at k=16. So one roll per transaction is not a conservative choice, it is the only
-// cut that fits. `table.compact` calls `firstRollChecked` once and `rerollUnderMask` twice, from
-// three separate exported circuits.
-//
-// The GAME is unchanged by this: the same three roll hashes over the same `RollContext`s in the
-// same order under the same latched mask, so a turn's dice are bit-for-bit what
-// `resolveDiceChecked` -- and `resolveDiceTs` in src/policy-mirror.ts -- produce. The settlement
-// verifier does not learn about the split at all. `resolveDiceChecked` is therefore kept, unused
-// by any exported circuit but still cross-checked against both the mirror and the split by
-// src/test/table.test.ts, as the executable statement that the split did not change the dice.
-
-/** Roll 1, and the mask latched from it. The two outputs of the split's first step. */
-export struct FirstRollResult {
-  dice: Vector<5, Uint<8>>,
-  hold: Vector<5, Boolean>,
-}
-
-/**
- * Step 1 of 3: derive roll 1, check the witnessed modal face against it, latch the hold mask.
- *
- * Roll 1 is derived ONCE and shared between the modality check and the mask, for the same
- * reason `resolveDiceChecked` exists rather than composing `firstRoll` with `resolveDice`.
- *
- * The check is guarded on the policy, so the other five policies do not have to supply a
- * meaningful `modal`. The guard is not a branch a prover can dodge: `policy` is public ledger
- * state, so exactly one side of it is live for any given transaction.
- */
-export pure circuit firstRollChecked(
-                      tableId: Bytes<32>,
-                      seed: Bytes<32>,
-                      mixed: Bytes<32>,
-                      round: Uint<8>,
-                      policy: Uint<8>,
-                      param: Uint<8>,
-                      modal: Uint<8>,
-                      ): FirstRollResult {
-  const r0 = deriveDice(rollContext(tableId, seed, mixed, round, 0));
-  assert(disclose(policy != policyKeepModal() || isCanonicalModal(r0, modal)),
-         "resolveRoll1: witnessed modal face is not the modal face of roll 1"
-         );
-  return FirstRollResult { dice: r0, hold: holdMaskOf(policy, param, modal, r0) };
-}
-
-/**
- * Steps 2 and 3 of 3: one reroll under a mask that was already latched from roll 1.
- *
- * `hold` comes off the ledger rather than being recomputed, which is what makes this circuit
- * one roll's worth of work: recomputing the mask would need roll 1 back, i.e. a second ladder.
- * That the mask is latched from roll 1 and never re-evaluated is a game rule (see `holdMaskOf`),
- * so carrying it forward is not an approximation -- it is the rule, written into the ledger.
+ * `hold` comes off the ledger, where the player's own `playerMove` transaction put it, so the
+ * operator has no say in it whatever. `rollIndex` separates the two rerolls' hashes.
  */
 export pure circuit rerollUnderMask(
                       tableId: Bytes<32>,
@@ -513,5 +248,5 @@ export pure circuit rerollUnderMask(
                       hold: Vector<5, Boolean>,
                       kept: Vector<5, Uint<8>>,
                       ): Vector<5, Uint<8>> {
-  return mergeHeld(hold, kept, deriveDice(rollContext(tableId, seed, mixed, round, rollIndex)));
+  return mergeStream(hold, kept, deriveDice(rollContext(tableId, seed, mixed, round, rollIndex)));
 }

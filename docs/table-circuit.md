@@ -10,18 +10,163 @@ Toolchain, unchanged from [gate0-report.md](gate0-report.md): Compact CLI `0.5.1
 
 ---
 
-> **This document was written before the E2E run and is superseded in two places by
-> [e2e-report.md](e2e-report.md).** The single `resolveTurn` measured throughout §3 is
-> **unprovable on this platform** (k=17 against a proof-server ceiling of k=15) and has been
-> split into `resolveRoll1/2/3`; and the transaction padding is now a compile-time constant
-> rather than a circuit argument, which changes every prover-key figure below. §3.4 carries the
-> as-shipped numbers. Everything else here — the compile-time findings, the `takeTurn`/resolve
-> separation, the padding _mechanism_ — stands unchanged and is what made the split possible.
+> **SUPERSEDED FROM §1 ONWARD by §0 below.** Two redesigns landed after this document was
+> written: SIMULTANEOUS ROUNDS (every seat plays each round independently; see
+> [simultaneous-rounds.md](simultaneous-rounds.md)) and INTERACTIVE HOLDS (the player picks the
+> dice to keep after seeing each roll, replacing the six pre-declared hold policies). Between
+> them they changed the exported circuit list, the round count, the dice merge and every
+> measurement.
+>
+> **§0 is the as-shipped record.** Everything from §1 onward is kept as the history of how the
+> design got here — the compile-time findings, the derivation/scoring separation and the padding
+> mechanism are all still true and are what made the current shape possible — but the numbers,
+> the circuit names and the policy set in those sections describe contracts that no longer exist.
+> An earlier banner in this position said the same thing about the E2E run's split of
+> `resolveTurn`; that split survives, in `resolveRoll1/2/3`.
 
-## 1. Exported circuits
+---
+
+## 0. As shipped: simultaneous rounds with interactive holds
+
+Ten exported circuits against a deploy ceiling measured at 11–12. Measured with compactc
+`0.34.0`, language `0.26.0`; `k` read out of the compiled ZKIR with `@midnight-ntwrk/zkir-v2`'s
+`Zkir.fromJson(...).getK()` (`npm run k -w cli`), prover-key sizes from a full
+`compact compile`.
+
+### 0.1 The k table
+
+**Every circuit is inside [13, 15], and that is a two-sided requirement.** The proof server
+bundles `bls_midnight_2p9 .. 2p15` and cannot fetch more, so 16 is unprovable. And there is a
+FLOOR: `claimTimeout` at k=11 was rejected by the node 1,610 times in live play with
+`OutsideTimeToDismiss`, measured at 7,455–7,463 bytes against a required 8,269, while
+`abortTable` at k=12 and everything above never failed once. The admission floor is a
+**proof-size** floor and proof size follows k, so k is the only reliable lever — raising the
+ledger padding does not work (§0.4).
+
+| circuit        | caller   |   k | instructions | public inputs | prover key | headroom           |
+| -------------- | -------- | --: | -----------: | ------------: | ---------: | ------------------ |
+| `join`         | player   |  14 |          830 |             3 |  5,208,806 | 1 step             |
+| `playerMove`   | player   |  14 |        1,243 |            10 |  5,207,892 | 1 step             |
+| `resolveRoll1` | operator |  15 |          870 |             1 |  9,981,795 | **none**           |
+| `resolveRoll2` | operator |  15 |          924 |             1 |  9,975,405 | **none**           |
+| `resolveRoll3` | operator |  15 |          926 |             1 |  9,975,444 | **none**           |
+| `closeRound`   | anyone   |  13 |          687 |             1 |  2,819,527 | 2 steps            |
+| `eliminate`    | anyone   |  13 |        1,015 |             3 |  2,822,941 | 2 steps, ballasted |
+| `settle`       | anyone   |  14 |        1,482 |             4 |  5,212,390 | 1 step             |
+| `redeem`       | anyone   |  13 |          605 |             1 |  2,820,079 | 2 steps, ballasted |
+| `abortTable`   | anyone   |  14 |        2,172 |             2 |  5,201,354 | 1 step             |
+
+Verifier keys are 2,119 bytes for every circuit. `--skip-zk` compiles the whole contract in
+**0.72 s** and emits byte-identical ZKIR, so the instruction counts above are safe to quote from
+the dev loop; only key generation needs the full compile.
+
+**k is not monotonic in instruction count and never was.** `abortTable` is the largest circuit
+here at 2,172 instructions and sits at k=14, while `resolveRoll2` at 924 needs k=15. The domain
+is set by the _gates_, and for the resolve circuits that means the roll hash and its rejection
+ladder — 30 `div_mod_power_of_two` and ~120 `less_than` per roll. Prover-key size is likewise a
+step function of the domain plus a gate-set constant, which is why it clusters at three values
+(2.8 MB at k=13, 5.2 MB at k=14, 10.0 MB at k=15) rather than tracking the circuits' work.
+
+### 0.2 The two circuits that needed ballast, and what they were given
+
+`eliminate` and `redeem` both do very little — one seat, a subtraction, a send — and both landed
+**under the floor** on first measurement: `eliminate` at **k=10** and `redeem` at k=13 only
+because it already carried a hash. Neither was given a hash over nothing. Both were given work
+that is worth doing and happens to be the right size:
+
+| circuit     | before | ballast added                                                                  | after |
+| ----------- | -----: | ------------------------------------------------------------------------------ | ----: |
+| `eliminate` |     10 | `assertCustody()` (6 reads + the invariant) and the `seatReceipt` penalty hash |    13 |
+| `redeem`    |     13 | the `seatReceipt` payout hash over the seat's final scorecard                  |    13 |
+
+`assertCustody()` is the check that catches a pot/redeemable arithmetic slip at the exact moment
+money moves between the two. The receipts are a public, permanent record of the arithmetic, and
+a player disputing a settlement has something to point at. Both are declared as ballast in the
+source so nobody later "optimises" them away and reopens the floor.
+
+`abortTable` was at **k=12** before `finalDigest` was added — one step above the observed
+failure but below the 13 target — and the closing certificate lifted it to 14.
+
+### 0.3 The resolve path has no headroom, and it was measured first
+
+`resolveRoll1/2/3` were measured **before any of the redesign was written**, because the whole
+contract turns on whether they still fit. Three shapes, same ladder:
+
+| shape                                      | roll 1 | roll 2 | roll 3 | verdict        |
+| ------------------------------------------ | -----: | -----: | -----: | -------------- |
+| cursor model, pre-declared policies        |  1,320 |    961 |  1,852 | k=15 / 15 / 15 |
+| simultaneous rounds, pre-declared policies |  1,133 |    792 |    792 | k=15 / 15 / 15 |
+| simultaneous rounds, interactive holds     |    870 |    924 |    926 | k=15 / 15 / 15 |
+
+The interactive redesign paid for itself twice here. `resolveRoll1` **lost** the witnessed
+modal-face check and the mask computation (1,133 → 870); rolls 2 and 3 **gained** the ten
+conditional selects of the left-to-right stream merge (792 → 924) and still came out under the
+cursor model's figures. All three remain at the ceiling, so anything that grows this path from
+here makes the contract unprovable rather than slow. That is why `closeRound` is a separate
+circuit and why the resolve steps touch exactly one ledger map.
+
+The single-circuit `resolveTurn` that started all this needed **k=17** and could never have
+produced a transaction. The cut at one roll per transaction was forced by the corpus — one roll
+is k=15, two are k=16 — and with interactive holds it is no longer a compromise at all: the
+player must see each roll to choose the next hold, so the rolls have to be separate transactions
+anyway.
+
+### 0.4 The padding is retained, and it does not do what it was added for
+
+`padTransaction()` writes a 4 KB compile-time constant to `padStore` after
+`kernel.checkpoint()`. It was added to clear the ~8 KB admission floor and **it does not**:
+raising it 2 KB → 4 KB grew the transaction by a few hundred bytes, not 2,048, because
+`pad(n, "…")` is a short tag followed by zero fill and serialises to almost nothing. It is kept
+because the transcript bytes are free and cannot hurt.
+
+What the padding's _shape_ still buys is real and is §3.3's finding: as a **compile-time
+constant** it costs nothing, and as a `Vector<64, Bytes<32>>` **argument** it cost two public
+inputs and five instructions per 32-byte word — enough on its own to push the resolve circuits to
+k=16 and the contract out of provability.
+
+### 0.5 Circuit count
+
+Ten exported against a ceiling measured at 11–12. The interactive turn has three player moves —
+open, hold, score — which as separate circuits would have been twelve. They are **merged into one
+`playerMove`** behind a `kind` discriminator with canonical sentinels for the arguments a kind
+does not use. A circuit has no branches, so the merge costs nothing at proving time that three
+circuits would not each have paid anyway: the union of the three read sets is what every kind
+reads regardless. Encoding in [table-interface.md](table-interface.md).
+
+Helper circuits (`padTransaction`, `pinTime`, `assertCustody`, `totalRedeemable`,
+`awaitingOperatorAt`) are **not** exported and cost nothing against the ceiling — the compiler
+emits one `.zkir` and one key pair per _exported_ circuit. Neither do `pure` circuits from
+`dice-core`, `scoring-core` and `policy-core`: a pure circuit produces no prover key, no verifier
+key and no zkir at all.
+
+### 0.6 Conflict-freedom, read off the compiled transcript
+
+Not a measurement of size but of the property the layout exists for, and it is checked
+mechanically on every test run by `src/test/ledger-access.ts`, which parses the generated
+`index.js` for the `popeq` (binding read) and `ins` (blind write) operations per circuit.
+
+| circuit          | binds to (reads)                                                                      |
+| ---------------- | ------------------------------------------------------------------------------------- |
+| `playerMove`     | `phase`, `openRound`, `seatCount`, `tableId`, and its own seat's four map entries     |
+| `resolveRoll1`   | `phase`, `openRound`, `roundDigest`, `seedCommitment`, `tableId`, own `seatTurn`      |
+| `resolveRoll2/3` | `phase`, `seedCommitment`, `tableId`, own `seatTurn` (roll 3 also own `seatProgress`) |
+| `redeem`         | `phase`, `seatCount`, `tableId`, and its own seat's three map entries                 |
+| `closeRound`     | all six `seatProgress`, plus `phase`/`openRound`/`roundDigest`/`seatCount`            |
+| `eliminate`      | the above **plus `pot` and `activeSeats`** — deliberately serialising                 |
+
+Every field on the player path is either sealed, frozen for the duration of a round, or that
+seat's own. `pot` and `activeSeats` are the contract's only shared accumulators and both are off
+the player path; two concurrent eliminations conflict and one retries, which is correct.
+
+---
+
+## 1. Exported circuits — HISTORICAL (the cursor model with pre-declared policies)
 
 Eight, against a deploy ceiling of ~11 measured upstream. **The deploy fits with three circuits
 to spare.**
+
+> Superseded by §0.5. `takeTurn` and `claimTimeout` no longer exist; `playerMove`, `closeRound`,
+> `eliminate` and `redeem` do.
 
 | circuit        | caller   | does                                                                                     |
 | -------------- | -------- | ---------------------------------------------------------------------------------------- |

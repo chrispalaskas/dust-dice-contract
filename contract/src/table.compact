@@ -3,197 +3,245 @@
 //
 // ===========================================================================================
 // Midnight Yahtzee -- the Table contract. One deployment per table.
+// SIMULTANEOUS ROUNDS, INTERACTIVE HOLDS.
 // ===========================================================================================
 //
-// Implements docs/table-contract.md: the two-step turn, pipelined category choice, the
-// hardened entropy scheme, structural authorisation, WaitPlayer/WaitResolve sub-state,
-// claimTimeout vs abortTable, native unshielded NIGHT custody, and the witness-checked rake.
+// Implements docs/simultaneous-rounds.md plus the interactive-hold amendment. Every seat plays
+// each round independently and the round advances when they have all finished; within a round a
+// player sees each roll, picks the dice to keep, and may stop and score at any point. A seat
+// that stops responding is eliminated, forfeits a share of its stake that grows with how far the
+// game has run, and redeems the rest once the table is over.
 //
-// Eight exported circuits -- join, takeTurn, resolveRoll1/2/3, settle, claimTimeout, abortTable
-// -- against a deploy ceiling of ~11. The operator's move is three transactions rather than one
-// because the one-transaction version cannot be proved on this platform; see decision 9.
+// This REPLACES two earlier designs at once. The seat cursor of docs/table-contract.md, under
+// which five players waited while one played, is gone. So are the six pre-declared hold
+// policies (Stand, RerollAll, KeepModal, KeepFace, ChaseStraight, KeepPairsPlus) and the
+// witness-checked modal-face machinery they needed -- a hold is now five explicit bits the
+// player sends after seeing the dice.
+//
+// TEN exported circuits -- join, playerMove, resolveRoll1/2/3, closeRound, eliminate, settle,
+// redeem, abortTable -- against a deploy ceiling measured at 11-12. The interactive turn wants
+// three player entry points where the old one wanted one (open a turn, hold, score), which
+// would be twelve; they are MERGED into a single `playerMove` with a kind discriminator and
+// canonical sentinels for the arguments a given kind does not use. See `playerMove`.
 //
 // Building blocks are `include`d verbatim and NOT reimplemented:
 //   dice-core.compact     byte-threshold ladder, roll derivation      (measured)
 //   scoring-core.compact  rawScore/applyScore/placeScore/totals,
 //                         winner tie-break, witness-checked rake      (measured)
-//   policy-core.compact   the six hold policies, three-roll turn      (measured, this MS)
+//   policy-core.compact   entropy scheme, the left-to-right reroll    (measured)
 //
 // -------------------------------------------------------------------------------------------
-// Decisions this file makes that docs/table-contract.md left open
+// 1. CONFLICT-FREEDOM IS THE CONSTRAINT THAT SHAPES EVERYTHING BELOW
 // -------------------------------------------------------------------------------------------
 //
-// 1. SEAT STORAGE IS THREE LEDGER `Map`s KEYED BY SEAT INDEX, not `Vector`s.
-//    A `Vector` index must be a compile-time constant, so every runtime seat access would be a
-//    6-way disjunction to read and a 6-way rebuild to write (docs/bugs-found.md #1's
-//    companion note). A ledger `Map` takes a runtime key directly. The three maps split by
-//    write frequency, so no circuit rewrites bytes it did not change:
-//      seatIdentity  written once, at join  (payout address + entropy-key commitment)
-//      seatCard      written by takeTurn    (the 13 packed scores + filled bitmap)
-//      seatProgress  written by takeTurn / resolveRoll3 / claimTimeout
-//    Scores are `Uint<8>` and `filled` is a `Vector<13, Boolean>` -- the packing
-//    scoring-core.compact already uses, because a circuit has no `null`.
+// A transaction's proof commits to the ledger values its transcript READ. The node re-executes
+// the transcript at inclusion time and rejects it if any read value has moved
+// (`Transcript(Execution(ReadMismatch))`). Binding is per-READ, not per-write and not
+// whole-state: this was measured, not assumed (docs/concurrency-probe.md, 96 attempts).
 //
-//    ALL SIX SLOTS ARE PRE-INSERTED BY THE CONSTRUCTOR, including slots no player will ever
-//    take. A ledger `Map.lookup` of an absent key aborts, so pre-inserting makes every lookup
-//    total and lets `settle` read all six seats without a `member` guard per seat. Whether a
-//    slot is real is `seat < seatCount`, never map membership.
+// Three consequences the probe pins down, and this file is built on all three:
 //
-// 2. ALL SIX HOLD POLICIES SHIPPED. Stand, RerollAll, KeepModal, KeepFace, ChaseStraight and
-//    KeepPairsPlus, encoded exactly as api/src/policies.ts encodes them. KeepModal goes
-//    through the witness-the-answer trick; the two count-based masks are computed in-circuit.
-//    They were expected to risk docs/bugs-found.md #1 and do not: the whole set compiles in
-//    ~1 s at 1,542 instructions for the dice half. Measurements in docs/table-circuit.md.
-//    The reason they are safe is structural and worth stating: the resolve circuits DERIVE dice
-//    and `takeTurn` SCORES them, so no merged die is ever read by `applyScore`. Merging the two
-//    into one circuit is what previously failed to compile at all.
+//   * A `Map.lookup` binds EXACTLY as a scalar read does. Per-seat storage is necessary but
+//     not sufficient -- a circuit that writes one seat but reads all six collides with all six.
+//     The old `forfeitFlags()` did precisely that.
+//   * Reading a shared value is free of conflict as long as it does not CHANGE during the
+//     window in which several actors read it. `openRound`, `roundDigest` and `roundDeadline`
+//     have exactly that property: they are written ONLY by `closeRound`, which by construction
+//     runs when no seat has a move in flight.
+//   * `Counter.increment` commutes (it compiles to a native `addi` and never reads the value
+//     back). Nothing here needs one, but it is the escape hatch if a shared accumulator is
+//     ever wanted on the player path.
 //
-// 3. THE ROLL HASH REACHES THE SPEC'S INPUT SET ONE HASH EARLIER. docs/table-contract.md
-//    writes the roll input as `H(seed, entropy_s(r), gameDigest, tableId, r, rollIndex)`.
-//    Here `gameDigest` is folded into the entropy first (`mixEntropy` in policy-core.compact)
-//    and the result handed to dice-core's existing `RollContext` as `playerEntropy`. Same
-//    inputs, same domain separation, and dice-core.compact keeps the byte-for-byte shape its
-//    TypeScript mirror and three measured contracts already pin. Adding a field to
-//    `RollContext` would have changed the dice of every existing artifact.
+// THE RULE. `playerMove` writes only its own seat's entries and read-modify-writes NO shared
+// scalar. That now has to hold for FOUR transactions per turn rather than one, since an
+// interactive turn is open, hold, hold, score -- so the property is exercised four times as
+// often and matters four times as much. The audit, field by field, is in the "Ledger state"
+// section below, and src/test/ledger-access.ts re-derives it mechanically from the COMPILED
+// TRANSCRIPT on every test run.
 //
-// 4. THE CONTRACT NEVER ASSERTS ITS OWN TOKEN BALANCE. `unshieldedBalance(nativeToken())`
-//    returns 0 under @midnight-ntwrk/compact-runtime 0.19.0 no matter what
-//    `receiveUnshielded` was called with (docs/bugs-found.md #11), so a ledger-balance guard
-//    of the kind probes/gate0/src/pot.compact carries would make every simulator test fail
-//    while proving nothing offline. Custody is therefore tracked by this contract's own `pot`
-//    field, which is what every assertion reads, and the ledger-vs-bookkeeping cross-check
-//    moves to the E2E devnet run. Named explicitly in docs/table-circuit.md as something the
-//    simulator cannot verify.
+// `stampTime()` IS GONE. It read-modify-wrote `lastActionAt` in seven of the eight old
+// circuits and would have serialised every move on its own. The per-round `roundDeadline`,
+// written once by `closeRound`, replaces it. Only `join` and `closeRound` now declare a `now`
+// at all; every other circuit tests block time against a stored deadline with an exact kernel
+// predicate, which reads nothing and declares nothing.
 //
-// 5. TIME IS DECLARED AND SANDWICHED, because it cannot be read. The kernel exposes block-time
-//    PREDICATES only -- `blockTimeGt/Gte/Lt/Lte(Uint<64>)`, seconds since epoch, strict, no
-//    `blockTime()` accessor exists (probed against compactc 0.34.0). So a circuit that has to
-//    stamp `lastActionAt` must be told the time and pin the claim:
-//
-//        blockTimeGte(now)                  =>  now <= blockTime
-//        blockTimeLt(now + timeSlackSecs()) =>  now >  blockTime - timeSlackSecs()
-//
-//    which traps `now` in `(blockTime - slack, blockTime]`, plus `now >= lastActionAt` for
-//    monotonicity. A caller can only under-declare, and by at most the slack. Deadlines
-//    themselves are exact: `blockTimeGt(lastActionAt + timeout)` is evaluated against real
-//    block time, never against a declared value. Build grace into the timeout parameters, not
-//    into the predicate; there is no tolerance widening anywhere in this file.
-//
-//    THE INCENTIVE DOES NOT POINT THE SAFE WAY, and an earlier version of this comment claimed
-//    it did. "Under-declaring only brings your OWN deadline forward" is true for `join` while a
-//    table is filling and for a `claimTimeout` that hands the turn to nobody in particular. It is
-//    FALSE for every hand-off transition, which is most of them: `takeTurn` stamps the deadline
-//    the OPERATOR is then judged against, `resolveRoll3` stamps the one the NEXT PLAYER is judged
-//    against, and `claimTimeout` stamps the one the next seat is judged against. In each of those
-//    the declarer pays nothing for under-declaring and the victim's window shrinks by up to the
-//    full slack. With `turnTimeoutSecs <= slack` the victim's deadline is already expired when
-//    they receive the turn, and a permissionless `claimTimeout` forfeits them on the spot --
-//    cascading, seat by seat, until the caller is the only one left. That is the Critical finding
-//    C1 of docs/security-review.md, and it is closed by two changes rather than by better
-//    commentary: `timeSlackSecs()` is 120 rather than 600, and the constructor refuses any
-//    timeout that is not strictly greater than `timeSlackSecs() * timeoutSlackFactor()`, so the
-//    most a hostile declarer can take from the next actor is a quarter of their window.
-//
-// 6. THE RAKE IS ALWAYS AT LEAST 1, ENFORCED AT CONSTRUCTION (`tier >= 100`). Language 0.26
-//    has no division, so the 1% rake is the witness-checked Euclidean identity
-//    `q * 100 + r == pot, r < 100` from scoring-core.compact. A pot under 100 would make
-//    `q == 0`, and a zero-value `sendUnshielded` is an unshielded output nobody wants to
-//    reason about, so it is excluded by construction instead of by a conditional send.
-//
-// 7. ALL-FORFEITED SETTLES AS A REFUND, NOT AS A WIN. See `claimTimeout` and `abortTable`.
-//
-// 8. EVERY EXPORTED CIRCUIT CARRIES FALLIBLE-PHASE PADDING, AND IT IS A CONSTANT.
-//    2 KB written to the ledger after `kernel.checkpoint()` -- the one lever that grew a
-//    transaction past the ~8 KB `OutsideTimeToDismiss` floor in Gate 0 without growing its
-//    dismiss cost (docs/gate0-report.md, probes/gate0/src/pot.compact). Applied to all eight
-//    circuits and not only the small ones: Gate 0's padded transactions all landed at 9.0-10.2
-//    KB regardless of circuit size, because a PLONK proof is a constant-size object and the
-//    transcript is not what dominates.
-//
-//    THE PADDING IS A COMPILE-TIME CONSTANT, NOT A CIRCUIT ARGUMENT, and that change is what
-//    makes decision 9's split fit. Gate 0's `pot.compact` took its padding as a
-//    `Vector<64, Bytes<32>>` parameter, and docs/table-circuit.md measured the price of that:
-//    5 instructions and TWO PUBLIC INPUTS per 32-byte word, which was enough to push five of
-//    the six original circuits up one or two PLONK steps on its own. A constant costs neither.
-//    The compiler emits it as a literal `StateValue` push inside the ledger op, so the 2,048
-//    bytes still land in the transcript -- and therefore still earn the dismiss-time allowance
-//    -- while the proving domain barely moves. Measured, same contract, same 2 KB of padding:
-//
-//      circuit         as an argument   as a constant
-//      join                     k=15            k=14
-//      takeTurn                 k=15            k=14
-//      settle                   k=15            k=13
-//      claimTimeout             k=15            k=12
-//      abortTable               k=15            k=12
-//      resolveRoll1/2/3         k=16            k=15   <- the difference between shipping and not
-//
-//    With an argument the split circuits are k=16 and the contract is undeployable; the only
-//    argument-padding size that fits is 16 words (512 bytes), which does not clear the
-//    admission floor. So the constant is not a tidiness preference, it is the thing that makes
-//    both bounds satisfiable at once. The width (2,048) is the single knob and appears in two
-//    places, `padStore`'s type and `paddingConstant()`; final sizing is checked against the
-//    real node in the E2E run.
-//
-// 9. THE OPERATOR'S MOVE IS THREE TRANSACTIONS, ONE PER ROLL, BECAUSE ONE IS UNPROVABLE.
-//    The single `resolveTurn` this file originally carried compiles to a PLONK domain of
-//    **k=17**. The proof server bundles `bls_midnight_2p9` .. `2p15` and has no route to
-//    `srs.midnight.network` (docs/gate0-report.md), so k=16 and k=17 are both unreachable and
-//    the circuit could never produce a transaction. This was settled offline, before any
-//    proving attempt, by reading `k` straight out of the compiled ZKIR with
-//    `@midnight-ntwrk/zkir-v2`'s `Zkir.fromJson(...).getK()` -- see docs/e2e-report.md, which
-//    also records the measured k of every circuit in the project.
-//
-//    The cut is ONE ROLL PER TRANSACTION, and it is forced rather than chosen: the measured
-//    corpus already says one roll is k=15 (`dice/rollDice`) and two rolls is k=16
-//    (`turn/probeTwoRolls`), so a two-way split covering rolls 1+2 would not have fitted
-//    either. `resolveRoll1` latches the mixed entropy and the hold mask, `resolveRoll2`
-//    rerolls once, `resolveRoll3` rerolls again and is the only step that writes seat state,
-//    advances `gameDigest` and hands the turn back.
-//
-//    WHAT DOES NOT CHANGE: the dice. Same three roll hashes over the same `RollContext`s in
-//    the same order under the same latched mask, so a turn's final dice are bit-for-bit what
-//    the one-circuit version produced. `gameDigest` still absorbs exactly one event per turn,
-//    with the same fields. The TypeScript mirrors and the settlement verifier are untouched by
-//    the split and do not know about it.
-//
-//    WHAT DOES CHANGE, and is worth saying plainly: the intermediate hands are now public --
-//    rolls 1 and 2 land on chain as their own transactions instead of staying inside one
-//    proof. Nothing exploitable follows, because the only player choice in a turn (the hold
-//    policy) is made in `takeTurn`, before any roll exists, and the mask is latched from
-//    roll 1; by the time roll 1 is public every remaining die is already determined. It is
-//    strictly more legible -- a UI can animate the three rolls from chain data alone. The real
-//    cost is throughput: a turn is 4 transactions instead of 2, and at the measured ~21 s per
-//    transaction that is what sets the length of a game.
+// ONE SILENT HAZARD the probe exposes: two transactions writing the SAME map key both land,
+// last-write-wins, with no error. That is why a seat's entries are only ever written by a
+// transaction that has proved knowledge of that seat's `sk_s` (`playerMove`, for all three
+// kinds), or of the table seed (`resolveRoll*`), or that is permissionless but
+// idempotent-by-assertion (`eliminate` checks `!eliminated`, `redeem` checks `amount > 0`).
 //
 // -------------------------------------------------------------------------------------------
-// A residual in the randomness design that docs/table-contract.md does not name
+// 2. THE DIGEST IS FROZEN PER ROUND, AND THAT IS A SECURITY REQUIREMENT, NOT A TIDINESS ONE
 // -------------------------------------------------------------------------------------------
 //
-// POLICY GRINDING. The spec's collusion analysis closes ENTROPY grinding: `entropy_s(r)` is
-// forced to `H(sk_s, tableId, r)` and proven against a join-time commitment, so a player has no
-// free choice there. But a player still makes one free choice per turn that changes their dice
-// -- the hold policy -- and they make it after the game digest is public. A player who knows the
-// seed (i.e. one colluding with the operator) can therefore evaluate all ELEVEN legal choices
-// for the coming turn -- Stand, RerollAll, KeepModal, KeepFace x 6, ChaseStraight,
-// KeepPairsPlus -- and take the best.
+// Under the cursor model, resolves happened in fixed seat order, so a running `gameDigest` gave
+// the operator no ordering discretion. Under simultaneous rounds, transactions land in whatever
+// order the chain picks -- and if the digest kept folding results as they landed, the operator
+// would choose that order for its own resolves, and the digest feeds every subsequent roll.
+// That hands it exactly the influence over outcomes the commit-reveal scheme exists to deny it.
 //
-// Worth stating plainly because it is a real edge and because it is bounded:
+// So: every seat in round `r` derives its rolls from `roundDigest` as it stood when round `r`
+// OPENED, and `closeRound` computes
 //
-//   * It is best-of-11 per turn, not the best-of-2^256 that free entropy would give. Free
-//     entropy means arbitrarily good dice; this means the best of eleven ordinary outcomes,
-//     which a skilled honest player partly captures anyway by choosing a policy sensibly.
-//   * It is inherent to the shape, not a bug in this implementation. Any design in which the
-//     player makes a dice-affecting choice at turn time gives a seed-knowing player a preview
-//     of exactly that many outcomes. Removing it means removing the choice -- pre-declaring
-//     every policy at join, which costs the skill expression the pipeline exists to preserve.
-//   * It needs the seed. It is therefore covered by the same assumption the spec already
-//     states and relies on elsewhere: the operator must not seat itself at tables it operates,
-//     and must not leak the seed. Under that assumption the exposure is zero; if it is
-//     violated, this is a smaller lever than the griefing the spec already concedes (an
-//     operator that withholds resolution when the dice displease it).
+//     roundDigest' = H("yahtzee:v1:round", roundDigest, r, seatCount, results in SEAT ORDER)
 //
-// No mitigation is attempted here. It is recorded so the threat model is honest and so nobody
-// later reads "entropy is non-grindable" as "outcomes are unpredictable to a seed holder".
+// once, at the boundary, from data that is complete and ordered by seat index rather than by
+// landing time. No participant's dice depend on who submitted first.
+//
+// EVERY SEAT'S DICE STREAM IS STILL DISTINCT, and it is worth saying where that comes from
+// because `RollContext` has no seat field. The separation is entirely in `playerEntropy`, which
+// is `mixEntropy(H(sk_s, tableId, r), roundDigest)`. Two seats can only collide by sharing a
+// secret, and `join` refuses a second seat for a `C_s` already registered.
+//
+// RESIDUAL, stated rather than hidden: the operator still chooses whether to call
+// `eliminate(s)` on a stalled seat or to keep waiting for it, and the two produce different
+// digests. That is a coarse, public, one-shot fork that costs it a player and requires the
+// seat's deadline to have already passed -- it is not a re-roll. The cursor model had the
+// identical lever in `claimTimeout`, so this is not a regression.
+//
+// -------------------------------------------------------------------------------------------
+// 3. EVERY CIRCUIT HAS A k FLOOR AS WELL AS A CEILING
+// -------------------------------------------------------------------------------------------
+//
+// Found the hard way in live play. `claimTimeout` (k=11) was rejected by the node 1,610 times
+// with `OutsideTimeToDismiss`, measured at 7,455-7,463 bytes against a required 8,269. Nothing
+// else ever failed -- `abortTable` at k=12 and everything above landed every time.
+//
+// RAISING THE LEDGER PADDING DOES NOT FIX IT. It was raised 2 KB -> 4 KB and the transaction
+// grew by a few hundred bytes, not 2,048: `pad(n, "...")` is a short tag followed by zero fill
+// and serialises to almost nothing. The byte that matters is the PROOF, and proof size scales
+// with the circuit's PLONK domain. The admission floor is a proof-size floor and the only
+// reliable lever is k.
+//
+// So every exported circuit here targets **k in [13, 15]**: at or above 13 to clear the floor
+// with margin, at or under 15 because the proof server bundles `bls_midnight_2p9 .. 2p15` and
+// has no route to `srs.midnight.network`. Measured values are in docs/table-circuit.md and are
+// re-checked by `npm run k -w cli`.
+//
+// Two circuits needed deliberate ballast to clear the floor, and both were given work that is
+// worth doing rather than a hash over nothing -- see `eliminate` and `redeem`.
+//
+// -------------------------------------------------------------------------------------------
+// 4. THE OPERATOR'S MOVE IS STILL THREE TRANSACTIONS, AND STILL AT THE CEILING
+// -------------------------------------------------------------------------------------------
+//
+// `resolveRoll1/2/3` sit at k=15 with zero headroom: the domain is set by the roll hash and its
+// rejection ladder, not by the transcript. Measured before this file was rewritten -- the
+// interactive shape is 811 / 870 / 870 instructions and all three are still k=15.
+//
+// The interactive redesign paid for itself here twice over. `resolveRoll1` lost the modal-face
+// check and the mask computation, which is where its 1,173 instructions went; rolls 2 and 3
+// gained the ten conditional selects of the left-to-right stream merge and still came out
+// under the old figures. Anything that grows this path from here makes the contract
+// UNPROVABLE rather than slow, which is why `closeRound` is a separate circuit and why the
+// resolve steps touch exactly one map.
+//
+// -------------------------------------------------------------------------------------------
+// 5. TIME IS DECLARED AND SANDWICHED, IN THE TWO CIRCUITS THAT STILL NEED IT
+// -------------------------------------------------------------------------------------------
+//
+// The kernel exposes block-time PREDICATES only -- `blockTimeGt/Gte/Lt/Lte(Uint<64>)`, seconds
+// since epoch, strict. There is no `blockTime()` accessor (probed against compactc 0.34.0). So
+// a circuit that has to STAMP a deadline must be told the time and pin the claim:
+//
+//     blockTimeGte(now)                  =>  now <= blockTime
+//     blockTimeLt(now + timeSlackSecs()) =>  now >  blockTime - timeSlackSecs()
+//
+// which traps `now` in `(blockTime - slack, blockTime]`. A caller can only under-declare, and
+// by at most the slack.
+//
+// THE INCENTIVE DOES NOT POINT THE SAFE WAY. `closeRound` stamps the deadline that the NEXT
+// round's players are judged against, and it is permissionless, so a hostile caller can shave
+// up to `timeSlackSecs()` off everyone's window for free. That is docs/security-review.md's
+// Critical C1 and it is closed the same way it was before: `timeSlackSecs()` is 120 rather than
+// 600, and the constructor refuses any timeout that is not strictly greater than
+// `timeSlackSecs() * timeoutSlackFactor()`, so the most a hostile declarer can take is a
+// quarter of the window.
+//
+// ONLY TWO CIRCUITS TAKE A `now`, and that is a deliberate reduction from seven. Nothing else
+// has a deadline to stamp: `playerMove`, the three resolves, `eliminate`, `settle`, `redeem`
+// and `abortTable` all compare real block time against a STORED deadline with a kernel
+// predicate, so there is nothing to declare and nothing to under-declare. Giving them a `now`
+// argument would cost public inputs and re-open C1's surface to buy nothing.
+//
+// -------------------------------------------------------------------------------------------
+// 6. CUSTODY: balance == pot + SUM(redeemable), AND THE TWO NEVER MIX
+// -------------------------------------------------------------------------------------------
+//
+//   * `pot` is money that goes to the winner (and the rake). `join` puts a stake in it.
+//   * `seatRedeemable[s]` is money owed to seat `s` personally. Only `redeem` pays it out, and
+//     only to the address seat `s` recorded at `join`.
+//   * `eliminate` moves `tier - penalty` from `pot` to `seatRedeemable[s]`. The penalty stays
+//     in the pot and goes to the winner.
+//   * `settle` pays out exactly `pot` and touches no `redeemable`.
+//   * `abortTable` moves the whole `pot` into `redeemable`, so nothing is left stranded.
+//
+// The invariant `pot + SUM(redeemable) == tier * seatCount` is asserted in-circuit by `settle`
+// and by `abortTable`, which are the two circuits that zero the pot. It CANNOT be checked
+// against the contract's real balance offline: `unshieldedBalance(nativeToken())` returns 0
+// under @midnight-ntwrk/compact-runtime 0.19.0 no matter what `receiveUnshielded` was called
+// with (docs/bugs-found.md #11), so the ledger-vs-bookkeeping cross-check lives in the E2E
+// devnet run and nowhere else.
+//
+// -------------------------------------------------------------------------------------------
+// 7. SEAT STORAGE IS FIVE LEDGER `Map`s KEYED BY SEAT INDEX, SPLIT BY WHO READS THEM
+// -------------------------------------------------------------------------------------------
+//
+// A `Vector` index must be a compile-time constant, so every runtime seat access would be a
+// 6-way disjunction to read and a 6-way rebuild to write. A ledger `Map` takes a runtime key.
+// The split across five maps is chosen so that the three circuits with NO headroom
+// (`resolveRoll1/2/3`) touch exactly one map, and so that `closeRound` -- which must read all
+// six seats -- reads only one of the others:
+//
+//   seatIdentity    written once, at join           read by playerMove, settle, redeem
+//   seatCard        written by playerMove(score)    read by playerMove, redeem
+//   seatProgress    round cursor + score + dice     read by all six seats at closeRound/settle
+//   seatTurn        the interactive turn state      read/written by playerMove and all resolves
+//   seatRedeemable  money owed to a seat            eliminate, abortTable, redeem
+//
+// ALL SIX SLOTS ARE PRE-INSERTED BY THE CONSTRUCTOR, including slots no player will take. A
+// ledger `Map.lookup` of an absent key aborts, so pre-inserting makes every lookup total.
+// Whether a slot is real is `seat < seatCount`, never map membership.
+//
+// WHY `playerMove(score)` AND NOT `resolveRoll3` ADVANCES `seatProgress.round`: because a turn
+// can now end after ANY roll, there is no single resolve step that means "this seat is done".
+// Scoring is the only move that ends a turn, so scoring is what advances the cursor -- and it
+// also sets `seatTurn.stage` back to idle, which is what lets `closeRound` decide "every seat
+// has finished round r" from `seatProgress` alone without also reading six `seatTurn` entries.
+//
+// -------------------------------------------------------------------------------------------
+// The randomness residual GREW with interactive holds, and the old wording no longer applies
+// -------------------------------------------------------------------------------------------
+//
+// `entropy_s(r)` is forced to `H(sk_s, tableId, r)` and proven against a join-time commitment,
+// so a player has no free choice there, and that part is unchanged.
+//
+// WHAT CHANGED. Under pre-declared policies, a player who knew the seed could preview the
+// eleven legal policy choices for the coming turn and take the best -- bounded, and partly
+// captured by any skilled honest player anyway. With interactive holds the same player can do
+// strictly better: they see roll 1, they can compute roll 2 and roll 3 for EVERY one of the 32
+// possible hold masks, and they can then choose the mask that maximises their final hand. They
+// can do it again after roll 2. That is not best-of-11, it is an optimal decision under perfect
+// information about the future, taken twice per turn, for thirteen turns.
+//
+// It is stated plainly here because the old "bounded, best-of-11" note would now be false. What
+// has NOT changed is the precondition: it requires the seed, so it falls under the assumption
+// the design already states and relies on elsewhere -- the operator must not seat itself at
+// tables it operates, and must not leak the seed. Under that assumption the exposure is zero.
+// If it is violated, interactive holds make the violation worth substantially more than
+// pre-declared policies did, and the site's threat model should say so.
+//
+// No mitigation is attempted. Removing it means removing the choice, which is the whole
+// feature.
+//
+// SIMULTANEITY ADDS ONE SMALLER THING, unchanged from the previous revision: within a round,
+// seats submit in an order the chain picks, and each seat's rolls become public as they are
+// resolved. A seat that has not yet chosen its hold can therefore see other seats' dice for the
+// same round. That is NOT a randomness leak -- a seat's own dice depend only on the frozen round
+// digest, its own forced entropy and the seed, so nothing another seat does can move them -- but
+// it is an information asymmetry in the ordinary game-theory sense, like acting last at a poker
+// table.
 
 pragma language_version >= 0.26;
 
@@ -210,41 +258,132 @@ include "policy-core";
 // ===========================================================================================
 
 /**
- * Rounds per seat, 0..13 inclusive.
+ * Rounds per seat: 0..12 inclusive, thirteen in total, one category each.
  *
- * Fourteen `takeTurn`s and thirteen `resolveTurn`s per seat, per the pipeline in
- * docs/table-contract.md: `takeTurn` at round r carries the CATEGORY for round r-1 (so there
- * is none at r=0) and the ENTROPY + POLICY for round r (so there is none at r=13, the
- * score-only round). Thirteen categories get filled, at rounds 1..13.
+ * THIRTEEN AND NOT FOURTEEN, and the change is a direct consequence of interactive holds. The
+ * cursor model PIPELINED the category: `takeTurn` at round r scored the dice resolved at round
+ * r-1, because a circuit that both derived dice and scored them could not be compiled
+ * (docs/bugs-found.md #1, fan-in x re-reads). That bought a fourteenth, score-only round and two
+ * awkward sentinel cases at the ends.
+ *
+ * The interactive turn already splits derivation from scoring across transactions -- the dice
+ * are written to the ledger by a resolve and read back as a leaf by `playerMove(score)` -- so
+ * the pipeline is unnecessary. A seat scores the dice it just rolled, in the round it rolled
+ * them, and there is no round without a category.
+ *
+ * `openRound == roundCount()` means the game is over and `settle` opens.
  */
 pure circuit roundCount(): Uint<8> {
-  return 14;
-}
-
-/** The score-only round: a category, no roll. */
-pure circuit lastRound(): Uint<8> {
   return 13;
 }
 
-/**
- * The policy code meaning "no roll this round". One past the last real policy, so it can never
- * collide with one; `isValidPolicy` rejects it, which is why round 13 is checked separately.
- */
-pure circuit policyNone(): Uint<8> {
-  return holdPolicyCount();
+/** The last round a seat plays. Completing it completes the scorecard. */
+pure circuit finalRound(): Uint<8> {
+  return 12;
 }
 
 /**
- * Slack allowed on a declared `now`, in seconds. See decision 5 in the header.
+ * The denominator of the elimination penalty: `stake * (r + 1) / penaltyDenom()`.
  *
- * 120 s, and it is deliberately small. The slack is a WEAPON in the hands of whoever declares it
- * (see decision 5), so it is sized to the thing it actually has to absorb -- proving plus
- * submission, measured at ~21 s in the E2E run -- plus generous room for clock skew between a
- * client and the chain. It was 600 s, which was picked for comfort rather than from any
- * measurement, and 600 s of free deadline movement against the NEXT actor is not comfort.
+ * Thirteen, because there are thirteen scoring rounds. Rounds are numbered 0..12 here and
+ * 1..13 in docs/simultaneous-rounds.md, which is why the numerator is `r + 1`: a seat that quits
+ * before playing anything forfeits a thirteenth, and one that quits in the final round forfeits
+ * the lot. Nobody forfeits zero, which is the point -- never showing up must not be free.
+ */
+pure circuit penaltyDenom(): Uint<64> {
+  return 13;
+}
+
+// -------------------------------------------------------------------------------------------
+// The interactive turn, as a state machine
+// -------------------------------------------------------------------------------------------
+//
+// `seatTurn.stage` for one seat within one round:
+//
+//     0  idle          the seat has not opened its turn, or has finished it
+//     1  awaiting r1   playerMove(open) ran; the operator owes resolveRoll1
+//     2  rolled once   the player may hold, or score and stop
+//     3  awaiting r2   playerMove(hold) ran; the operator owes resolveRoll2
+//     4  rolled twice  the player may hold again, or score and stop
+//     5  awaiting r3   playerMove(hold) ran; the operator owes resolveRoll3
+//     6  rolled thrice the player must score; there are no rolls left
+//
+// EVEN STAGES ARE OWED BY THE PLAYER AND ODD STAGES BY THE OPERATOR. That split is what
+// `eliminate` and `abortTable` divide on, and it is the whole of the "whose fault is the stall"
+// question: a player who never sends a hold is eliminable at 2 or 4 exactly as one who never
+// opened a turn is eliminable at 0, and an operator that never resolves leaves the seat at 1, 3
+// or 5 where `eliminate` refuses and `abortTable` is the remedy.
+
+pure circuit stageIdle(): Uint<8> {
+  return 0;
+}
+
+pure circuit stageAwaitRoll1(): Uint<8> {
+  return 1;
+}
+
+pure circuit stageRolled1(): Uint<8> {
+  return 2;
+}
+
+pure circuit stageAwaitRoll2(): Uint<8> {
+  return 3;
+}
+
+pure circuit stageRolled2(): Uint<8> {
+  return 4;
+}
+
+pure circuit stageAwaitRoll3(): Uint<8> {
+  return 5;
+}
+
+pure circuit stageRolled3(): Uint<8> {
+  return 6;
+}
+
+/** Is the PLAYER the one who owes the next move? See the state machine above. */
+pure circuit playerOwes(stage: Uint<8>): Boolean {
+  return stage == stageIdle() ||
+         stage == stageRolled1() ||
+         stage == stageRolled2() ||
+         stage == stageRolled3();
+}
+
+// -------------------------------------------------------------------------------------------
+// `playerMove` kinds
+// -------------------------------------------------------------------------------------------
+//
+// A `Uint<8>` and not a Compact `enum`, matching the category and (former) policy encodings:
+// the value is compared arithmetically and it appears in the client's argument encoding, where
+// a plain number is what the daemon and the website actually send.
+
+/** Open this round's turn: prove the secret, declare the forced entropy, await roll 1. */
+pure circuit moveOpen(): Uint<8> {
+  return 0;
+}
+
+/** Keep these five dice and roll again. */
+pure circuit moveHold(): Uint<8> {
+  return 1;
+}
+
+/** Score the dice as they stand and end the turn. Legal after any resolved roll. */
+pure circuit moveScore(): Uint<8> {
+  return 2;
+}
+
+/** One past the last valid kind. */
+pure circuit moveKindCount(): Uint<8> {
+  return 3;
+}
+
+/**
+ * Slack allowed on a declared `now`, in seconds. See section 5 of the header.
  *
- * The constructor's `timeout > slack * 4` floor is the other half of the same fix: the slack
- * cannot be a large fraction of a timeout, whatever the operator configures.
+ * 120 s, and deliberately small: the slack is a weapon in the hands of whoever declares it, so
+ * it is sized to what it actually has to absorb -- proving plus submission, measured at ~21 s --
+ * plus room for clock skew. Only `join` and `closeRound` declare a time at all.
  */
 pure circuit timeSlackSecs(): Uint<64> {
   return 120;
@@ -254,7 +393,7 @@ pure circuit timeSlackSecs(): Uint<64> {
  * The multiple of `timeSlackSecs()` that every timeout parameter must strictly exceed.
  *
  * Four, so a caller who under-declares by the full slack can consume at most a quarter of the
- * victim's window and the victim still gets three quarters of the deadline they were promised.
+ * next round's window and the players still get three quarters of the deadline promised.
  */
 pure circuit timeoutSlackFactor(): Uint<64> {
   return 4;
@@ -268,12 +407,11 @@ pure circuit minTier(): Uint<64> {
 /**
  * Largest stake a table may be opened with, in the smallest NIGHT unit: 10^15.
  *
- * The binding constraint is `abortTable`'s `tier * seatCount`, a CHECKED narrowing cast to
- * `Uint<64>`: an overflow there aborts the circuit, which would deny the refund path while
- * leaving `settle` working -- i.e. the pot could only ever leave through the winner. At the
- * bound, `maxTier() * maxSeats()` is 6 x 10^15, comfortably under `Uint<64>`'s 1.8 x 10^19, and
- * `settle`'s `q * 100 + r` (Field arithmetic, no narrowing) has room to spare. 10^15 atomic units
- * is far above any stake this game will ever see, so the bound costs nothing real.
+ * Two products have to stay inside `Uint<64>`: `tier * seatCount` (the custody invariant, and
+ * `abortTable`'s refund total) and `tier * penaltyDenom()` (the elimination penalty identity).
+ * At the bound those are 6e15 and 1.3e16, both far under `Uint<64>`'s 1.8e19. An overflow in
+ * either would abort a REFUND path while leaving `settle` working -- i.e. the pot could only
+ * ever leave through the winner -- so the bound is a safety property, not tuning.
  */
 pure circuit maxTier(): Uint<64> {
   return 1000000000000000;
@@ -284,39 +422,57 @@ export enum Phase {
   filling,
   /** Full table, game running. */
   playing,
-  /** `settle` paid the winner and the rake. Terminal. */
+  /** `settle` paid the winner and the rake. Terminal; `redeem` opens. */
   settled,
-  /** `abortTable` refunded every seat. Terminal. */
+  /** `abortTable` converted the pot into per-seat refunds. Terminal; `redeem` opens. */
   aborted,
   /**
-   * Every seat forfeited on a turn timeout, so there is no one left to play and no one who
-   * earned the pot. Reachable only from `claimTimeout`. `abortTable` converts it to a refund
-   * with no further waiting -- the timeout that produced it has already elapsed.
+   * Every seat was eliminated, so there is no one left to play and no one who earned the pot.
+   * Reachable only from `eliminate`.
+   *
+   * NOT yet redeemable. It is a PENDING terminal state: the all-eliminated waiver (penalties
+   * refunded, rake still paid) is applied by a single permissionless `abortTable` call, which
+   * moves the table to `aborted`. See `abortTable` for why the waiver lives there and not in
+   * `eliminate`.
    */
   abandoned,
-}
-
-/** Whose move it is. `currentSeat` names the player in both states. */
-export enum TurnState {
-  /** Waiting for `currentSeat` to call `takeTurn`. `claimTimeout` lives here. */
-  waitPlayer,
-  /** Waiting for the operator to call `resolveTurn`. `abortTable` lives here. */
-  waitResolve,
 }
 
 // ===========================================================================================
 // Ledger state
 // ===========================================================================================
+//
+// CONCURRENCY AUDIT OF THE PLAYER PATH. `playerMove` reads, and therefore binds to:
+//
+//   phase           frozen for the whole game once `playing`
+//   openRound       written ONLY by closeRound, which cannot run while a seat may still move
+//   seatCount       written only by join, and join only runs while `filling`
+//   tableId         sealed
+//   seatIdentity[s] written once, at join
+//   seatCard[s]     this seat's own
+//   seatProgress[s] this seat's own
+//   seatTurn[s]     this seat's own
+//
+// and writes seatCard[s], seatProgress[s], seatTurn[s] -- all blind `insert`s on its own key.
+// No shared scalar is read-modify-written anywhere on that path. `pot`, `activeSeats`,
+// `roundDigest` and `roundDeadline` are not touched by `playerMove` at all.
+//
+// `eliminate` DOES read-modify-write `pot` and `activeSeats`, and two concurrent eliminations
+// therefore conflict and one is rejected. That is correct and deliberate: they are the only
+// two shared accumulators in the contract and both are off the player's path. The loser
+// retries. It also binds to the victim's own `seatProgress` and `seatTurn`, which is what
+// makes `eliminate(s)` racing seat `s`'s own `playerMove` resolve to exactly one winner
+// instead of silently applying both.
 
 /**
  * `tableId` is a constructor argument and NOT `kernel.self()`: `kernel.self()` returns zeros
- * in a constructor (inherited defect #13, docs/bugs-found.md §0), so a contract cannot derive
- * its own identity at deploy time. It must be fresh random per table -- it is a domain
- * separator on every roll hash, so a reused id replays another table's dice.
+ * in a constructor (inherited defect #13, docs/bugs-found.md §0). It must be fresh random per
+ * table -- it is a domain separator on every roll hash, so a reused id replays another table's
+ * dice.
  */
 export sealed ledger tableId: Bytes<32>;
 
-/** Stake per seat, in the smallest NIGHT unit. The pot is exactly `tier * seatCount`. */
+/** Stake per seat, in the smallest NIGHT unit. The pot starts at exactly `tier * seatCount`. */
 export sealed ledger tier: Uint<64>;
 
 /** Seats this table opens with. 2..6. `join` flips to `playing` when the last one is taken. */
@@ -329,111 +485,100 @@ export sealed ledger rakeAddress: UserAddress;
  * `H(tableId, seed)`, committed before any player existed.
  *
  * Checked by all three `resolveRoll` steps and -- before the table deadline -- by `settle`.
- * `tableId` is inside the hash so that a seed accidentally reused at two tables does not produce
- * one commitment for both; see `seedCommitmentOf` in policy-core.compact.
  */
 export sealed ledger seedCommitment: Bytes<32>;
 
-/** Deadline for one player move, in seconds. `claimTimeout` forfeits past it. */
+/**
+ * How long a whole round gets, in seconds. Past it, seats that owe a move can be eliminated.
+ *
+ * A ROUND, not a move. An interactive turn is up to four player transactions and three operator
+ * ones, and they all share this one deadline -- so it has to be sized for the whole turn plus
+ * the operator's round trips, not for one click. The operator SLA has to be written against
+ * that, and a client should show the player the round deadline rather than a per-move one.
+ */
 export sealed ledger turnTimeoutSecs: Uint<64>;
 
-/** Deadline for the operator, and for a table that never filled. `abortTable` refunds past it. */
+/**
+ * The operator's grace, and the fill deadline, in seconds.
+ *
+ * Used in three places: the time a filling table has to fill after each join; the extra grace
+ * past `roundDeadline` before a table with a roll stuck mid-pipeline may be aborted; and the
+ * grace past `roundDeadline` after which `settle` no longer requires the seed.
+ */
 export sealed ledger tableTimeoutSecs: Uint<64>;
 
 export ledger phase: Phase;
 
-export ledger turnState: TurnState;
-
 /** Seats taken so far. Also the next seat index while `filling`. */
 export ledger seatCount: Uint<8>;
 
-/** Seats that have not forfeited. At 0 the table is `abandoned`. */
+/** Seats not yet eliminated. At 0 the table is `abandoned`. */
 export ledger activeSeats: Uint<8>;
 
-/** Whose turn it is. Always an active seat while `playing` and `round < roundCount()`. */
-export ledger currentSeat: Uint<8>;
-
-/** 0..13 while playing; `roundCount()` means every active seat is finished. */
-export ledger round: Uint<8>;
-
-/** Global move counter. `finishedAtTurn` is a snapshot of it, so it is the tie-break clock. */
-export ledger turnIndex: Uint<16>;
-
-/** Native NIGHT the contract believes it holds. See decision 4 in the header. */
-export ledger pot: Uint<64>;
+/**
+ * The round every seat is currently playing. 0..12 while playing; `roundCount()` means the game
+ * is finished and `settle` is open.
+ *
+ * WRITTEN ONLY BY `closeRound`. That is the whole of the concurrency design: it is a shared
+ * scalar that six simultaneous turns all read, and reading it is free precisely because it
+ * cannot move while any of them is in flight.
+ */
+export ledger openRound: Uint<8>;
 
 /**
- * `H(gameDigest, <event>)` over every `join` and every `resolveTurn`.
+ * The entropy every seat in the OPEN round derives its rolls from. Frozen at round open.
  *
- * This is the anti-grinding term. Because seat order is join order and the digest absorbs
- * joins and resolutions in chain order, a player choosing `sk_s` at join time cannot know the
- * digest their later rolls will hash against -- so even a seed-knowing player cannot simulate
- * their own future dice unless they control every seat.
+ * `genesisDigest(tableId)` at construction, folded by each `join`, and then advanced exactly
+ * once per round by `closeRound`. See section 2 of the header for why it must not advance
+ * per-resolve.
  */
-export ledger gameDigest: Bytes<32>;
+export ledger roundDigest: Bytes<32>;
 
-/** Block-time seconds of the last state-advancing move. Every deadline is relative to it. */
-export ledger lastActionAt: Uint<64>;
+/**
+ * Block-time seconds by which the open round must be finished.
+ *
+ * Written by `closeRound` (round open + `turnTimeoutSecs`) and, while `filling`, by `join`
+ * (join time + `tableTimeoutSecs`), which is what gives a table that never fills a deadline
+ * without a second field. Every other deadline in the contract is derived from it:
+ *
+ *   eliminate       blockTimeGt(roundDeadline)
+ *   abortTable      blockTimeGt(roundDeadline + tableTimeoutSecs)   [operator stalled]
+ *   abortTable      blockTimeGt(roundDeadline)                      [never filled]
+ *   settle waiver   blockTimeGt(roundDeadline + tableTimeoutSecs)
+ *
+ * It is a blind write in both writers -- neither reads the previous value -- which is what lets
+ * it replace `lastActionAt` without reintroducing a binding read. The monotonicity check that
+ * `stampTime` used to carry is gone with it, and does not need replacing: the sandwich already
+ * traps a declared `now` within `timeSlackSecs()` of real block time.
+ */
+export ledger roundDeadline: Uint<64>;
+
+/** Native NIGHT owed to the eventual winner. See section 6 of the header. */
+export ledger pot: Uint<64>;
 
 /**
  * The seed, once `settle` has revealed it. Zeros before -- and zeros forever on a force-settle.
  *
- * A non-zero value here is the game's certificate of verifiability: it opens `seedCommitment`, so
- * anyone can replay every roll of the whole game from the public log. It stays zero when `settle`
- * ran on the post-deadline path with no valid seed (see `settle`), which marks the game as paid
- * but unverifiable. Consumers must test it rather than assume it: `revealedSeed == 0` is a
- * meaningful state, not a "not settled yet" state.
+ * A non-zero value is the game's certificate of verifiability: it opens `seedCommitment`, so
+ * anyone can replay every roll from the public log. `revealedSeed == 0` on a settled table is a
+ * meaningful state ("paid but unverifiable"), not a "not settled yet" state.
  */
 export ledger revealedSeed: Bytes<32>;
 
 /** Winning seat, once settled. Meaningless before. */
 export ledger winnerSeatIndex: Uint<8>;
 
-/** The current turn's declared entropy, awaiting `resolveTurn`. */
-export ledger pendingEntropy: Bytes<32>;
-
-/** The current turn's declared hold policy and its parameter, awaiting `resolveTurn`. */
-export ledger pendingPolicy: Uint<8>;
-
-export ledger pendingParam: Uint<8>;
-
 /**
- * Which of the turn's three rolls comes next: 0, 1 or 2. See decision 9.
+ * How this table ended, as one hash. Zeros until `settle` or `abortTable` runs.
  *
- * Only meaningful while `turnState == waitResolve`. `takeTurn` leaves it at 0 (nothing resets
- * it, because `resolveRoll3` returns it to 0 as it hands the turn back), and each of the three
- * resolve circuits asserts the exact value it is the successor of, so the operator cannot skip,
- * repeat or reorder a roll.
+ * A closing certificate: it binds the final round digest, the phase the table ended in, the
+ * winner, the amounts paid and whether the seed was actually revealed, in one value a client can
+ * check without replaying the whole log or trusting the indexer's event ordering. It is also
+ * `abortTable`'s k ballast -- see section 3 of the header and the doc comment on `abortTable`.
  */
-export ledger rollStep: Uint<8>;
+export ledger finalDigest: Bytes<32>;
 
-/**
- * `mixEntropy(pendingEntropy, gameDigest)`, latched by `resolveRoll1`.
- *
- * Carried in the ledger rather than recomputed by steps 2 and 3 because recomputing it is a
- * `persistentHash` per step and the whole point of the split is to fit under k=15. It is not a
- * new disclosure: both its inputs were already public, so anyone could compute it.
- */
-export ledger pendingMixed: Bytes<32>;
-
-/** The mask latched from roll 1 by `resolveRoll1`, applied by steps 2 and 3. */
-export ledger pendingHold: HoldMask;
-
-/**
- * The turn's dice as of the most recent resolved roll.
- *
- * Public, and deliberately so: with the split, rolls 1 and 2 land on chain as their own
- * transactions, so the intermediate hands are visible where previously only the final hand was.
- * That reveals nothing exploitable -- the policy is declared in `takeTurn`, BEFORE any roll, and
- * the mask is latched from roll 1, so no player choice remains once `resolveRoll1` has run --
- * and it is what lets a UI animate the three rolls from chain data alone.
- *
- * Defaults to all-zero and is never read before `resolveRoll1` writes it: `mergeHeld` only
- * selects between dice, so unlike `SeatProgress.dice` there is no `face - 1` to underflow.
- */
-export ledger pendingRoll: Dice;
-
-/** The five latched hold bits. A struct because a ledger cell holds one named type. */
+/** The five hold bits. A struct because a ledger cell holds one named type. */
 export struct HoldMask {
   bits: Vector<5, Boolean>,
 }
@@ -442,29 +587,103 @@ export struct HoldMask {
 export struct SeatIdentity {
   /** Where this seat is paid. Recorded at join, so no circuit ever learns its caller. */
   addr: UserAddress,
-  /** `C_s = H(sk_s)`. `takeTurn` proves knowledge of `sk_s` against it. */
+  /** `C_s = H(tableId, sk_s)`. Every `playerMove` proves knowledge of `sk_s` against it. */
   keyCommit: Bytes<32>,
 }
 
-/** Everything about a seat that changes during play. */
+/**
+ * A seat's position in the game: which round it owes, what it has scored, its last dice.
+ *
+ * This is the map `closeRound` reads all six of, so it is kept as small as the job allows --
+ * the turn state lives in `seatTurn` and the money in `seatRedeemable`.
+ */
 export struct SeatProgress {
+  /**
+   * The next round this seat owes. `roundCount()` means finished (or eliminated).
+   *
+   * Advanced by `playerMove(score)`, which is the only move that ends a turn. Because a turn
+   * can now stop after any roll, no single resolve step means "this seat is done" -- so
+   * `round > openRound` is by itself proof that the seat's whole move for the open round is
+   * complete, and `closeRound` needs to read nothing else.
+   */
+  round: Uint<8>,
   /** Grand total including the upper bonus and Yahtzee bonuses, maintained incrementally. */
   total: Uint<16>,
-  /** Turn index at which the 13th category was taken; `noFinish()` if never. */
-  finishedAtTurn: Uint<16>,
-  /** Timed out. Keeps whatever it scored, is skipped by the turn cursor, stake stays in pot. */
-  forfeited: Boolean,
-  /** Are `dice` real, resolved dice awaiting a category? */
-  hasDice: Boolean,
   /**
-   * The dice `resolveTurn` produced, awaiting the next `takeTurn`'s category.
+   * The round at which the 13th category was taken; `noFinish()` if never.
+   *
+   * Under simultaneous rounds every surviving seat completes at `finalRound()`, so this
+   * degenerates as a tie-break clock: what it actually distinguishes is "completed the card"
+   * from "eliminated". Kept in the `Uint<16>` shape `winnerOfSeats` expects rather than
+   * replaced, because the tie-break order it feeds is still exactly the reference's -- highest
+   * total, then a completer over a non-completer, then the lowest seat index.
+   */
+  finishedAtRound: Uint<16>,
+  /** Out of the game. Keeps its card for the record; cannot win; has a `seatRedeemable`. */
+  eliminated: Boolean,
+  /**
+   * The dice this seat scored in its most recent completed turn. What the round digest folds.
    *
    * Initialised to all-ones, NOT all-zeros. `applyScore` reads `d[0]` as the Yahtzee face and
-   * computes `face - 1`, which underflows and aborts the circuit on a zero die. The value is
-   * never scored while `hasDice` is false, but the expression is still evaluated -- a circuit
-   * has no branches -- so the placeholder has to be in range.
+   * computes `face - 1`, which underflows and aborts the circuit on a zero die. A circuit has
+   * no branches, so the expression is evaluated even on a move that is not scoring -- the
+   * placeholder has to be in range.
    */
   dice: Dice,
+}
+
+/**
+ * One seat's interactive turn. The ONLY map the three resolve circuits touch.
+ *
+ * Under the cursor model these were seven shared singletons (`pendingEntropy`, `pendingPolicy`,
+ * `pendingParam`, `rollStep`, `pendingMixed`, `pendingHold`, `pendingRoll`) and every resolve
+ * read all of them. Keyed by seat, they are six independent pipelines that never intersect --
+ * and `pendingPolicy` / `pendingParam` are gone entirely, because a hold is no longer a rule to
+ * be evaluated later but five bits the player already chose.
+ */
+export struct SeatTurn {
+  /** 0..6. See the state-machine comment above `stageIdle`. */
+  stage: Uint<8>,
+  /** The round this turn belongs to. Asserted equal to `openRound` by `resolveRoll1`. */
+  round: Uint<8>,
+  /** `H(sk_s, tableId, round)`, proven against the seat's join-time commitment when opened. */
+  entropy: Bytes<32>,
+  /**
+   * `mixEntropy(entropy, roundDigest)`, latched by `resolveRoll1`.
+   *
+   * Carried in the ledger rather than recomputed by steps 2 and 3 because recomputing it is a
+   * `persistentHash` per step and the whole point of the split is to fit under k=15. Not a new
+   * disclosure: both its inputs were already public.
+   */
+  mixed: Bytes<32>,
+  /**
+   * The dice the player asked to keep before roll 2. Read by `resolveRoll2`, and by nothing
+   * else.
+   *
+   * The PLAYER's choice, so the operator has no say in it whatever.
+   */
+  hold1: HoldMask,
+  /**
+   * The dice the player asked to keep before roll 3. Read by `resolveRoll3`, and by nothing
+   * else.
+   *
+   * TWO CELLS AND NOT ONE OVERWRITTEN CELL, deliberately, and the reason is a planned future
+   * version rather than anything this one needs. A shape under consideration moves the
+   * interactive phase OFF chain and collapses the player's four transactions into two: an open,
+   * and a single `finishTurn(mask1, mask2, category)` submitted after the player has explored
+   * the rolls locally. That version needs both masks present before either reroll runs. Keeping
+   * them in separate cells means it replaces exactly one circuit -- the player's -- and touches
+   * neither resolve, neither deadline, nor any of the custody logic. One extra five-bit field
+   * is a cheap price for a seam that narrow.
+   */
+  hold2: HoldMask,
+  /**
+   * The dice as of the most recent resolved roll.
+   *
+   * Public, and deliberately so: every roll lands on chain as its own transaction, which is
+   * what makes an interactive hold possible at all -- the player has to see the dice to choose.
+   */
+  roll: Dice,
 }
 
 export ledger seatIdentity: Map<Uint<8>, SeatIdentity>;
@@ -473,51 +692,59 @@ export ledger seatCard: Map<Uint<8>, Scorecard>;
 
 export ledger seatProgress: Map<Uint<8>, SeatProgress>;
 
+export ledger seatTurn: Map<Uint<8>, SeatTurn>;
+
+/**
+ * Native NIGHT owed to a seat personally, and payable only to that seat's join-time address.
+ *
+ * Written by `eliminate` (the un-forfeited part of a stake) and by `abortTable` (the whole
+ * refund); drained one seat at a time by `redeem`. Kept strictly separate from `pot` so that an
+ * eliminated player's money can never be awarded to the winner by accident -- that separation
+ * is the whole of the custody design.
+ */
+export ledger seatRedeemable: Map<Uint<8>, Uint<64>>;
+
+/**
+ * A per-seat hash chain of the two things that can happen to a seat's money.
+ *
+ * `eliminate` folds in the penalty arithmetic it performed; `redeem` folds in the payout and
+ * the final scorecard it was paid against. Because `redeem` chains the previous value, a seat's
+ * final receipt attests to its elimination too, so one 32-byte cell per seat carries the whole
+ * custody story for that seat.
+ *
+ * Also the k ballast for both of those circuits: see section 3 of the header. Real work that
+ * happens to be the right size, rather than a hash over nothing.
+ */
+export ledger seatReceipt: Map<Uint<8>, Bytes<32>>;
+
 /**
  * Every `C_s` registered so far, so one secret cannot take two seats.
  *
- * This is NOT Sybil resistance and must not be read as it: a player can generate a second
- * `sk` and take a second seat, and no circuit can tell. It rules out the accidental
- * double-join (a retried transaction, a double-clicked button) and makes the seat-to-secret
- * map injective, which the entropy scheme relies on.
+ * NOT Sybil resistance: a player can generate a second `sk` and take a second seat, and no
+ * circuit can tell. It rules out the accidental double-join, and it makes the seat-to-secret map
+ * injective -- which the entropy scheme relies on, because a seat's dice stream is separated
+ * from every other seat's ONLY by its secret.
  */
 export ledger joinedKeys: Set<Bytes<32>>;
 
-/** Sink for the transaction padding, so the compiler cannot drop it. See decision 8. */
+/** Sink for the transaction padding, so the compiler cannot drop it. See section 3. */
 export ledger padStore: Bytes<4096>;
 
 /**
- * The 4 KB of transaction padding, as a COMPILE-TIME CONSTANT. See decision 8.
+ * The 4 KB of transaction padding, as a COMPILE-TIME CONSTANT.
  *
  * The width appears twice -- here and in `padStore`'s type -- and language 0.26 has no way to
- * write it once, because `pad`'s length argument must be a literal. Keep the two in step by
- * hand; a mismatch is a compile error, not a silent shrink.
+ * write it once, because `pad`'s length argument must be a literal. A mismatch is a compile
+ * error, not a silent shrink.
  *
- * CORRECTION, from live play: THIS LEVER DOES NOT WORK. Raising it 2 KB -> 4 KB grew the
- * transaction by a few hundred bytes, not 2,048, and `claimTimeout` still fails admission at
- * 7,455-7,463 bytes against a required 8,269. `pad(n, "...")` is a short tag followed by zero
- * fill, which costs almost nothing once serialised. What actually sizes these transactions is
- * the PROOF, and proof size scales with the circuit's PLONK domain: `claimTimeout` (k=11) is
- * the only circuit that has ever hit the floor, while `abortTable` (k=12) and everything above
- * never do. The floor is a proof-size floor. The fix is to give an under-sized circuit real
- * work until it clears k=12 with margin -- see docs/simultaneous-rounds.md. The padding below
- * is retained because it is harmless, not because it is doing the job it was added for.
+ * A CONSTANT AND NOT AN ARGUMENT, and that is load-bearing: an exported circuit's parameters
+ * are public inputs, measured at two public inputs and five instructions per 32-byte word
+ * (docs/bugs-found.md #14), which was enough on its own to push the resolve circuits to k=16
+ * and the contract out of provability. A constant is folded into the ledger op as a literal
+ * `StateValue` push and is never an input at all.
  *
- * Original (mistaken) rationale, kept so the reasoning error is legible:
- * RAISED FROM 2 KB after a real rejection, not a measurement: with 2 KB the operator's
- * `claimTimeout` was refused by the node with `OutsideTimeToDismiss` (client error 231) on a
- * live table, even though the E2E run had measured every circuit clearing the floor. Nothing
- * about the circuit changed -- a transaction's size also depends on how many UTXOs the paying
- * wallet contributes, so the same call is smaller from a wallet holding fewer, larger notes.
- * `claimTimeout` is the leanest circuit here (k=11, the smallest proof), so it is the first to
- * fall under the floor when that varies, and it is also the worst one to lose: it is a
- * permissionless timeout path, and a timeout that cannot be admitted is how a pot gets trapped.
- * The margin is now large enough that wallet-shape variation cannot cross it.
- *
- * Padding can only ever help admission: it is written after `kernel.checkpoint()`, so it adds to
- * the size the allowance is computed from (`max(15ms, 0.002ms/byte)`) while landing in the
- * fallible cost that `time_to_dismiss` never sums. Bigger is strictly safer, bounded only by
- * the 1 MiB transaction limit and the fee.
+ * It does NOT clear the admission floor by itself -- see section 3 of the header. It is kept
+ * because the transcript bytes are free and cannot hurt, not because it works.
  */
 pure circuit paddingConstant(): Bytes<4096> {
   return pad(4096, "yahtzee:v1:pad");
@@ -526,40 +753,28 @@ pure circuit paddingConstant(): Bytes<4096> {
 // ===========================================================================================
 // Witnesses
 // ===========================================================================================
+//
+// TWO, where there were three. `modalFaceHint` is gone with the pre-declared policies: it
+// existed only so that `KeepModal`'s mask could be witnessed-and-checked rather than computed,
+// and there is no mask to compute any more.
 
 /**
  * The player's entropy secret for this seat.
  *
- * `join` commits to it; `takeTurn` proves knowledge of it. This is the whole of a player's
- * authorisation -- authorisation here is structural, not address-based, so no circuit ever
- * needs to learn its caller (which it could not anyway: `docs/gate0-report.md`).
+ * `join` commits to it; every `playerMove` proves knowledge of it. This is the whole of a
+ * player's authorisation -- authorisation here is structural, not address-based, so no circuit
+ * ever needs to learn its caller (which it could not anyway: docs/gate0-report.md).
  */
 witness playerEntropySecret(): Bytes<32>;
 
 /**
  * The operator's roll seed, held off-chain until settlement.
  *
- * Knowledge of it IS `resolveTurn`'s authority: the circuit checks it against the committed
- * `H(seed)`, and only the operator can produce a preimage. The seed is never disclosed
- * mid-game -- `resolveTurn` reveals only the resulting dice, and recovering the seed from them
- * means inverting `persistentHash` over a 32-byte preimage.
+ * Knowledge of it IS the resolve circuits' authority: each checks it against the committed
+ * `H(tableId, seed)`, and only the operator can produce a preimage. The seed is never disclosed
+ * mid-game -- a resolve reveals only the resulting dice.
  */
 witness rollSeed(): Bytes<32>;
-
-/**
- * The modal face of this turn's roll 1 -- the witness-the-answer half of `KeepModal`.
- *
- * Declared over the PUBLIC inputs that determine the roll (`tableId`, the mixed entropy, the
- * round) rather than over roll 1 itself, so the circuit derives roll 1 exactly once: taking
- * the dice as an argument would force a second full derivation of the ladder just to feed the
- * witness. The operator's implementation re-derives roll 1 with the TypeScript dice mirror
- * from the seed it already holds.
- *
- * Nothing here is trusted. `resolveDiceChecked` proves the returned face is THE modal face of
- * roll 1 under the exact tie-break api/src/policies.ts uses, so there is one value that
- * produces a transaction. Only the value's provenance is private, never its correctness.
- */
-witness modalFaceHint(id: Bytes<32>, mixed: Bytes<32>, r: Uint<8>): Uint<8>;
 
 // ===========================================================================================
 // Domain-separated event hashing
@@ -570,7 +785,7 @@ pure circuit genesisDigest(id: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<2, Bytes<32>>>([pad(32, "yahtzee:v1:genesis"), id]);
 }
 
-/** One `join`, as hashed into `gameDigest`. Fixed-width fields, one hash, no concatenation. */
+/** One `join`, as hashed into `roundDigest`. Fixed-width fields, one hash, no concatenation. */
 export struct JoinEvent {
   domain: Bytes<32>,
   prev: Bytes<32>,
@@ -594,168 +809,174 @@ pure circuit joinDigest(
            );
 }
 
-/** One `resolveTurn`, as hashed into `gameDigest`. */
-export struct ResolveEvent {
-  domain: Bytes<32>,
-  prev: Bytes<32>,
-  turnIndex: Uint<16>,
-  seat: Uint<8>,
-  round: Uint<8>,
-  policy: Uint<8>,
-  param: Uint<8>,
-  entropy: Bytes<32>,
+/** One seat's contribution to a round's result: the dice it scored, and whether it is out. */
+export struct RoundResult {
   dice: Dice,
+  out: Boolean,
 }
 
-pure circuit resolveDigest(
+/**
+ * A whole round, as hashed into `roundDigest` by `closeRound`.
+ *
+ * SEAT ORDER, not landing order. That is the entire point (section 2 of the header): the six
+ * results are read out of `seatProgress` by index at the round boundary, so the operator's
+ * choice of which seat to resolve first cannot change the digest and therefore cannot change
+ * anybody's future dice.
+ *
+ * Slots at or above `seatCount` carry their constructor defaults and contribute a fixed value;
+ * `seatCount` is hashed too, so a 2-seat table and a 6-seat table whose last four slots happen
+ * to hold defaults are still distinguishable.
+ */
+export struct RoundEvent {
+  domain: Bytes<32>,
+  prev: Bytes<32>,
+  round: Uint<8>,
+  seatCount: Uint<8>,
+  results: Vector<6, RoundResult>,
+}
+
+pure circuit roundDigestOf(
                prev: Bytes<32>,
-               turn: Uint<16>,
+               r: Uint<8>,
+               seats: Uint<8>,
+               results: Vector<6, RoundResult>,
+               ): Bytes<32> {
+  return persistentHash<RoundEvent>(
+           RoundEvent { domain: pad(32, "yahtzee:v1:round"),
+                        prev: prev,
+                        round: r,
+                        seatCount: seats,
+                        results: results, }
+           );
+}
+
+/**
+ * The receipt `eliminate` writes into `seatReceipt`. Records the penalty arithmetic in full.
+ *
+ * Every term of the split is in the preimage -- the round charged, the stake, the forfeited
+ * share and the refundable share -- so the receipt is checkable against the rule rather than
+ * merely being a marker that something happened.
+ */
+export struct EliminateEvent {
+  domain: Bytes<32>,
+  prev: Bytes<32>,
+  tableId: Bytes<32>,
+  seat: Uint<8>,
+  round: Uint<8>,
+  tier: Uint<64>,
+  penalty: Uint<64>,
+  refund: Uint<64>,
+}
+
+pure circuit eliminateDigest(
+               prev: Bytes<32>,
+               id: Bytes<32>,
                seat: Uint<8>,
                r: Uint<8>,
-               policy: Uint<8>,
-               param: Uint<8>,
-               entropy: Bytes<32>,
-               d: Dice,
+               stake: Uint<64>,
+               penalty: Uint<64>,
+               refund: Uint<64>,
                ): Bytes<32> {
-  return persistentHash<ResolveEvent>(
-           ResolveEvent { domain: pad(32, "yahtzee:v1:resolve"),
-                          prev: prev,
-                          turnIndex: turn,
-                          seat: seat,
-                          round: r,
-                          policy: policy,
-                          param: param,
-                          entropy: entropy,
-                          dice: d, }
+  return persistentHash<EliminateEvent>(
+           EliminateEvent { domain: pad(32, "yahtzee:v1:eliminated"),
+                            prev: prev,
+                            tableId: id,
+                            seat: seat,
+                            round: r,
+                            tier: stake,
+                            penalty: penalty,
+                            refund: refund, }
+           );
+}
+
+/**
+ * The receipt `redeem` writes. Binds the amount to the payee and to the card it was paid on.
+ *
+ * The scorecard is in the preimage for two reasons: it makes the receipt a statement about the
+ * whole game rather than only about a number, and hashing it is real cryptographic work on a
+ * circuit that is otherwise far too small to clear the admission floor. See `redeem`.
+ *
+ * `prev` chains the seat's earlier receipt, so a redeemed eliminated seat's final value attests
+ * to the penalty it paid as well as to the sum it got back.
+ */
+export struct RedeemEvent {
+  domain: Bytes<32>,
+  prev: Bytes<32>,
+  tableId: Bytes<32>,
+  seat: Uint<8>,
+  amount: Uint<64>,
+  addr: UserAddress,
+  card: Scorecard,
+}
+
+pure circuit redeemDigest(
+               prev: Bytes<32>,
+               id: Bytes<32>,
+               seat: Uint<8>,
+               amount: Uint<64>,
+               addr: UserAddress,
+               card: Scorecard,
+               ): Bytes<32> {
+  return persistentHash<RedeemEvent>(
+           RedeemEvent { domain: pad(32, "yahtzee:v1:redeemed"),
+                         prev: prev,
+                         tableId: id,
+                         seat: seat,
+                         amount: amount,
+                         addr: addr,
+                         card: card, }
+           );
+}
+
+/**
+ * The closing certificate written to `finalDigest` by `settle` and by `abortTable`.
+ *
+ * One value that says how a table ended: which phase it landed in, which seat won (or
+ * `maxSeats()` for an abort, which is not a seat), what the pot paid, what the rake took, what
+ * each seat may redeem, and whether the seed was actually revealed. `prev` is the final round
+ * digest, so the certificate is bound to the whole game that produced it.
+ */
+export struct FinalEvent {
+  domain: Bytes<32>,
+  prev: Bytes<32>,
+  tableId: Bytes<32>,
+  ending: Uint<8>,
+  winner: Uint<8>,
+  seatCount: Uint<8>,
+  paid: Uint<64>,
+  rake: Uint<64>,
+  perSeat: Uint<64>,
+  verifiable: Boolean,
+}
+
+pure circuit finalDigestOf(
+               prev: Bytes<32>,
+               id: Bytes<32>,
+               ending: Uint<8>,
+               winner: Uint<8>,
+               seats: Uint<8>,
+               paid: Uint<64>,
+               rake: Uint<64>,
+               perSeat: Uint<64>,
+               verifiable: Boolean,
+               ): Bytes<32> {
+  return persistentHash<FinalEvent>(
+           FinalEvent { domain: pad(32, "yahtzee:v1:final"),
+                        prev: prev,
+                        tableId: id,
+                        ending: ending,
+                        winner: winner,
+                        seatCount: seats,
+                        paid: paid,
+                        rake: rake,
+                        perSeat: perSeat,
+                        verifiable: verifiable, }
            );
 }
 
 // ===========================================================================================
-// The turn cursor
+// Shared helpers
 // ===========================================================================================
-//
-// `currentSeat` and `round` advance INCREMENTALLY and are never derived from `turnIndex`.
-// Language 0.26 has no division, so `turnIndex mod seatCount` is not available -- and it would
-// be wrong anyway once seats start forfeiting, since the cursor has to skip them.
-
-/** Where the cursor is, and whether it has landed on a seat that can play. */
-struct Cursor {
-  seat: Uint<8>,
-  round: Uint<8>,
-  done: Boolean,
-}
-
-/** `forfeited[s]` with a runtime `s`. Flat six-way disjunction. */
-pure circuit forfeitedAt(forfeited: Vector<6, Boolean>, s: Uint<8>): Boolean {
-  return (s == 0 && forfeited[0]) ||
-         (s == 1 && forfeited[1]) ||
-         (s == 2 && forfeited[2]) ||
-         (s == 3 && forfeited[3]) ||
-         (s == 4 && forfeited[4]) ||
-         (s == 5 && forfeited[5]);
-}
-
-/** A seat that exists and has not forfeited. Slot membership is never consulted. */
-pure circuit seatIsActive(forfeited: Vector<6, Boolean>, count: Uint<8>, s: Uint<8>): Boolean {
-  return s < count && !forfeitedAt(forfeited, s);
-}
-
-/**
- * One position forward in seat order, wrapping into the next round.
- *
- * The round increments exactly once per wrap, and only on a wrap, which is what makes
- * `round == roundCount()` a sound "everyone is finished" test.
- */
-pure circuit advanceOne(seat: Uint<8>, r: Uint<8>, count: Uint<8>): Cursor {
-  const n = (seat + 1) as Uint<8>;
-  return n >= count
-           ? Cursor { seat: 0, round: (r + 1) as Uint<8>, done: false }
-           : Cursor { seat: n, round: r, done: false };
-}
-
-/** Stop if already stopped, stop here if this seat can play, otherwise step once more. */
-pure circuit settleCursor(c: Cursor, count: Uint<8>, forfeited: Vector<6, Boolean>,): Cursor {
-  return c.done
-           ? c
-           : (seatIsActive(forfeited, count, c.seat)
-                ? Cursor { seat: c.seat, round: c.round, done: true }
-                : advanceOne(c.seat, c.round, count));
-}
-
-/**
- * The next seat to move, skipping forfeited seats.
- *
- * Six `settleCursor` steps examine six candidate positions, which covers every seat of a
- * full table exactly once, so the scan is complete and bounded. It is a chain of six
- * conditionals, but every operand is a ledger leaf -- `forfeited` and `count` come straight
- * off the ledger -- so its DAG is tiny and docs/bugs-found.md #1 does not bite. (The defect
- * is re-reads x DAG SIZE, not nesting depth; a flat rewrite of a chain over big DAGs was
- * measured not to help at all, and this chain is the reverse case.)
- *
- * `done` is false on return only when NO seat is active, which every caller rules out before
- * calling: `claimTimeout` checks `activeSeats` first, and the other callers only advance from
- * a seat that just moved.
- */
-pure circuit nextCursor(
-               seat: Uint<8>,
-               r: Uint<8>,
-               count: Uint<8>,
-               forfeited: Vector<6, Boolean>,
-               ): Cursor {
-  const c0 = advanceOne(seat, r, count);
-  const c1 = settleCursor(c0, count, forfeited);
-  const c2 = settleCursor(c1, count, forfeited);
-  const c3 = settleCursor(c2, count, forfeited);
-  const c4 = settleCursor(c3, count, forfeited);
-  const c5 = settleCursor(c4, count, forfeited);
-  return settleCursor(c5, count, forfeited);
-}
-
-/** The forfeit flags of all six slots, in cursor order. */
-circuit forfeitFlags(): Vector<6, Boolean> {
-  return [seatProgress.lookup(0).forfeited,
-          seatProgress.lookup(1).forfeited,
-          seatProgress.lookup(2).forfeited,
-          seatProgress.lookup(3).forfeited,
-          seatProgress.lookup(4).forfeited,
-          seatProgress.lookup(5).forfeited,];
-}
-
-/**
- * Move the cursor to the next seat that can play and hand the turn back to a player.
- *
- * Called at the end of every move that completes a turn: `resolveTurn`, the score-only
- * `takeTurn` of round 13, and `claimTimeout`. When the cursor's round reaches
- * `roundCount()` the game is over and `settle` opens; nothing else changes, so the table
- * simply stops accepting `takeTurn`.
- */
-circuit advanceTurn(): [] {
-  const c = nextCursor(currentSeat, round, seatCount, forfeitFlags());
-  currentSeat = c.seat;
-  round = c.round;
-  turnIndex = (turnIndex + 1) as Uint<16>;
-  turnState = TurnState.waitPlayer;
-}
-
-// ===========================================================================================
-// Time and padding
-// ===========================================================================================
-
-/**
- * Pin `now` to the real block time and stamp it. See decision 5 in the file header.
- *
- * `now` must already be `disclose`d by the caller: it arrives as an exported circuit's
- * parameter, which is a private input to the proof exactly like a witness result, so both the
- * ledger write and the kernel predicate need it declared public.
- */
-circuit stampTime(now: Uint<64>): [] {
-  assert(blockTimeGte(now), "declared time is ahead of block time");
-  assert(blockTimeLt((now + timeSlackSecs()) as Uint<64>),
-         "declared time is further behind block time than the allowed slack"
-         );
-  assert(now >= lastActionAt, "declared time must not move backwards");
-  lastActionAt = now;
-}
 
 /**
  * Grow the transaction past the node's ~8 KB admission floor without growing its dismiss cost.
@@ -764,19 +985,64 @@ circuit stampTime(now: Uint<64>): [] {
  * guaranteed phase, so the write that follows lands in the fallible phase: it counts toward
  * the transaction's `est_size()` -- which is what earns the dismiss-time allowance -- but its
  * gas lands in `f_cost`, which `time_to_dismiss` never sums. A plain ledger write and NOT a
- * hash: hashing 2 KB pushed the circuit to k=17 in Gate 0 and the proof server has no SRS for
- * it. Transaction bytes and circuit size are independent levers and this one must move only
- * the first.
+ * hash: hashing 4 KB pushes the circuit to k=17 and the proof server has no SRS for it.
  *
- * The padding is a CONSTANT and not a caller-supplied argument. See decision 8: an argument
- * costs two public inputs per 32-byte word and is what pushed the resolve circuits over the
- * SRS ceiling; a constant is compiled straight into the ledger op as a literal `StateValue`
- * push, so it lands in the transcript -- and therefore in the transaction's byte count -- while
- * contributing essentially nothing to the proving domain.
+ * On its own this is NOT sufficient (section 3 of the header): the byte that decides admission
+ * is the proof, and proof size follows k. Keeping every circuit at k >= 13 is the real fix and
+ * this is the belt to its braces.
  */
 circuit padTransaction(): [] {
   kernel.checkpoint();
   padStore = paddingConstant();
+}
+
+/**
+ * Pin a declared `now` to real block time. See section 5 of the header.
+ *
+ * `now` must already be `disclose`d by the caller: it arrives as an exported circuit's
+ * parameter, which is a private input to the proof exactly like a witness result, so the kernel
+ * predicates need it declared public.
+ *
+ * Deliberately does NOT write anything, and deliberately has no monotonicity check. Both would
+ * need a shared scalar read, which is what the whole redesign exists to remove.
+ */
+circuit pinTime(now: Uint<64>): [] {
+  assert(blockTimeGte(now), "declared time is ahead of block time");
+  assert(blockTimeLt((now + timeSlackSecs()) as Uint<64>),
+         "declared time is further behind block time than the allowed slack"
+         );
+}
+
+/**
+ * `SUM(seatRedeemable)` over all six slots.
+ *
+ * Six `Map.lookup`s, so it BINDS to all six -- only ever called from `settle` and `abortTable`,
+ * which are terminal and serialised by construction (each asserts a phase it then leaves).
+ */
+circuit totalRedeemable(): Uint<64> {
+  return (seatRedeemable.lookup(0) +
+          seatRedeemable.lookup(1) +
+          seatRedeemable.lookup(2) +
+          seatRedeemable.lookup(3) +
+          seatRedeemable.lookup(4) +
+          seatRedeemable.lookup(5))
+         as Uint<64>;
+}
+
+/**
+ * The custody invariant, in-circuit: every atom the contract ever received is still accounted
+ * for, either as pot or as somebody's redeemable.
+ *
+ * Asserted by the two circuits that zero the pot. It is bookkeeping against bookkeeping, not
+ * against the chain -- `unshieldedBalance` is inert under the simulator AND is the wrong thing
+ * to read anyway (docs/bugs-found.md #11) -- so the ledger-vs-contract half of the check lives
+ * in the E2E devnet run. What this catches is an arithmetic slip inside the contract, which is
+ * the failure mode a test can actually reach.
+ */
+circuit assertCustody(): [] {
+  assert((pot + totalRedeemable()) == (tier * (seatCount as Uint<64>)),
+         "custody invariant broken: pot + redeemable != tier * seatCount"
+         );
 }
 
 // ===========================================================================================
@@ -790,10 +1056,9 @@ circuit padTransaction(): [] {
  * the table address, and computed `seedCommitmentOf(id, seed)` -- the commitment is made BEFORE
  * any player exists, which is what makes the commit-reveal sound.
  *
- * `lastActionAt` stays 0 and the Filling deadline therefore only starts at the first join.
- * `abortTable` refuses an empty table for exactly this reason: otherwise every freshly opened
- * table would be abortable on sight, which is a free griefing move against a table that has
- * no funds to protect.
+ * `roundDeadline` stays 0, so an EMPTY table is never abortable: `abortTable`'s filling case
+ * requires `seatCount > 0`, and the first `join` is what starts the fill clock. Aborting a
+ * freshly opened table on sight would be a free griefing move against a table with no funds.
  */
 constructor(id: Bytes<32>,
             stake: Uint<64>,
@@ -805,17 +1070,16 @@ constructor(id: Bytes<32>,
             ) {
   assert(seats >= 2, "a table needs at least 2 seats");
   assert(seats <= maxSeats(), "a table holds at most 6 seats");
-  // Guarantees `q >= 1` in the rake split, so `settle` never has to make a zero-value payment
-  // conditional. See decision 6.
+  // Guarantees `q >= 1` in both rake splits (the pot's at `settle`, and the per-seat one at
+  // `abortTable`), so no payment path has to make a zero-value send conditional.
   assert(stake >= minTier(), "tier must be at least 100 so the 1% rake is non-zero");
-  // Keeps `abortTable`'s `tier * seatCount` inside `Uint<64>`, so the refund path can never be
-  // denied by a checked-cast overflow while `settle` still works. See `maxTier`.
+  // Keeps `tier * seatCount` and `tier * penaltyDenom()` inside `Uint<64>`, so no refund path
+  // can be denied by a checked-cast overflow while `settle` still works. See `maxTier`.
   assert(stake <= maxTier(), "tier is above the maximum a table may stake");
-  // NOT merely `> 0`. A timeout at or below the declared-time slack lets the actor handing the
-  // turn over under-declare `now` far enough that the NEXT seat's deadline has already expired
-  // when they receive it, and `claimTimeout` is permissionless -- so the hand-off itself becomes
-  // a forfeit weapon. See decision 5 and docs/security-review.md C1. The floor is strict, so a
-  // timeout exactly at `slack * factor` is refused too.
+  // NOT merely `> 0`. A timeout at or below the declared-time slack lets `closeRound`'s caller
+  // under-declare `now` far enough that the next round's deadline has already expired when it
+  // opens, and `eliminate` is permissionless -- so opening a round becomes an elimination
+  // weapon. See section 5 and docs/security-review.md C1. The floor is strict.
   const timeoutFloor = (timeSlackSecs() * timeoutSlackFactor()) as Uint<64>;
   assert(turnTimeout > timeoutFloor, "turn timeout must exceed four times the declared-time slack");
   assert(tableTimeout > timeoutFloor,
@@ -831,50 +1095,50 @@ constructor(id: Bytes<32>,
   tableTimeoutSecs = disclose(tableTimeout);
 
   phase = Phase.filling;
-  turnState = TurnState.waitPlayer;
-  gameDigest = genesisDigest(disclose(id));
+  roundDigest = genesisDigest(disclose(id));
 
-  // Explicit zero-inits. Every one of these already holds its type's default before this runs, so
-  // none of it changes behaviour -- it is here so that the initial value of a field is a statement
-  // in the source rather than an inference about Compact's defaults, which is what
-  // docs/security-review.md §5 asked for. Two of them are load-bearing enough to be worth stating
-  // out loud: `lastActionAt` STAYS 0 so the filling deadline only starts at the first join (see
-  // the doc comment above), and `revealedSeed` STAYS zero until a settlement that actually opened
-  // the commitment writes it (see `settle`).
+  // Explicit zero-inits. Every one of these already holds its type's default, so none of it
+  // changes behaviour -- it is here so the initial value of a field is a statement in the source
+  // rather than an inference about Compact's defaults (docs/security-review.md §5). Two are
+  // load-bearing enough to say out loud: `roundDeadline` STAYS 0 so an empty table has no fill
+  // clock and cannot be aborted, and `revealedSeed` STAYS zero until a settlement that actually
+  // opened the commitment writes it.
   //
   // `padStore` is deliberately NOT initialised: it is a transaction-padding sink, not state, and
-  // writing 2 KB here would grow the deploy transaction for no reason. `seatIdentity`, `seatCard`
-  // and `seatProgress` are initialised by the loop below, which is a correctness requirement
-  // rather than documentation.
+  // writing 4 KB here would grow the deploy transaction for no reason.
   seatCount = 0;
   activeSeats = 0;
-  currentSeat = 0;
-  round = 0;
-  turnIndex = 0;
+  openRound = 0;
+  roundDeadline = 0;
   pot = 0;
-  lastActionAt = 0;
   revealedSeed = default<Bytes<32>>;
   winnerSeatIndex = 0;
-  pendingEntropy = default<Bytes<32>>;
-  pendingPolicy = 0;
-  pendingParam = 0;
-  rollStep = 0;
-  pendingMixed = default<Bytes<32>>;
-  pendingHold = default<HoldMask>;
-  pendingRoll = default<Dice>;
+  finalDigest = default<Bytes<32>>;
 
-  // Pre-insert all six slots so every runtime `lookup` is total. See decision 1.
+  // Pre-insert all six slots so every runtime `lookup` is total. See section 7.
   for (const s of 0..6) {
     seatIdentity.insert(s as Uint<8>, default<SeatIdentity>);
     seatCard.insert(s as Uint<8>, emptyScorecard());
     seatProgress.insert(
       s as Uint<8>,
-      SeatProgress { total: 0,
-                     finishedAtTurn: noFinish(),
-                     forfeited: false,
-                     hasDice: false,
+      SeatProgress { round: 0,
+                     total: 0,
+                     finishedAtRound: noFinish(),
+                     eliminated: false,
                      dice: Dice { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1 }, }
       );
+    seatTurn.insert(
+      s as Uint<8>,
+      SeatTurn { stage: stageIdle(),
+                 round: 0,
+                 entropy: default<Bytes<32>>,
+                 mixed: default<Bytes<32>>,
+                 hold1: default<HoldMask>,
+                 hold2: default<HoldMask>,
+                 roll: Dice { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1 }, }
+      );
+    seatRedeemable.insert(s as Uint<8>, 0);
+    seatReceipt.insert(s as Uint<8>, default<Bytes<32>>);
   }
 }
 
@@ -891,13 +1155,17 @@ constructor(id: Bytes<32>,
  * own stake by balancing and signing its own UTXO, and the contract cannot pull funds from
  * anyone (docs/gate0-report.md, Q1).
  *
- * `payoutTo` is recorded here and read at `settle`/`abortTable`. A circuit cannot learn its
- * caller, so this is the only way the contract can pay anyone -- and recording it at join
- * rather than asserting it at settle is what removes the need for any external "who won"
- * authorisation.
+ * `payoutTo` is recorded here and read at `settle` and `redeem`. A circuit cannot learn its
+ * caller, so this is the only way the contract can pay anyone.
  *
- * The last join flips the table to `playing`, zeroes the cursor and stamps `lastActionAt`, so
- * seat 0 gets a full turn timeout to make the first move.
+ * NOT CONFLICT-FREE, AND THAT IS THE POINT. `join` read-modify-writes `seatCount`, so two
+ * simultaneous joins bind to it and exactly one survives with a `ReadMismatch`. That is the
+ * behaviour we want: if both landed they would both take the same seat index and one player's
+ * identity would be silently overwritten by the other's -- experiment B in
+ * docs/concurrency-probe.md, the silent lost write. A rejection the client can retry is
+ * strictly better than a stake paid into a seat somebody else owns.
+ *
+ * The last join flips the table to `playing` and opens round 0 with a full turn timeout.
  */
 export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   assert(phase == Phase.filling, "join: table is not filling");
@@ -905,19 +1173,19 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
 
   const t = disclose(now);
   const who = disclose(payoutTo);
+  pinTime(t);
 
-  // A zero payout address is where a stake goes to die: `settle` and `abortTable` both pay the
+  // A zero payout address is where a stake goes to die: `redeem` and `settle` both pay the
   // address recorded here and nothing else, so a seat that records zeros has staked into a
-  // burn. It is self-harm rather than an attack on anyone else, which is why it is a cheap
-  // assert and not a phase rule -- but a client bug that leaves the field unset should cost a
-  // rejected transaction, not a lost stake.
+  // burn. Self-harm rather than an attack, which is why it is a cheap assert -- but a client
+  // bug that leaves the field unset should cost a rejected transaction, not a lost stake.
   assert(who != default<UserAddress>, "join: payout address must not be the zero address");
 
-  // The seat's authorisation key. Proving knowledge of `sk` is what a later `takeTurn`
+  // The seat's authorisation key. Proving knowledge of `sk` is what every later `playerMove`
   // authorises against; committing to it here is what makes the per-round entropy
   // non-grindable. `entropyKeyCommitment` is a hash, so disclosing it reveals nothing about
-  // `sk` -- and it has to be public, since it is the value `takeTurn` checks against. It binds
-  // `tableId`, so the same secret at two tables produces two unrelated commitments.
+  // `sk` -- and it has to be public, since it is the value `playerMove` checks against. It
+  // binds `tableId`, so the same secret at two tables produces two unrelated commitments.
   const commit = disclose(entropyKeyCommitment(tableId, playerEntropySecret()));
   assert(!joinedKeys.member(commit), "join: this entropy key already holds a seat");
 
@@ -928,230 +1196,329 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   receiveUnshielded(nativeToken(), tier as Uint<128>);
   pot = (pot + tier) as Uint<64>;
 
-  gameDigest = joinDigest(gameDigest, seat, who, commit);
-  seatCount = (seatCount + 1) as Uint<8>;
-  activeSeats = (activeSeats + 1) as Uint<8>;
+  // Folded into the digest chain here, exactly as under the cursor model. Because seat order is
+  // join order and the digest absorbs every join, a player choosing `sk_s` at join time cannot
+  // know the digest their later rolls will hash against.
+  roundDigest = joinDigest(roundDigest, seat, who, commit);
+  const taken = (seatCount + 1) as Uint<8>;
+  seatCount = taken;
+  activeSeats = taken;
 
-  if (seatCount == seatLimit) {
+  if (taken == seatLimit) {
+    // Round 0 opens now, and every seat gets a full turn timeout to play its first turn.
     phase = Phase.playing;
-    turnState = TurnState.waitPlayer;
-    currentSeat = 0;
-    round = 0;
-    turnIndex = 0;
+    openRound = 0;
+    roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
+  } else {
+    // The fill clock. Restarted by every join, so a table that is still attracting players is
+    // never abortable, and one that stops attracting them becomes abortable a table-timeout
+    // later. Under-declaring `now` here only brings the declarer's own table's abort forward,
+    // and an abort is a full refund, so there is nothing to gain.
+    roundDeadline = (t + tableTimeoutSecs) as Uint<64>;
   }
 
-  stampTime(t);
   padTransaction();
   return seat;
 }
 
 // ===========================================================================================
-// takeTurn
+// playerMove -- open a turn, hold dice, or score and stop
 // ===========================================================================================
 
 /**
- * The player's move: score the PREVIOUS round's dice, and declare entropy and hold policy for
- * THIS round.
+ * THE player's entry point, and the only one. Three moves in one circuit.
  *
- * The pipeline, from docs/table-contract.md: pre-declaring a category before seeing the dice
- * costs too much skill expression, so `takeTurn` at round r scores the dice `resolveTurn`
- * produced at round r-1 -- which the player has seen on-chain -- and sets up round r's roll.
- * Round 0 has no category; round 13 has no roll. Both ends are checked, not ignored: the
- * unused argument must carry its canonical zero, so the on-chain log has one representation of
- * each move.
+ * ---------------------------------------------------------------------------------------------
+ * WHY ONE CIRCUIT AND NOT THREE
+ * ---------------------------------------------------------------------------------------------
  *
- * `entropy` is BOTH supplied and re-derived. The circuit proves `entropy == H(sk, tableId,
- * round)` and `H(sk) == C_s`, so a player cannot choose their entropy at turn time at all --
- * they can only reveal the one value their join-time commitment already fixed. Supplying it as
- * an argument rather than only deriving it costs one hash and buys a distinguishable failure:
- * a wrong secret and a wrong entropy are different errors, which matters when the client is
- * the thing that is broken.
+ * The interactive turn has three player moves -- open, hold, score -- where the pre-declared
+ * turn had one. Exported as separate circuits they would take the contract to TWELVE, against a
+ * deploy ceiling measured at 11-12 on this toolchain. That is too close to a limit whose exact
+ * value nobody has pinned, for a contract holding real stakes.
  *
- * Only two bits of the secret's neighbourhood are disclosed -- the two equality results -- and
- * never `sk` itself.
+ * So they are merged behind a `kind` discriminator with canonical sentinels for the arguments a
+ * kind does not use, which is the same pipelined-sentinel style the old `takeTurn` already used
+ * for its two end rounds. A circuit has no branches, so merging costs nothing at proving time
+ * that three circuits would not each have paid anyway: the union of the three read sets is what
+ * every kind reads regardless.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * THE ARGUMENT ENCODING -- also in docs/table-interface.md, which the client is written from
+ * ---------------------------------------------------------------------------------------------
+ *
+ *   kind = 0  OPEN    entropy = H(sk, tableId, openRound)   mask = 00000   category = 0
+ *   kind = 1  HOLD    entropy = 32 zero bytes                mask = chosen   category = 0
+ *   kind = 2  SCORE   entropy = 32 zero bytes                mask = 00000   category = 0..12
+ *
+ * The unused arguments must carry EXACTLY those values. Canonicity is not fussiness: the moves
+ * are part of the public log a settlement verifier replays, and two encodings of one move would
+ * make that log ambiguous.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * AUTHORISATION AND ENTROPY
+ * ---------------------------------------------------------------------------------------------
+ *
+ * ALL THREE KINDS prove knowledge of the seat's `sk_s` against the `C_s` recorded at join. That
+ * is not optional for hold and score: without it anyone could hold nothing and score a seat's
+ * dice into its worst category.
+ *
+ * `entropy` is BOTH supplied and re-derived, on OPEN only. The circuit proves
+ * `entropy == H(sk, tableId, r)`, so a player cannot choose their entropy at turn time at all --
+ * only reveal the one value their join-time commitment already fixed. Supplying it as an
+ * argument costs one hash and buys a distinguishable failure: a wrong secret and a wrong entropy
+ * are different errors, which matters when the client is the thing that is broken.
+ *
+ * `seat` IS AN ARGUMENT AND THAT IS SAFE, even though the concurrency probe's silent-lost-write
+ * hazard says a map key must be derived from the actor. The key is not the authorisation: the
+ * `C_s` check means a transaction writing seat 3 can only be produced by someone holding seat
+ * 3's secret. Deriving the index by scanning all six identities would be the same guarantee at
+ * the cost of six binding reads -- which is exactly the collision the layout exists to avoid.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * CONFLICT-FREEDOM
+ * ---------------------------------------------------------------------------------------------
+ *
+ * Everything else in this contract exists to let this circuit write only `seatCard[seat]`,
+ * `seatProgress[seat]` and `seatTurn[seat]`, and read nothing that can move while it is in
+ * flight. Six seats submitting in the same instant all land, in one block -- measured at that
+ * exact width in docs/concurrency-probe.md, experiment G. src/test/ledger-access.ts re-derives
+ * the read set from the compiled transcript on every test run, so the claim cannot rot.
  */
-export circuit takeTurn(
+export circuit playerMove(
+                 seat: Uint<8>,
+                 kind: Uint<8>,
                  entropy: Bytes<32>,
-                 policy: Uint<8>,
-                 param: Uint<8>,
+                 mask: Vector<5, Boolean>,
                  category: Uint<8>,
-                 now: Uint<64>,
-                 ): [] {
-  assert(phase == Phase.playing, "takeTurn: table is not playing");
-  assert(turnState == TurnState.waitPlayer, "takeTurn: waiting on the operator to resolve");
-  assert(round < roundCount(), "takeTurn: every seat has finished");
+                 ): Uint<8> {
+  assert(phase == Phase.playing, "playerMove: table is not playing");
 
-  const t = disclose(now);
+  const s = disclose(seat);
+  const k = disclose(kind);
   const e = disclose(entropy);
-  const pol = disclose(policy);
-  const par = disclose(param);
+  const m = disclose(mask);
   const cat = disclose(category);
 
-  const seat = currentSeat;
-  const r = round;
+  assert(s < seatCount, "playerMove: no such seat");
+  assert(k < moveKindCount(), "playerMove: unknown move kind");
+
+  const r = openRound;
+  assert(r < roundCount(), "playerMove: the game is over");
+
+  const opening = k == moveOpen();
+  const holding = k == moveHold();
+  const scoring = k == moveScore();
+
+  // ---- canonical sentinels ------------------------------------------------------------
+  // The unused arguments carry a fixed value so the public log has one representation of each
+  // move. Cheap asserts; they are the difference between a replayable log and an ambiguous one.
+  assert(opening || e == default<Bytes<32>>,
+         "playerMove: only an open declares entropy -- pass 32 zero bytes"
+         );
+  assert(holding || (!m[0] && !m[1] && !m[2] && !m[3] && !m[4]),
+         "playerMove: only a hold declares a mask -- pass all-false"
+         );
+  assert(scoring || cat == 0, "playerMove: only a score declares a category -- pass 0");
 
   // ---- authorisation: knowledge of this seat's entropy secret -------------------------
   const sk = playerEntropySecret();
-  assert(disclose(entropyKeyCommitment(tableId, sk) == seatIdentity.lookup(seat).keyCommit),
-         "takeTurn: wrong entropy secret for this seat"
+  assert(disclose(entropyKeyCommitment(tableId, sk) == seatIdentity.lookup(s).keyCommit),
+         "playerMove: wrong entropy secret for this seat"
          );
-  assert(disclose(forcedEntropy(sk, tableId, r) == e),
-         "takeTurn: entropy is not H(sk, tableId, round)"
+  assert(disclose(!opening || forcedEntropy(sk, tableId, r) == e),
+         "playerMove: entropy is not H(sk, tableId, round)"
          );
 
-  // ---- score the previous round's dice ------------------------------------------------
-  const scoring = r > 0;
-  assert(scoring || cat == 0, "takeTurn: round 0 carries no category");
+  const prog = seatProgress.lookup(s);
+  const pend = seatTurn.lookup(s);
 
-  const prog = seatProgress.lookup(seat);
-  assert(!scoring || prog.hasDice, "takeTurn: no resolved dice to score");
+  // ---- is this move legal in this state? ----------------------------------------------
+  //
+  // Opening needs a seat that owes the round and has not started it. Holding and scoring need a
+  // turn that is between rolls -- the seat's own state carries the rest, and an eliminated seat
+  // is unreachable from all three because `eliminate` sets `round` to `roundCount()` and `stage`
+  // to idle.
+  assert(!prog.eliminated, "playerMove: this seat has been eliminated");
+  assert(!opening || prog.round == r, "playerMove: this seat has already played the open round");
+  assert(!opening || pend.stage == stageIdle(), "playerMove: this seat already opened its turn");
+  const between = pend.stage == stageRolled1() ||
+                  pend.stage == stageRolled2() ||
+                  pend.stage == stageRolled3();
+  assert(!holding || pend.stage == stageRolled1() || pend.stage == stageRolled2(),
+         "playerMove: a hold needs a resolved roll with another roll left"
+         );
+  assert(!scoring || between, "playerMove: nothing has been rolled to score");
 
-  const card = seatCard.lookup(seat);
-  const d = fromDice(prog.dice);
+  // ---- score ---------------------------------------------------------------------------
+  const card = seatCard.lookup(s);
+  const d = fromDice(pend.roll);
   const outcome = applyScore(cat, d, card.filled, card.scores[11]);
   assert(!scoring || outcome.validPlacement,
-         "takeTurn: illegal placement -- box taken, or joker rules violated"
+         "playerMove: illegal placement -- box taken, or joker rules violated"
          );
 
   // NOT `cardTotal(placeScore(...))`: that reads the new score nineteen times and took a
   // measured compile from 12 s to 187 s. `totalAfterPlacing` reads it twice.
-  // See scoring-core.compact.
   const newTotal = totalAfterPlacing(card, cat, outcome.score, outcome.bonusEarned);
   const newCard = placeScore(card, cat, d);
 
-  // ---- declare this round's roll ------------------------------------------------------
-  const rolling = r < lastRound();
-  assert(!rolling || isValidPolicy(pol, par), "takeTurn: invalid hold-policy encoding");
-  assert(rolling || (pol == policyNone() && par == 0),
-         "takeTurn: the score-only round declares no policy"
-         );
+  // The completeness assert is an invariant check, not a rule -- thirteen rounds each taking a
+  // distinct open category can only end with a full card -- and it is here so a round-accounting
+  // bug shows up as a failed transaction rather than as a settled game with a wrong total.
+  const finishing = scoring && r == finalRound();
+  assert(!finishing || isComplete(newCard), "playerMove: the last round must complete the card");
 
   if (scoring) {
-    seatCard.insert(seat, newCard);
+    seatCard.insert(s, newCard);
     seatProgress.insert(
-      seat,
-      SeatProgress { total: newTotal,
-                     finishedAtTurn: rolling ? prog.finishedAtTurn : turnIndex,
-                     // Preserved rather than hard-coded false. A forfeited
-                     // seat is skipped by the cursor and can never reach
-                     // here, but writing the invariant down is cheaper than
+      s,
+      SeatProgress { round: (r + 1) as Uint<8>,
+                     total: newTotal,
+                     finishedAtRound: finishing ? (r as Uint<16>) : prog.finishedAtRound,
+                     // Preserved rather than hard-coded false. An eliminated seat cannot reach
+                     // here (asserted above), but writing the invariant down is cheaper than
                      // relying on it.
-                     forfeited: prog.forfeited,
-                     // The dice have been spent on a category. Setting this
-                     // false is what makes the pipeline check above real: a
-                     // second `takeTurn` in the same round has nothing to
-                     // score.
-                     hasDice: false,
-                     dice: prog.dice, }
+                     eliminated: prog.eliminated,
+                     // What `closeRound` folds into the round digest.
+                     dice: pend.roll, }
       );
   }
 
-  if (rolling) {
-    pendingEntropy = e;
-    pendingPolicy = pol;
-    pendingParam = par;
-    // `resolveRoll3` already returns the step counter to 0 as it hands the turn back, and
-    // nothing else can leave `waitResolve`, so this is an invariant restated rather than a
-    // reset that is ever needed. Written anyway: it costs one cell and it means the three
-    // resolve steps' sequencing cannot be broken by some future path into `waitResolve`.
-    rollStep = 0;
-    turnState = TurnState.waitResolve;
-  } else {
-    // Round 13: the seat has just taken its thirteenth category and is done. There is no roll
-    // to resolve, so the turn completes here. The completeness assert is an invariant check,
-    // not a rule -- thirteen rounds each taking a distinct open category can only end with a
-    // full card -- and it is here so that a cursor bug shows up as a failed transaction
-    // rather than as a settled game with a wrong total.
-    assert(isComplete(newCard), "takeTurn: round 13 must complete the scorecard");
-    advanceTurn();
-  }
+  // ---- the turn's next stage -----------------------------------------------------------
+  //
+  // Open moves to "awaiting roll 1"; a hold moves to the next odd stage, which is the operator's
+  // to discharge; a score returns the seat to idle for the next round.
+  const nextStage =
+          opening
+            ? stageAwaitRoll1()
+            : (holding
+                 ? (pend.stage == stageRolled1() ? stageAwaitRoll2() : stageAwaitRoll3())
+                 : stageIdle());
 
-  stampTime(t);
+  seatTurn.insert(
+    s,
+    SeatTurn { stage: nextStage,
+               round: r,
+               // Written on open, carried afterwards. A hold or a score cannot change it -- the
+               // sentinel assert above already forces `e` to zeros for those kinds.
+               entropy: opening ? e : pend.entropy,
+               // Latched by resolveRoll1; nothing to write here. Cleared on open so a turn never
+               // inherits the previous round's mix.
+               mixed: opening ? default<Bytes<32>> : pend.mixed,
+               // A hold writes the mask for the roll it precedes and leaves the other alone;
+               // opening a turn clears both so a turn never inherits the previous round's.
+               hold1: opening
+                        ? default<HoldMask>
+                        : (holding && pend.stage == stageRolled1()
+                             ? HoldMask { bits: m }
+                             : pend.hold1),
+               hold2: opening
+                        ? default<HoldMask>
+                        : (holding && pend.stage == stageRolled2()
+                             ? HoldMask { bits: m }
+                             : pend.hold2),
+               roll: pend.roll, }
+    );
+
   padTransaction();
+  return nextStage;
 }
 
 // ===========================================================================================
-// resolveRoll1 / resolveRoll2 / resolveRoll3 -- the operator's move, in three transactions
+// resolveRoll1 / resolveRoll2 / resolveRoll3 -- the operator's move, one roll per transaction
 // ===========================================================================================
 //
 // This is the one place ZK genuinely earns its keep in the base game. The seed stays a private
-// witness -- each circuit proves `H(seed) == seedCommitment` without revealing `seed` -- so the
-// dice are proven correct against a commitment made before any player existed, while the game
-// is still live and the player still must not know the seed.
+// witness -- each circuit proves `H(tableId, seed) == seedCommitment` without revealing `seed`
+// -- so the dice are proven correct against a commitment made before any player existed, while
+// the game is still live and the player still must not know the seed.
 //
 // Authorisation is knowledge of the seed and nothing else, in all three steps. There is no
 // operator address anywhere in this contract. Re-checking the seed in every step is not
-// redundant: each step derives a roll from it, so a step that skipped the check would accept
-// dice derived from a different preimage.
+// redundant: each step derives a roll from it.
 //
-// The roll inputs are `H(tableId, seed, mixEntropy(entropy, gameDigest), round, rollIndex)`, and
-// the digest folded in is the one from BEFORE this turn's resolution -- which is the digest a
-// replaying verifier has at that point in the log. `resolveRoll1` latches it into
-// `pendingMixed` so all three rolls hash against the same value, and `resolveRoll3` is the only
-// step that advances `gameDigest`. Getting that ordering wrong is the easiest way to make an
-// unverifiable game, so the mirror pins it too.
+// THE SEAT IS AN ARGUMENT. Under the cursor model the operator resolved whoever `currentSeat`
+// named; under simultaneous rounds up to six seats can be awaiting a roll at once, so the
+// operator has to say which. That is not discretion over outcomes -- a seat's dice are fixed by
+// the frozen round digest, its own forced entropy and the seed, so the order the operator picks
+// changes nothing about what any seat receives (section 2 of the header).
 //
-// WHY THREE TRANSACTIONS AND NOT ONE: see decision 9 in the file header. The one-circuit version
-// is still in `policy-core.compact` as `resolveDiceChecked`, is still cross-checked against
-// these three by the tests, and is unprovable on this platform.
+// THE ROLL INPUTS ARE `H(tableId, seed, mixEntropy(entropy_s(r), roundDigest_r), r, rollIndex)`,
+// and `roundDigest_r` is the digest FROZEN AT ROUND OPEN. `resolveRoll1` latches the mixed
+// entropy into the seat's own pipeline so all three rolls hash against the same value.
+//
+// NO TIME CHECK, IN ANY OF THE THREE. A resolve is never late: `eliminate` refuses a seat whose
+// next move is the operator's, and an operator that abandons one mid-turn is `abortTable`'s
+// business. Adding a deadline here would only give the operator a way to lose a seat's move to
+// the clock.
+//
+// WHY THREE TRANSACTIONS AND NOT ONE: the single-circuit version compiles to k=17 and the proof
+// server has no SRS above 15. The measured corpus forces the cut at one roll per transaction:
+// one roll is k=15, two are k=16. With interactive holds the cut is no longer a compromise
+// anyway -- the player has to see each roll to choose the next hold, so the rolls MUST be
+// separate transactions.
 
 /**
- * Step 1 of 3: derive roll 1, verify the witnessed modal face against it, latch the mask.
+ * Roll 1 of 3: five fresh dice for one seat, and the latch of that seat's mixed entropy.
  *
- * Also the step that latches `pendingMixed`, so steps 2 and 3 need neither `pendingEntropy` nor
- * a second `mixEntropy` hash. Nothing about the turn is decided here that was not already fixed
- * by `takeTurn`: the policy and its parameter are ledger state before this runs, so latching the
- * mask is a computation, not a choice.
+ * Nothing is held: the player has not seen anything yet. Under pre-declared policies this step
+ * also checked a witnessed modal face and computed the hold mask, which is where its
+ * instruction count went; both are gone.
+ *
+ * Touches exactly ONE map, and that is deliberate -- this circuit is at k=15 with no headroom.
  */
-export circuit resolveRoll1(now: Uint<64>): Dice {
+export circuit resolveRoll1(seat: Uint<8>): Dice {
   assert(phase == Phase.playing, "resolveRoll1: table is not playing");
-  assert(turnState == TurnState.waitResolve,
-         "resolveRoll1: waiting on the player, not the operator"
-         );
-  assert(rollStep == 0, "resolveRoll1: this turn's first roll is already resolved");
 
-  const t = disclose(now);
-  const r = round;
+  const s = disclose(seat);
+  const t = seatTurn.lookup(s);
+  assert(t.stage == stageAwaitRoll1(), "resolveRoll1: this seat is not awaiting its first roll");
+  // The digest below is the OPEN round's. A pending turn from another round would derive its
+  // dice from the wrong entropy, so pin the two together rather than trusting `closeRound`'s
+  // own guard to have held. Reading `openRound` is free: it cannot move while a roll is pending.
+  assert(t.round == openRound, "resolveRoll1: pending turn is not in the open round");
 
   const seed = rollSeed();
   assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
          "resolveRoll1: seed does not open the table's seed commitment"
          );
 
-  const mixed = mixEntropy(pendingEntropy, gameDigest);
-  const modal = modalFaceHint(tableId, mixed, r);
-  const first = firstRollChecked(tableId, seed, mixed, r, pendingPolicy, pendingParam, modal);
+  // `mixed` needs NO `disclose`, and the asymmetry is the point: it is a hash of the seat's
+  // entropy and the round digest, both public ledger reads, so anyone could already compute it.
+  // The dice below DO need one, because they depend on `seed`.
+  const mixed = mixEntropy(t.entropy, roundDigest);
+  const dice = disclose(toDice(firstRoll(tableId, seed, mixed, t.round)));
 
-  // `mixed` needs NO `disclose`, and the asymmetry is the point: it is a hash of `pendingEntropy`
-  // and `gameDigest`, both public ledger reads, so anyone could already compute it -- writing it
-  // down discloses nothing. The roll and the mask below DO need one, because they depend on
-  // `seed`. Checked by removing each and recompiling, not by inspection.
-  pendingMixed = mixed;
-  pendingHold = HoldMask { bits: disclose(first.hold) };
-  const dice = disclose(toDice(first.dice));
-  pendingRoll = dice;
-  rollStep = 1;
+  seatTurn.insert(
+    s,
+    SeatTurn { stage: stageRolled1(),
+               round: t.round,
+               entropy: t.entropy,
+               mixed: mixed,
+               hold1: t.hold1,
+               hold2: t.hold2,
+               roll: dice, }
+    );
 
-  stampTime(t);
   padTransaction();
   return dice;
 }
 
 /**
- * Step 2 of 3: reroll every die the latched mask does not hold, from roll hash 1.
+ * Roll 2 of 3: reroll exactly the positions the player did not hold.
  *
- * Writes no seat state and touches no digest -- the turn is still in progress. A table stalled
- * here is stalled in `waitResolve` exactly as it would be stalled before step 1, so `abortTable`
- * covers an operator that dies mid-turn without any extra case.
+ * The fresh roll is consumed LEFT TO RIGHT over the rerolled positions -- see `mergeStream` in
+ * policy-core.compact. Writes no seat progress: the turn is still in progress and the player may
+ * still stop and score after this.
  */
-export circuit resolveRoll2(now: Uint<64>): Dice {
+export circuit resolveRoll2(seat: Uint<8>): Dice {
   assert(phase == Phase.playing, "resolveRoll2: table is not playing");
-  assert(turnState == TurnState.waitResolve,
-         "resolveRoll2: waiting on the player, not the operator"
-         );
-  assert(rollStep == 1, "resolveRoll2: roll 1 has not been resolved yet");
 
-  const t = disclose(now);
+  const s = disclose(seat);
+  const t = seatTurn.lookup(s);
+  assert(t.stage == stageAwaitRoll2(), "resolveRoll2: this seat is not awaiting its second roll");
+
   const seed = rollSeed();
   assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
          "resolveRoll2: seed does not open the table's seed commitment"
@@ -1160,42 +1527,43 @@ export circuit resolveRoll2(now: Uint<64>): Dice {
   const dice = disclose(toDice(rerollUnderMask(
                                  tableId,
                                  seed,
-                                 pendingMixed,
-                                 round,
+                                 t.mixed,
+                                 t.round,
                                  1,
-                                 pendingHold.bits,
-                                 fromDice(pendingRoll)
+                                 t.hold1.bits,
+                                 fromDice(t.roll)
                                  )
                                ));
-  pendingRoll = dice;
-  rollStep = 2;
 
-  stampTime(t);
+  seatTurn.insert(
+    s,
+    SeatTurn { stage: stageRolled2(),
+               round: t.round,
+               entropy: t.entropy,
+               mixed: t.mixed,
+               hold1: t.hold1,
+               hold2: t.hold2,
+               roll: dice, }
+    );
+
   padTransaction();
   return dice;
 }
 
 /**
- * Step 3 of 3: the last reroll, the turn's final dice, the digest, and the turn hand-back.
+ * Roll 3 of 3: the last reroll. After this the seat must score -- there are no rolls left.
  *
- * This is the step that makes the turn real: it writes the dice the next `takeTurn` will score,
- * folds the turn into `gameDigest` and advances the cursor. Steps 1 and 2 are pure preparation,
- * so a turn that stops after either of them has changed nothing a seat can be scored on.
- *
- * `resolveDigest` hashes the FINAL dice and the turn's declared policy, exactly as the
- * one-transaction version did -- the split is invisible in the digest chain, which is why a
- * verifier replaying the log needs to know nothing about it.
+ * Identical to roll 2 but for the roll index and the stage it lands in. Kept as its own circuit
+ * rather than parameterised because an exported circuit's arguments are public inputs and the
+ * two are already at the SRS ceiling; a shared implementation would have cost a `rollIndex`
+ * argument on both.
  */
-export circuit resolveRoll3(now: Uint<64>): Dice {
+export circuit resolveRoll3(seat: Uint<8>): Dice {
   assert(phase == Phase.playing, "resolveRoll3: table is not playing");
-  assert(turnState == TurnState.waitResolve,
-         "resolveRoll3: waiting on the player, not the operator"
-         );
-  assert(rollStep == 2, "resolveRoll3: roll 2 has not been resolved yet");
 
-  const t = disclose(now);
-  const seat = currentSeat;
-  const r = round;
+  const s = disclose(seat);
+  const t = seatTurn.lookup(s);
+  assert(t.stage == stageAwaitRoll3(), "resolveRoll3: this seat is not awaiting its third roll");
 
   const seed = rollSeed();
   assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
@@ -1205,34 +1573,247 @@ export circuit resolveRoll3(now: Uint<64>): Dice {
   const dice = disclose(toDice(rerollUnderMask(
                                  tableId,
                                  seed,
-                                 pendingMixed,
-                                 r,
+                                 t.mixed,
+                                 t.round,
                                  2,
-                                 pendingHold.bits,
-                                 fromDice(pendingRoll)
+                                 t.hold2.bits,
+                                 fromDice(t.roll)
                                  )
                                ));
 
-  const prog = seatProgress.lookup(seat);
-  seatProgress.insert(
-    seat,
-    SeatProgress { total: prog.total,
-                   finishedAtTurn: prog.finishedAtTurn,
-                   forfeited: prog.forfeited,
-                   hasDice: true,
-                   dice: dice, }
+  seatTurn.insert(
+    s,
+    SeatTurn { stage: stageRolled3(),
+               round: t.round,
+               entropy: t.entropy,
+               mixed: t.mixed,
+               hold1: t.hold1,
+               hold2: t.hold2,
+               roll: dice, }
     );
 
-  gameDigest =
-    resolveDigest(gameDigest, turnIndex, seat, r, pendingPolicy, pendingParam, pendingEntropy, dice);
-
-  pendingRoll = dice;
-  rollStep = 0;
-
-  advanceTurn();
-  stampTime(t);
   padTransaction();
   return dice;
+}
+
+// ===========================================================================================
+// closeRound
+// ===========================================================================================
+
+/**
+ * Advance the whole table one round: freeze a new digest, open the next round, restamp the
+ * deadline.
+ *
+ * THE ONLY WRITER OF `openRound`, `roundDigest` AND (while playing) `roundDeadline`. That
+ * exclusivity is what makes those three safe for six simultaneous turns to read: they cannot
+ * move while any seat still has a move to make, because this circuit refuses to run until every
+ * seat has finished.
+ *
+ * Permissionless. Every input is public ledger state and the outcome is fully determined, so
+ * there is no discretion to abuse -- the operator will normally call it because it is watching
+ * anyway, but a player whose operator has gone quiet can advance the table itself.
+ *
+ * A SEPARATE CIRCUIT AND NOT PART OF A RESOLVE for a hard reason: `resolveRoll1/2/3` are at k=15
+ * with zero headroom and the proof server has no SRS above 15. Folding a six-seat read and a
+ * `persistentHash` over 36 bytes of results into the roll path would make the contract
+ * unprovable rather than slow. With interactive holds there is no resolve it could sensibly be
+ * folded into anyway, since a turn may end after any of the three.
+ *
+ * Reads all six `seatProgress` entries and therefore binds to all six. That is fine and in fact
+ * necessary: it must observe a consistent snapshot in which every seat is finished, and if a
+ * seat moves underneath it the transaction should fail rather than close a round that is not
+ * over.
+ */
+export circuit closeRound(now: Uint<64>): Uint<8> {
+  assert(phase == Phase.playing, "closeRound: table is not playing");
+
+  const r = openRound;
+  assert(r < roundCount(), "closeRound: the game is already over");
+
+  const t = disclose(now);
+  pinTime(t);
+
+  const p0 = seatProgress.lookup(0);
+  const p1 = seatProgress.lookup(1);
+  const p2 = seatProgress.lookup(2);
+  const p3 = seatProgress.lookup(3);
+  const p4 = seatProgress.lookup(4);
+  const p5 = seatProgress.lookup(5);
+
+  const n = seatCount;
+  assert(seatDone(p0, 0, n, r) &&
+         seatDone(p1, 1, n, r) &&
+         seatDone(p2, 2, n, r) &&
+         seatDone(p3, 3, n, r) &&
+         seatDone(p4, 4, n, r) &&
+         seatDone(p5, 5, n, r),
+         "closeRound: not every seat has finished the open round"
+         );
+
+  roundDigest =
+    roundDigestOf(
+      roundDigest,
+      r,
+      n,
+      [roundResultOf(p0),
+       roundResultOf(p1),
+       roundResultOf(p2),
+       roundResultOf(p3),
+       roundResultOf(p4),
+       roundResultOf(p5),]
+      );
+  const next = (r + 1) as Uint<8>;
+  openRound = next;
+  // Restamped even for the final close, because `settle`'s seed-waiver deadline is measured from
+  // it: the operator gets one more table timeout past the end of the game to produce the seed
+  // before anyone may force-settle without it.
+  roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
+
+  padTransaction();
+  return next;
+}
+
+/**
+ * Has this slot finished round `r`?
+ *
+ * True for a slot that does not exist at this table, and for an eliminated seat -- neither owes
+ * the round. A live seat is finished when `playerMove(score)` has moved its cursor past `r`,
+ * which also returned its `stage` to idle, so this one read settles the question.
+ */
+pure circuit seatDone(p: SeatProgress, s: Uint<8>, n: Uint<8>, r: Uint<8>): Boolean {
+  return s >= n || p.eliminated || p.round > r;
+}
+
+/** One seat's contribution to the round digest. */
+pure circuit roundResultOf(p: SeatProgress): RoundResult {
+  return RoundResult { dice: p.dice, out: p.eliminated };
+}
+
+// ===========================================================================================
+// eliminate
+// ===========================================================================================
+
+/**
+ * Knock out a seat that let the round deadline pass, and split its stake.
+ *
+ * Permissionless, pays the caller nothing, and takes nothing that a wait would not have taken
+ * anyway -- so there is no incentive to grief and no reason to race. Anyone can unstick a table
+ * whose player has walked away.
+ *
+ * IT COVERS EVERY PLAYER-OWED SUB-STATE, which with interactive holds is four of them rather
+ * than one: a seat that never opened its turn (`stage == 0`), one that opened and saw roll 1 but
+ * never sent a hold or a score (`stage == 2`), the same after roll 2 (`stage == 4`), and one
+ * that rolled three times and never scored (`stage == 6`). All four are the player's silence.
+ * The odd stages -- 1, 3 and 5 -- are the operator's, and `eliminate` refuses them: punishing a
+ * player for the operator's failure to resolve would punish the wrong party, and it is the
+ * operator that can grief by withholding resolution. `abortTable` is the remedy for that, and it
+ * refunds everyone.
+ *
+ * THE PENALTY IS `tier * (r + 1) / penaltyDenom()`, where `r` is the round the seat failed in. A
+ * thirteenth for the first round, all of it for the last: the more you have played, the more you
+ * cost the others by leaving. The forfeited share STAYS IN THE POT and goes to the winner, which
+ * is the compensation. The rest becomes the seat's `redeemable` and leaves the pot, so the
+ * winner can never be paid an eliminated player's refund.
+ *
+ * Compact has no division, so the split is the same witness-and-assert identity the rake uses:
+ * the caller supplies `q` and `rem` with `q * penaltyDenom() + rem == tier * (r + 1)` and
+ * `rem < penaltyDenom()`, which has exactly one solution. `q` is the penalty.
+ *
+ * The `+ 1` reconciles two numbering schemes and is not an off-by-one:
+ * docs/simultaneous-rounds.md numbers the penalty over rounds 1..13, and this contract numbers
+ * its thirteen rounds 0..12. A seat that never moves at all forfeits a thirteenth rather than
+ * nothing, which is the case the penalty most needs to cover.
+ *
+ * WHEN THE LAST ACTIVE SEAT GOES, the table becomes `abandoned` -- there is nobody left to play
+ * and nobody who earned the pot. `abortTable` then applies the waiver (decision 1 of
+ * docs/simultaneous-rounds.md) and opens `redeem`. Deliberately not "the last seat standing
+ * wins": the last seat also walked away, and paying it would make timing out last profitable.
+ *
+ * k BALLAST, DECLARED. This circuit would otherwise be small enough to fall under the node's
+ * proof-size admission floor -- the shape that made `claimTimeout` (k=11) fail 1,610 times. Two
+ * things lift it and both are worth doing: `assertCustody()`, which is the check that catches a
+ * pot/redeemable arithmetic slip at the exact moment money moves between the two, and the
+ * `seatReceipt` hash, which records the penalty arithmetic publicly and permanently. Measured
+ * before being kept. See section 3 of the header.
+ */
+export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>): Uint<64> {
+  assert(phase == Phase.playing, "eliminate: table is not playing");
+
+  const s = disclose(seat);
+  assert(s < seatCount, "eliminate: no such seat");
+
+  const r = openRound;
+  assert(r < roundCount(), "eliminate: the game is over");
+  assert(blockTimeGt(roundDeadline), "eliminate: the round deadline has not passed");
+
+  const prog = seatProgress.lookup(s);
+  assert(!prog.eliminated, "eliminate: this seat is already out");
+  assert(prog.round == r, "eliminate: this seat has already played the open round");
+
+  const pend = seatTurn.lookup(s);
+  assert(playerOwes(pend.stage),
+         "eliminate: this seat is waiting on the operator, not the other way round"
+         );
+
+  // Rounds are 0..12 here and 1..13 in the design note. See the doc comment.
+  const charged = (r + 1) as Uint<64>;
+  const penalty = disclose(q);
+  const slack = disclose(rem);
+  // Field arithmetic on both sides, no narrowing cast: a checked cast here would abort instead
+  // of failing the assert on an over-large `q`, which is a worse error to debug.
+  assert(penalty * penaltyDenom() + slack == tier * charged,
+         "eliminate: penalty must satisfy q * 13 + rem == tier * (round + 1)"
+         );
+  assert(slack < penaltyDenom(), "eliminate: penalty remainder must be below 13");
+  // Implied by `charged <= 13`, asserted anyway so a bad `charged` can never mint money.
+  assert(penalty <= tier, "eliminate: penalty cannot exceed the stake");
+
+  const refund = (tier - penalty) as Uint<64>;
+
+  seatProgress.insert(
+    s,
+    SeatProgress { round: roundCount(),
+                   total: prog.total,
+                   // An eliminated seat never completed its card, so it loses every tie-break it
+                   // would otherwise have drawn -- and `settle` excludes it from the winner
+                   // computation outright. Written for the record either way.
+                   finishedAtRound: noFinish(),
+                   eliminated: true,
+                   dice: prog.dice, }
+    );
+
+  // Returning the turn to idle is not tidiness: it is what makes a half-played turn unreachable
+  // afterwards, so a `playerMove(hold)` that was already in flight cannot land on a seat that
+  // has left the game.
+  seatTurn.insert(
+    s,
+    SeatTurn { stage: stageIdle(),
+               round: pend.round,
+               entropy: pend.entropy,
+               mixed: pend.mixed,
+               hold1: pend.hold1,
+               hold2: pend.hold2,
+               roll: pend.roll, }
+    );
+
+  // The forfeited share stays behind; the rest leaves the pot for good.
+  pot = (pot - refund) as Uint<64>;
+  seatRedeemable.insert(s, (seatRedeemable.lookup(s) + refund) as Uint<64>);
+  seatReceipt.insert(
+    s,
+    eliminateDigest(seatReceipt.lookup(s), tableId, s, r, tier, penalty, refund)
+    );
+
+  const remaining = (activeSeats - 1) as Uint<8>;
+  activeSeats = remaining;
+  if (remaining == 0) {
+    phase = Phase.abandoned;
+  }
+
+  assertCustody();
+
+  padTransaction();
+  return refund;
 }
 
 // ===========================================================================================
@@ -1240,85 +1821,75 @@ export circuit resolveRoll3(now: Uint<64>): Dice {
 // ===========================================================================================
 
 /**
- * Pay the winner and the rake, and reveal the seed.
+ * Pay the winner and the rake out of the pot, and reveal the seed.
  *
  * Permissionless: every input is on-chain except the seed, and the seed is checked against the
- * commitment, so the outcome is fully determined by public state and nobody's discretion is
- * involved. `seed` is a PUBLIC argument here, unlike in `resolveTurn` -- the whole point of
- * settlement is that anyone can then re-derive every roll of the game from the public log with
- * the TypeScript mirror and no chain access.
+ * commitment, so the outcome is fully determined by public state. `seed` is a PUBLIC argument
+ * here, unlike in the resolves -- the whole point of settlement is that anyone can then
+ * re-derive every roll of the game from the public log with the TypeScript mirror and no chain
+ * access.
  *
- * The winner is `scoring-core.compact`'s tie-break over all six slots: highest total, then
- * earliest finisher, then lowest seat. Forfeited seats compete with whatever they scored --
- * they keep their partial total and carry `noFinish()`, so they lose every tie they would
- * otherwise draw, but a forfeiter who was far ahead still wins. Their stake never leaves the
- * pot either way, which is what makes a mid-game forfeit pay the eventual winner.
+ * ELIMINATED SEATS CANNOT WIN. Under the cursor model a forfeited seat still competed with
+ * whatever it had scored. Under simultaneous rounds elimination is permanent and economic -- the
+ * seat has already been given back `tier - penalty` -- so letting it also take the pot would pay
+ * it twice. Decision 2 of docs/simultaneous-rounds.md: "a seat that misses a round is out of the
+ * game". The tie-break among survivors is unchanged: highest total, then a completer over a
+ * non-completer, then the lowest seat index.
  *
  * `q` and `r` are supplied, not trusted: `splitPot` asserts `q * 100 + r == pot` and `r < 100`,
- * which has exactly one solution, so the caller cannot inflate the rake. The remainder goes to
- * the winner.
+ * which has exactly one solution, so the caller cannot inflate the rake.
  *
  * ---------------------------------------------------------------------------------------------
- * THE SEED CHECK IS WAIVED ONCE THE TABLE DEADLINE HAS PASSED. This is the fix for the Critical
- * finished-but-unsettled trap in docs/security-review.md §5, and it is the one place in this
- * contract where a check is deliberately dropped, so the reasoning is written out in full.
+ * THE SEED CHECK IS WAIVED ONCE THE TABLE DEADLINE HAS PASSED, and this is the one place in the
+ * contract where a check is deliberately dropped.
  *
- * THE TRAP. A game that runs to completion lands in (`Playing`, `waitPlayer`,
- * `round >= roundCount()`). `claimTimeout` refuses it (`round < roundCount()`), `abortTable`
- * refuses it (`operatorStalled` requires `waitResolve`), and `takeTurn` refuses it. `settle` was
- * therefore the ONLY exit, and `settle` needed the operator's seed. An operator that vanished
- * after the last resolve -- or simply lost its seed file -- locked every stake permanently. That
- * breaks the design's own core invariant: every reachable state has a permissionless exit.
+ * THE TRAP it closes. A game that runs to completion lands in (`playing`, `openRound == 13`).
+ * `playerMove`, `closeRound` and `eliminate` all refuse it, and `abortTable` refuses it too (no
+ * seat has a roll in flight). `settle` is the only exit, and if `settle` needed the operator's
+ * seed then an operator that vanished -- or simply lost its seed file -- would lock every stake
+ * permanently. That breaks the design's core invariant, that every reachable state has a
+ * permissionless exit.
  *
- * WHY WAIVING IS SOUND. Nothing about the payout depends on the seed. The winner is
- * `winnerOfSeats` over `seatProgress`, which is public ledger state built up by circuits that
- * each already proved their dice against the commitment as they ran. The rake split is pinned by
- * the Euclidean identity. The payout addresses were recorded at `join`. So the seed reveal was
- * never load-bearing for SOUNDNESS -- it is load-bearing for VERIFIABILITY, which is a different
- * property: it is what lets a third party replay the whole game offline from the public log.
+ * WHY WAIVING IS SOUND. Nothing about the payout depends on the seed. The winner is a function
+ * of public ledger state built up by circuits that each already proved their dice against the
+ * commitment as they ran. The rake split is pinned by the Euclidean identity. The payout
+ * addresses were recorded at `join`. The seed reveal was never load-bearing for SOUNDNESS -- it
+ * is load-bearing for VERIFIABILITY.
  *
- * WHAT IS LOST, stated honestly. A force-settled game is UNVERIFIABLE after the fact.
- * `revealedSeed` stays zero, so nobody -- including the players -- can re-derive the rolls from
- * the log, and the CLI verifier reports the game as unverified rather than as correct. The dice
- * were still proven correct one transaction at a time while the game was live; what is missing is
- * the ability to re-check that offline, later, without trusting the chain's own verification.
- * That is a real loss and it is the right trade against the alternative, which was losing the
- * money.
+ * WHAT IS LOST. A force-settled game is unverifiable after the fact: `revealedSeed` stays zero,
+ * so nobody -- including the players -- can re-derive the rolls, and the verifier must report
+ * the game as unverified rather than as verification-failed. The dice were still proven correct
+ * one transaction at a time while the game was live.
  *
- * WHY IT PAYS THE WINNER RATHER THAN REFUNDING. A refund path here would be strictly worse: an
- * operator that had also seated a player (which the threat model already forbids, but which the
- * contract cannot detect) could watch that seat lose and then simply decline to settle, converting
- * the loss into a refund. Paying the winner the game already produced removes every incentive to
- * stall, so the timeout is a fallback nobody profits from reaching.
+ * WHY IT PAYS THE WINNER RATHER THAN REFUNDING. An operator that had also seated a player (which
+ * the threat model forbids but the contract cannot detect) could watch that seat lose and then
+ * decline to settle, converting the loss into a refund. Paying the winner the game already
+ * produced removes every incentive to reach the timeout at all.
  *
- * BEFORE the deadline the seed check is mandatory, exactly as before, which is what keeps the
- * honest path -- and the reveal it publishes -- the normal one. `settle` takes no `now`: the
- * deadline is evaluated by the kernel against real block time, so there is nothing to declare and
- * nothing to under-declare.
+ * `settle` takes no `now`: the deadline is evaluated by the kernel against real block time, so
+ * there is nothing to declare and nothing to under-declare.
  */
 export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
   assert(phase == Phase.playing, "settle: table is not playing");
-  assert(round >= roundCount(), "settle: the game is not finished");
+  assert(openRound >= roundCount(), "settle: the game is not finished");
+  assert(activeSeats > 0, "settle: no seat is left to pay");
 
   const s = disclose(seed);
   const opens = seedCommitmentOf(tableId, s) == seedCommitment;
-  const graceExpired = blockTimeGt((lastActionAt + tableTimeoutSecs) as Uint<64>);
+  const graceExpired = blockTimeGt((roundDeadline + tableTimeoutSecs) as Uint<64>);
   assert(opens || graceExpired, "settle: seed does not open the table's seed commitment");
 
-  const totals = [seatProgress.lookup(0).total,
-                  seatProgress.lookup(1).total,
-                  seatProgress.lookup(2).total,
-                  seatProgress.lookup(3).total,
-                  seatProgress.lookup(4).total,
-                  seatProgress.lookup(5).total,];
-  const finished =
-          [seatProgress.lookup(0).finishedAtTurn,
-           seatProgress.lookup(1).finishedAtTurn,
-           seatProgress.lookup(2).finishedAtTurn,
-           seatProgress.lookup(3).finishedAtTurn,
-           seatProgress.lookup(4).finishedAtTurn,
-           seatProgress.lookup(5).finishedAtTurn,];
-  const winner = winnerOfSeats(totals, finished, seatCount);
+  assertCustody();
+
+  const n = seatCount;
+  const winner = winnerSeat(
+                   [survivorRow(0, n, seatProgress.lookup(0)),
+                    survivorRow(1, n, seatProgress.lookup(1)),
+                    survivorRow(2, n, seatProgress.lookup(2)),
+                    survivorRow(3, n, seatProgress.lookup(3)),
+                    survivorRow(4, n, seatProgress.lookup(4)),
+                    survivorRow(5, n, seatProgress.lookup(5)),]
+                   );
 
   const split = splitPot(pot, disclose(q), disclose(r));
   sendUnshielded(
@@ -1333,81 +1904,101 @@ export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
     );
 
   pot = 0;
-  // Zero on a force-settle, and that zero is the game's "unverified" marker: `revealedSeed` is
-  // the one field a replaying verifier needs, so leaving it at its constructor default is what
-  // tells the verifier -- and the settle-panel -- that this game cannot be replayed. A seed that
-  // did NOT open the commitment must never be written here: it would look exactly like a reveal
-  // while opening nothing, which is worse than an honest blank.
+  // Zero on a force-settle, and that zero is the game's "unverified" marker. A seed that did NOT
+  // open the commitment must never be written here: it would look exactly like a reveal while
+  // opening nothing, which is worse than an honest blank.
   revealedSeed = opens ? s : default<Bytes<32>>;
   winnerSeatIndex = winner;
+  finalDigest =
+    finalDigestOf(
+      roundDigest,
+      tableId,
+      Phase.settled as Uint<8>,
+      winner,
+      n,
+      split[0],
+      split[1],
+      0,
+      opens
+      );
   phase = Phase.settled;
 
   padTransaction();
   return winner;
 }
 
+/**
+ * One row for the winner tie-break. Only a real, un-eliminated seat is eligible.
+ *
+ * `winnerSeat` returns 0 when no row is active, which `settle` rules out with `activeSeats > 0`.
+ */
+pure circuit survivorRow(s: Uint<8>, n: Uint<8>, p: SeatProgress): SeatTotal {
+  return SeatTotal { seat: s,
+                     total: p.total,
+                     finishedAtTurn: p.finishedAtRound,
+                     active: s < n && !p.eliminated, };
+}
+
 // ===========================================================================================
-// claimTimeout
+// redeem
 // ===========================================================================================
 
 /**
- * Forfeit a player who has run out of time, and move the game on.
+ * Pay one seat the money that is owed to it personally, and write its receipt.
  *
- * Permissionless, and only while waiting on a PLAYER. A stalled operator is `abortTable`'s
- * business, not this one's: forfeiting a player for the operator's failure to resolve would
- * punish the wrong party, and it is the operator who can grief by withholding resolution.
+ * Permissionless -- it pays the address seat `s` recorded at `join` and nothing else, so a
+ * third party calling it can only do the seat a favour. Idempotent by assertion: the balance is
+ * zeroed before the send and a second call finds nothing to pay.
  *
- * The claim is a forfeit and a refund path, never compensation to the claimant -- there is no
- * bounty here and nothing a tight deadline could be farmed for. That is what licenses a tight
- * deadline in the first place (the sandwich discipline: make the claim worthless to the
- * claimant and the deadline stops being an attack surface).
+ * ONLY ONCE THE TABLE IS TERMINAL, never while it is live. That is decision 4 of
+ * docs/simultaneous-rounds.md and it is what keeps the custody invariant to a single line:
+ * nothing is paid out mid-game, so the all-eliminated waiver can be applied uniformly at the end
+ * with no claw-back and no top-up. The cost is latency for an eliminated player -- someone
+ * knocked out in round 2 waits for the game to end before withdrawing -- and it is accepted
+ * deliberately: the alternative needs per-seat withdrawal history and delta payments, which is
+ * more state and more ways to get custody wrong, for money that is not at risk either way.
  *
- * The forfeited seat keeps the total it had. Its remaining categories are worth 0, which
- * `grandTotal` already gives them -- an unfilled score is 0, so nothing needs writing -- and
- * `finishedAtTurn` becomes `noFinish()`, so it loses every tie-break it would have drawn. Its
- * stake stays in the pot and is paid to whoever eventually wins.
+ * `abandoned` IS NOT REDEEMABLE, and this is the one place the phase list is shorter than the
+ * design note's. An all-eliminated table still has the penalties sitting in `pot` and every
+ * seat's `redeemable` still net of its penalty; paying those out would hand each seat less than
+ * the waiver promises and strand the pot. One permissionless `abortTable` call applies the
+ * waiver and moves the table to `aborted`, after which this circuit pays the right number. See
+ * `abortTable`.
  *
- * When the LAST active seat forfeits there is no one left to play and no one who earned the
- * pot, so the table goes to `abandoned` and `abortTable` refunds every seat. That is
- * deliberately a refund and not "the last seat standing wins": the last seat did not win
- * anything, it also walked away. Paying it the pot would make timing out profitable for
- * whoever times out last.
+ * CONFLICT-FREE, so six seats can withdraw in one block: it reads `phase` (terminal, so frozen),
+ * the sealed config, and its own three map entries.
+ *
+ * k BALLAST, DECLARED. Paying one number to one address is far too little work to clear the
+ * node's proof-size admission floor -- the exact shape that made `claimTimeout` (k=11) fail
+ * 1,610 times with `OutsideTimeToDismiss`. `redeemDigest` is what lifts it: a domain-separated
+ * `persistentHash` over data this circuit already touches (the table id, the seat, the amount,
+ * the payee, and the seat's final scorecard). It is ballast in the sense that it was added for
+ * k, and real work in the sense that the receipt is worth having -- it binds a payout to the
+ * card it was paid against, publicly and permanently, which is exactly what a player disputing
+ * a settlement would want to point at. See section 3 of the header.
  */
-export circuit claimTimeout(now: Uint<64>): Uint<8> {
-  assert(phase == Phase.playing, "claimTimeout: table is not playing");
-  assert(turnState == TurnState.waitPlayer,
-         "claimTimeout: the table is waiting on the operator, not on a player"
-         );
-  assert(round < roundCount(), "claimTimeout: every seat has finished");
-  assert(blockTimeGt((lastActionAt + turnTimeoutSecs) as Uint<64>),
-         "claimTimeout: the turn deadline has not passed"
+export circuit redeem(seat: Uint<8>): Uint<64> {
+  assert(phase == Phase.settled || phase == Phase.aborted,
+         "redeem: the table is not finished -- nothing may be withdrawn while it is live"
          );
 
-  const t = disclose(now);
-  const seat = currentSeat;
-  const prog = seatProgress.lookup(seat);
+  const s = disclose(seat);
+  assert(s < seatCount, "redeem: no such seat");
 
-  seatProgress.insert(
-    seat,
-    SeatProgress { total: prog.total,
-                   finishedAtTurn: noFinish(),
-                   forfeited: true,
-                   hasDice: false,
-                   dice: prog.dice, }
+  const amount = seatRedeemable.lookup(s);
+  assert(amount > 0, "redeem: this seat has nothing to redeem");
+
+  const who = seatIdentity.lookup(s).addr;
+  seatRedeemable.insert(s, 0);
+  seatReceipt.insert(
+    s,
+    redeemDigest(seatReceipt.lookup(s), tableId, s, amount, who, seatCard.lookup(s))
     );
 
-  const remaining = (activeSeats - 1) as Uint<8>;
-  activeSeats = remaining;
+  sendUnshielded(nativeToken(), amount as Uint<128>, right<ContractAddress, UserAddress>(who));
 
-  if (remaining == 0) {
-    phase = Phase.abandoned;
-  } else {
-    advanceTurn();
-  }
-
-  stampTime(t);
   padTransaction();
-  return remaining;
+  return amount;
 }
 
 // ===========================================================================================
@@ -1415,65 +2006,128 @@ export circuit claimTimeout(now: Uint<64>): Uint<8> {
 // ===========================================================================================
 
 /**
- * Refund `tier` to every seated player. Nothing to the rake.
+ * End a table that cannot finish, and turn the whole pot into per-seat refunds.
+ *
+ * PAYS NOBODY DIRECTLY. It moves money from `pot` into `seatRedeemable` and leaves the sending
+ * to `redeem`, which is the only circuit that pays a player. That keeps one payout path instead
+ * of two, keeps the custody invariant a single line, and removes the old version's hazard of
+ * sending to a pre-inserted zero address.
  *
  * Permissionless, and legal in exactly three situations:
  *
- *   * `filling` and stalled -- the table never filled within `tableTimeoutSecs` of the last
- *     join. An EMPTY table is deliberately not abortable: `lastActionAt` is 0 until the first
- *     join, so an empty table would look infinitely stalled, and aborting it on sight is a
- *     free griefing move against a table with no funds to protect.
- *   * `playing` and `waitResolve` past `tableTimeoutSecs` -- the OPERATOR stalled. This is the
- *     documented residual of the randomness design: a seed-knowing operator can selectively
- *     withhold resolution when the upcoming dice displease it. It cannot alter an outcome,
- *     only freeze the table, and this circuit is what converts that freeze into a refund.
+ *   * `filling` and stalled -- the table did not fill within `tableTimeoutSecs` of the last
+ *     join. An EMPTY table is deliberately not abortable: `roundDeadline` is 0 until the first
+ *     join, so an empty table would look infinitely stalled, and aborting it on sight is a free
+ *     griefing move against a table with no funds to protect.
  *
- *     ONE CASE, NOT THREE, ACROSS THE SPLIT RESOLVE. `waitResolve` covers `rollStep` 0, 1 and 2
- *     alike: steps 1 and 2 write no seat state, no digest and no cursor, so a stall at any of
- *     them is the same stall as a stall before step 1 and needs no separate rule. What the split
- *     DOES change is the clock, and it is worth being explicit rather than surprised: every one
- *     of the three steps calls `stampTime`, so an operator that runs step 1, waits, runs step 2,
- *     waits, and then stops has restarted the table deadline twice. The worst-case freeze is
- *     therefore about `3 * tableTimeoutSecs` rather than one, and that is the correct behaviour
- *     -- each step is a real state advance and the operator is visibly still working -- but it
- *     means the parameter bounds one step's silence, not one turn's.
- *   * `abandoned` -- every seat forfeited on a turn timeout. No further waiting: the timeout
- *     that produced `abandoned` has already elapsed.
+ *   * `playing`, some seat is waiting on the OPERATOR, and `tableTimeoutSecs` has passed on top
+ *     of the round deadline. This is the documented residual of the randomness design: a
+ *     seed-knowing operator can selectively withhold resolution when the upcoming dice displease
+ *     it. It cannot alter an outcome, only freeze the table, and this circuit is what converts
+ *     that freeze into a refund. `!playerOwes(stage)` covers all three roll steps alike -- a
+ *     stall at 1, 3 or 5 is the same stall.
  *
- * Payouts go to the addresses recorded at join. The sends are conditional on
- * `seat < seatCount` because slots are pre-inserted with a zero address, and paying a zero
- * address burns the stake; `seatCount` is public ledger state, so the condition is public and
- * the transcript is deterministic.
+ *     THE WAITING-ON-THE-OPERATOR CONDITION IS LOAD-BEARING, not decoration. Without it, a
+ *     player who is losing could simply stop playing, let the round deadline and the table grace
+ *     both pass, and abort the game into a full refund. With it, a table where every seat's next
+ *     move is its own has only one exit -- `eliminate` the stragglers, then `closeRound` -- and
+ *     both of those are permissionless and available a whole table-timeout before this circuit
+ *     would have been. So the losing player's stall is answered by the remedy that costs them a
+ *     penalty, not by the one that gives them their money back.
+ *
+ *   * `abandoned` -- every seat was eliminated. No further waiting: the deadline that produced
+ *     it has already elapsed.
+ *
+ * THE ALL-ELIMINATED WAIVER LIVES HERE. Decision 1 of docs/simultaneous-rounds.md: when nobody
+ * kept playing there is nobody for the penalties to compensate, so they are waived and every
+ * seat gets its stake back less the 1% rake -- and the rake IS still paid, because the operator
+ * did its work regardless. Applying it needs a single pass over all six seats and a rake
+ * payment, which is exactly the shape of this circuit and exactly the wrong shape for
+ * `eliminate`, whose job is one seat and which has no headroom to spare for six writes and a
+ * send. The cost of putting it here is one extra permissionless transaction on the
+ * all-eliminated path, and in exchange `eliminate` stays a small, single-seat, provable circuit.
+ *
+ * THE OTHER TWO CASES PAY NO RAKE. The table never produced a game: either it never filled, or
+ * the operator abandoned it. Raking a table the operator failed to run would pay it for failing.
+ *
+ * `q` and `rem` are the PER-SEAT rake on `tier`, not on the pot: `q * 100 + rem == tier`,
+ * `rem < 100`, so each seat gets `tier - q` and the rake gets `q * seatCount`. Dividing the pot
+ * instead would need a division by `seatCount`, which the language does not have. The identity
+ * is required unconditionally, even on the two cases that pay no rake -- it is a function of
+ * `tier` alone, so it is always satisfiable, and demanding it keeps the argument encoding
+ * canonical instead of leaving two ignored fields a caller could stuff with anything.
+ *
+ * NO `now`. Every deadline here is a kernel predicate against a stored value, so there is
+ * nothing to declare.
  */
-export circuit abortTable(now: Uint<64>): Uint<64> {
-  const stalled = blockTimeGt((lastActionAt + tableTimeoutSecs) as Uint<64>);
-  const fillingStalled = phase == Phase.filling && seatCount > 0 && stalled;
-  const operatorStalled = phase == Phase.playing && turnState == TurnState.waitResolve && stalled;
+export circuit abortTable(q: Uint<64>, rem: Uint<64>): Uint<64> {
+  const fillingStalled = phase == Phase.filling && seatCount > 0 && blockTimeGt(roundDeadline);
 
-  assert(fillingStalled || operatorStalled || phase == Phase.abandoned,
+  const graceExpired = blockTimeGt((roundDeadline + tableTimeoutSecs) as Uint<64>);
+  const waiting = awaitingOperatorAt(0) ||
+                  awaitingOperatorAt(1) ||
+                  awaitingOperatorAt(2) ||
+                  awaitingOperatorAt(3) ||
+                  awaitingOperatorAt(4) ||
+                  awaitingOperatorAt(5);
+  const operatorStalled = phase == Phase.playing && waiting && graceExpired;
+
+  const allOut = phase == Phase.abandoned;
+
+  assert(fillingStalled || operatorStalled || allOut,
          "abortTable: the table is neither stalled past its deadline nor abandoned"
          );
 
-  const t = disclose(now);
-  const refunded = (tier * (seatCount as Uint<64>)) as Uint<64>;
-  assert(pot == refunded, "abortTable: pot does not match the sum of the stakes");
+  const rake = disclose(q);
+  const slack = disclose(rem);
+  assert(rakeIsValid(tier, rake, slack),
+         "abortTable: the per-seat rake must satisfy q * 100 + rem == tier with rem < 100"
+         );
+
+  assertCustody();
+
+  // The waiver: penalties refunded, the rake still paid. On the other two paths nobody has been
+  // eliminated for a penalty worth waiving -- or if they have, the table never produced a game,
+  // so the whole stake goes back and the rake is not earned.
+  const share = allOut ? (tier - rake) as Uint<64> : tier;
 
   for (const s of 0..6) {
     if ((s as Uint<8>) < seatCount) {
-      sendUnshielded(
-        nativeToken(),
-        tier as Uint<128>,
-        right<ContractAddress, UserAddress>(seatIdentity.lookup(s as Uint<8>).addr)
-        );
+      seatRedeemable.insert(s as Uint<8>, share);
     }
   }
 
+  if (allOut) {
+    sendUnshielded(
+      nativeToken(),
+      (rake * (seatCount as Uint<64>)) as Uint<128>,
+      right<ContractAddress, UserAddress>(rakeAddress)
+      );
+  }
+
   pot = 0;
+  finalDigest =
+    finalDigestOf(
+      roundDigest,
+      tableId,
+      Phase.aborted as Uint<8>,
+      // `maxSeats()` is not a seat index, so it cannot be mistaken for a winner.
+      maxSeats(),
+      seatCount,
+      0,
+      allOut ? (rake * (seatCount as Uint<64>)) as Uint<64> : 0,
+      share,
+      false
+      );
   phase = Phase.aborted;
 
-  stampTime(t);
   padTransaction();
-  return refunded;
+  return share;
+}
+
+/** Is this slot's next move the operator's -- i.e. is a roll outstanding? */
+circuit awaitingOperatorAt(s: Uint<8>): Boolean {
+  return s < seatCount && !playerOwes(seatTurn.lookup(s).stage);
 }
 
 export { UserAddress, ContractAddress };

@@ -6,27 +6,43 @@
  *
  * Companion to src/dice-mirror.ts, and load-bearing for the same reason: when a table settles,
  * the operator reveals its seed and anyone re-derives every roll of the game from the public
- * log -- joins, entropies, digests, dice -- with no proof server and no chain access. That
- * replay needs the hold policies and the entropy/digest hashing, which live here, not just the
- * dice ladder, which lives in dice-mirror.ts. One file per include file, so a change on either
- * side has an obvious counterpart.
+ * log -- joins, entropies, round digests, holds, dice -- with no proof server and no chain
+ * access. That replay needs the entropy scheme and the reroll merge, which live here, not just
+ * the dice ladder, which lives in dice-mirror.ts. One file per include file, so a change on
+ * either side has an obvious counterpart.
  *
  * Written INDEPENDENTLY of the compiled circuit rather than delegating to `pureCircuits`:
- * src/test/table.test.ts asserts the two agree over a whole 6-seat game, and delegating would
- * make that cross-check vacuous. The exceptions are the same as dice-mirror.ts's -- the
- * `persistentHash` primitive and its field-aligned struct encoding come from the runtime,
- * because reimplementing those would be reimplementing the platform and getting them subtly
- * wrong is exactly the failure the cross-check exists to catch.
+ * src/test/table.test.ts asserts the two agree over whole games, and delegating would make that
+ * cross-check vacuous. The exceptions are the `persistentHash` primitive and its field-aligned
+ * struct encoding, which come from the runtime -- reimplementing those would be reimplementing
+ * the platform, and getting them subtly wrong is exactly the failure the cross-check exists to
+ * catch.
  *
- * The policy semantics themselves are api/src/policies.ts's. That module is contract-canonical
- * for the ENCODING (which number means which policy) and for the MASK RULES; this file is the
- * bridge between it and the circuit's hash-derived dice stream, because api/src/policies.ts
- * models rerolls as a left-to-right dice stream while the circuit derives die `i` of roll `k`
- * from fixed bytes of the roll-`k` hash. `resolveTurnDice` in api and `resolveDiceTs` here
- * therefore produce the same masks but consume entropy differently, and only this file matches
- * the chain. See `resolveDiceTs`.
+ * -------------------------------------------------------------------------------------------
+ * WHAT THE INTERACTIVE-HOLD REDESIGN REMOVED
+ * -------------------------------------------------------------------------------------------
  *
- * Any edit to policy-core.compact must be made here too, and vice versa.
+ * Everything to do with PRE-DECLARED HOLD POLICIES: `Policy`, `POLICY_NONE`, `isValidPolicy`,
+ * `isCanonicalModal`, `holdMaskOf` and `resolveDiceTs`. The player used to choose one of six
+ * deterministic rules before any dice existed and the circuit computed a mask from it; the
+ * player now sees each roll and names the dice to keep, so the mask is five bits that arrive as
+ * an argument and there is nothing to mirror.
+ *
+ * api/src/policies.ts is no longer contract-canonical for anything. It is left in the tree
+ * because the site still imports its type.
+ *
+ * -------------------------------------------------------------------------------------------
+ * AND ONE THING IT FIXED: the reroll is now a STREAM, and the mirror and the circuit agree
+ * -------------------------------------------------------------------------------------------
+ *
+ * This file used to carry a documented divergence from api/src/policies.ts: the circuit merged
+ * rerolls POSITIONALLY (die `i` of a reroll came from bytes `4i..4i+3` of that roll's hash,
+ * whether or not earlier positions were rerolled) while the rules engine consumed a
+ * left-to-right dice stream. Both were self-consistent; only one could be the verifier.
+ *
+ * `mergeStream` below is the stream model, and it is now what the circuit does too. If a player
+ * holds positions 0 and 3, the two dice they get back are `fresh[0]` and `fresh[1]` -- the
+ * rerolled positions consume the fresh roll from the left, in order.
  */
 
 import {
@@ -36,125 +52,17 @@ import {
   persistentHash,
   type CompactType,
 } from '@midnight-ntwrk/compact-runtime';
-import { deriveDiceTs, faceCount, modalFace, pad, rollContext } from './dice-mirror.ts';
-
-// ---------------------------------------------------------------------------------------
-// Policy encoding -- mirrors api/src/policies.ts exactly
-// ---------------------------------------------------------------------------------------
+import { deriveDiceTs, pad, rollContext } from './dice-mirror.ts';
 
 /**
- * The shipped hold policies. A plain const object rather than a TS enum, matching
- * dice-mirror.ts: Node's strip-only type removal rejects TS enums, and the generated contract
- * bindings represent these as plain numbers anyway (the circuit uses `Uint<8>`, not a Compact
- * enum, so the joker-style arithmetic dispatch stays available).
+ * `faceCount` and `modalFace` come from dice-mirror.ts and are re-exported here for clients.
  *
- * These are api/src/policies.ts's numbers. They appear on-chain in `pendingPolicy` and in the
- * resolve digest. Never reorder.
- */
-export const Policy = {
-  Stand: 0,
-  RerollAll: 1,
-  KeepModal: 2,
-  KeepFace: 3,
-  ChaseStraight: 4,
-  KeepPairsPlus: 5,
-} as const;
-
-export type PolicyValue = (typeof Policy)[keyof typeof Policy];
-
-/** `policyNone()` in table.compact: the score-only round 13's mandatory encoding. */
-export const POLICY_NONE = 6;
-
-/** Mirror of `isValidPolicy`. KeepFace carries a face 1..6; everything else carries 0. */
-export function isValidPolicy(policy: number, param: number): boolean {
-  if (!Number.isInteger(policy) || !Number.isInteger(param)) return false;
-  if (policy < 0 || policy >= POLICY_NONE) return false;
-  return policy === Policy.KeepFace ? param >= 1 && param <= 6 : param === 0;
-}
-
-// ---------------------------------------------------------------------------------------
-// Counts, modal face
-// ---------------------------------------------------------------------------------------
-
-/**
- * `faceCount` and `modalFace` come from dice-mirror.ts and are re-exported here rather than
- * reimplemented.
- *
- * They mirror `pFaceCount` in policy-core.compact and api/src/policies.ts's `KeepModal` scan
- * (`counts[f] >= counts[modal]` walking upward, so ties go to the HIGHER face) -- and
- * dice-mirror.ts already carries exactly those two functions, because turn.compact had a
- * modal-face policy before the production set existed. Two byte-identical copies in one package
- * is not independence, it is a second thing to keep in step; the independence that earns its
- * keep is `isCanonicalModal` below, which is written as six comparisons against this scan and
- * cross-checked against it exhaustively.
- *
- * `modalFace` is what the operator witnesses into `resolveTurn` as `modalFaceHint`.
+ * NEITHER IS MIRRORED BY ANY CIRCUIT ANY MORE -- `isCanonicalModal` and the `modalFaceHint`
+ * witness went with the pre-declared policies. They are kept exported because a UI that wants
+ * to suggest a hold ("keep the threes") needs them, and because the fairness tests use
+ * `faceCount` to measure the dice distribution. Nothing on chain depends on either.
  */
 export { faceCount, modalFace } from './dice-mirror.ts';
-
-/**
- * Mirror of `isCanonicalModal` -- the CHECK, written independently of `modalFace` above.
- *
- * Two implementations of the same predicate on purpose: `modalFace` is a scan and this is six
- * comparisons, which is the same rewrite the circuit makes. src/test/table.test.ts asserts
- * they agree, which is the only way to catch a tie-break that drifted.
- */
-export function isCanonicalModal(dice: readonly number[], m: number): boolean {
-  if (m < 1 || m > 6) return false;
-  const cm = faceCount(dice, m);
-  for (let f = 1; f <= 6; f++) {
-    const cf = faceCount(dice, f);
-    if (f < m && cm < cf) return false;
-    if (f > m && cm <= cf) return false;
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------------------
-// The hold mask
-// ---------------------------------------------------------------------------------------
-
-/**
- * Mirror of `holdMaskOf`. True = keep this die, false = reroll it.
- *
- * Semantics are api/src/policies.ts's `holdMask`, position for position:
- *   Stand          keep everything (rolls 2 and 3 change nothing)
- *   RerollAll      keep nothing
- *   KeepModal      keep every die showing the modal face
- *   KeepFace       keep every die showing `param`
- *   ChaseStraight  keep the LOWEST-indexed die of each distinct face, reroll duplicates
- *   KeepPairsPlus  keep every die whose face appears at least twice
- *
- * `modal` is passed in rather than computed so that a test can feed a deliberately wrong modal
- * face and see the same mask the circuit would build from a wrong witness.
- */
-export function holdMaskOf(
-  policy: number,
-  param: number,
-  modal: number,
-  dice: readonly number[],
-): boolean[] {
-  return dice.map((die, i) => {
-    switch (policy) {
-      case Policy.Stand:
-        return true;
-      case Policy.RerollAll:
-        return false;
-      case Policy.KeepModal:
-        return die === modal;
-      case Policy.KeepFace:
-        return die === param;
-      case Policy.ChaseStraight:
-        return dice.slice(0, i).every((earlier) => earlier !== die);
-      case Policy.KeepPairsPlus:
-        return faceCount(dice, die) >= 2;
-      default:
-        // Matches the circuit: an out-of-range code selects no term, so nothing is held.
-        // `isValidPolicy` is what rejects it; the mask is not the guard.
-        return false;
-    }
-  });
-}
 
 // ---------------------------------------------------------------------------------------
 // Hash contexts
@@ -240,71 +148,123 @@ export function seedCommitmentTs(tableId: Uint8Array, seed: Uint8Array): Uint8Ar
   return persistentHash(VEC3_BYTES32, [pad(32, TAG_SEED), tableId, seed]);
 }
 
-/** Mirror of `mixEntropy`: folds the running game digest into the forced entropy. */
-export function mixEntropyTs(entropy: Uint8Array, gameDigest: Uint8Array): Uint8Array {
-  return persistentHash(VEC3_BYTES32, [pad(32, TAG_MIX), entropy, gameDigest]);
+/**
+ * Mirror of `mixEntropy`: folds the FROZEN round digest into the forced entropy.
+ *
+ * The second argument is `roundDigest` as it stood when the round opened, and under
+ * simultaneous rounds that freeze is a security requirement rather than a convenience -- see
+ * section 2 of table.compact's header.
+ */
+export function mixEntropyTs(entropy: Uint8Array, roundDigest: Uint8Array): Uint8Array {
+  return persistentHash(VEC3_BYTES32, [pad(32, TAG_MIX), entropy, roundDigest]);
 }
 
 // ---------------------------------------------------------------------------------------
-// Turn resolution
+// The reroll merge -- left to right over the rerolled positions
 // ---------------------------------------------------------------------------------------
 
-export type ResolvedTurn = {
-  /** Roll 1 in full. */
-  roll0: number[];
-  /** Roll 2: held dice from roll 1, fresh dice elsewhere. */
-  roll1: number[];
-  /** Roll 3, and the turn's final dice. */
-  roll2: number[];
-  /** The mask latched from roll 1 and reused for both rerolls. */
-  hold: boolean[];
-  /** The modal face of roll 1 -- what the operator must witness. */
-  modal: number;
-};
-
 /**
- * Mirror of `resolveDiceChecked`: three rolls under one latched hold mask.
+ * Mirror of `mergeStream`: keep the held dice, fill the rerolled positions from the fresh roll
+ * LEFT TO RIGHT.
  *
- * `mixed` is `mixEntropyTs`'s output, not the raw forced entropy, matching the circuit: the
- * running game digest is folded into the entropy before the roll hash sees it.
+ * Position `i` draws `fresh[rank(i)]`, where `rank(i)` counts the rerolled positions before it.
+ * The circuit writes this as five explicit muxes of widths 1..5, because position `i` can only
+ * ever draw from `fresh[0..i]`; here it is the obvious cursor. They are the same function, and
+ * `src/test/table.test.ts` checks that over every one of the 32 masks.
  *
- * TWO THINGS DIFFER FROM api/src/policies.ts's `resolveTurnDice`, and both are the circuit's
- * doing rather than a simplification here:
- *
- *  1. ENTROPY IS POSITIONAL, NOT A STREAM. `resolveTurnDice` pulls fresh dice from a
- *     left-to-right `nextDie()` stream, so the number of dice consumed depends on how many
- *     were rerolled. The circuit cannot: die `i` of roll `k` comes from bytes `4i..4i+3` of
- *     the roll-`k` hash, always, whether or not position `i` was rerolled. Fixed, disjoint
- *     byte ranges are what make the five dice independent, and a stream would need a
- *     run-time-indexed read, which language 0.26 does not have. So THIS file, not
- *     api/src/policies.ts, is what a settlement verifier must run; api's version is the
- *     rules-engine model of a turn.
- *  2. STAND STILL "ROLLS" THREE TIMES. `resolveTurnDice` returns early for `Stand` with one
- *     roll; here the mask is all-true so both merges are identities and the final dice are
- *     roll 1 regardless. Same answer, and the circuit has no early return to make.
- *
- * The mask is latched from roll 1 and NOT re-evaluated on roll 2 -- a compiler-imposed
- * constraint promoted to a game rule; see `holdMaskOf` in policy-core.compact.
+ * THE VERIFIER DEPENDS ON THIS BEING EXACT. A settlement replay that merged positionally would
+ * reproduce roll 1 correctly and then diverge on every reroll where the held positions were not
+ * a prefix.
  */
-export function resolveDiceTs(
+export function mergeStreamTs(
+  hold: readonly boolean[],
+  kept: readonly number[],
+  fresh: readonly number[],
+): number[] {
+  let cursor = 0;
+  return kept.map((die, i) => (hold[i] === true ? die : fresh[cursor++]!));
+}
+
+/** Mirror of `firstRoll`: five fresh dice, nothing held. */
+export function firstRollTs(
   tableId: Uint8Array,
   seed: Uint8Array,
   mixed: Uint8Array,
   round: number | bigint,
-  policy: number,
-  param: number,
-  modalOverride?: number,
-): ResolvedTurn {
-  const roll0 = deriveDiceTs(rollContext(tableId, seed, mixed, round, 0));
-  const modal = modalOverride ?? modalFace(roll0);
-  const hold = holdMaskOf(policy, param, modal, roll0);
+): number[] {
+  return deriveDiceTs(rollContext(tableId, seed, mixed, round, 0));
+}
 
-  const merge = (prev: number[], rollIndex: number): number[] => {
-    const fresh = deriveDiceTs(rollContext(tableId, seed, mixed, round, rollIndex));
-    return prev.map((die, i) => (hold[i] ? die : fresh[i]!));
-  };
+/**
+ * Mirror of `rerollUnderMask`: one reroll of the positions `hold` does not keep.
+ *
+ * `rollIndex` is 1 for the second roll and 2 for the third, matching the circuit and separating
+ * the two rerolls' hashes.
+ */
+export function rerollUnderMaskTs(
+  tableId: Uint8Array,
+  seed: Uint8Array,
+  mixed: Uint8Array,
+  round: number | bigint,
+  rollIndex: number,
+  hold: readonly boolean[],
+  kept: readonly number[],
+): number[] {
+  return mergeStreamTs(
+    hold,
+    kept,
+    deriveDiceTs(rollContext(tableId, seed, mixed, round, rollIndex)),
+  );
+}
 
-  const roll1 = merge(roll0, 1);
-  const roll2 = merge(roll1, 2);
-  return { roll0, roll1, roll2, hold, modal };
+/** One seat's turn, as the replay reconstructs it. */
+export type ReplayedTurn = {
+  /** Roll 1 in full. */
+  roll0: number[];
+  /** After the first reroll. Absent from `rolls` if the player scored after roll 1. */
+  roll1: number[];
+  /** After the second reroll. */
+  roll2: number[];
+  /** The dice the turn actually ended on, given how many rolls the player took. */
+  final: number[];
+  /** The two masks the player sent, in order. Unused entries are all-false. */
+  holds: boolean[][];
+};
+
+/** A mask that keeps nothing -- the canonical "reroll everything". */
+export function keepNothing(): boolean[] {
+  return [false, false, false, false, false];
+}
+
+/**
+ * Replay one seat's whole turn from the public log.
+ *
+ * NOT `resolveTurnTs`, which is dice-mirror.ts's mirror of the measurement contract
+ * `turn.compact` and a different function entirely. This one takes the masks a player actually
+ * sent and reports where the turn stopped.
+ *
+ * `holds` carries the masks the player actually sent, so its length says how many rolls the
+ * turn took: zero masks means the player scored straight after roll 1, one mask means they
+ * scored after roll 2, two masks means they went the distance. That is the ONLY thing that
+ * varies between turns now -- a pre-declared policy fixed it at three rolls for everyone.
+ *
+ * `mixed` is `mixEntropyTs(forcedEntropyTs(sk, tableId, r), roundDigest_r)`, where the round
+ * digest is the one FROZEN when round `r` opened -- not a running accumulator. See section 2 of
+ * table.compact's header for why that matters.
+ */
+export function replayTurnTs(
+  tableId: Uint8Array,
+  seed: Uint8Array,
+  mixed: Uint8Array,
+  round: number | bigint,
+  holds: readonly (readonly boolean[])[],
+): ReplayedTurn {
+  if (holds.length > 2) throw new Error(`a turn has at most two holds, got ${holds.length}`);
+  const roll0 = firstRollTs(tableId, seed, mixed, round);
+  const hold1 = holds[0] ?? keepNothing();
+  const hold2 = holds[1] ?? keepNothing();
+  const roll1 = rerollUnderMaskTs(tableId, seed, mixed, round, 1, hold1, roll0);
+  const roll2 = rerollUnderMaskTs(tableId, seed, mixed, round, 2, hold2, roll1);
+  const final = holds.length === 0 ? roll0 : holds.length === 1 ? roll1 : roll2;
+  return { roll0, roll1, roll2, final, holds: [[...hold1], [...hold2]] };
 }

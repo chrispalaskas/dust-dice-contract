@@ -417,6 +417,23 @@ export function userAddress(fill: number): UserAddress {
   return { bytes: new Uint8Array(32).fill(fill) };
 }
 
+/**
+ * `playerMove` kinds, as table.compact numbers them.
+ *
+ * Restated here rather than imported: the generated bindings spell the argument as a plain
+ * `Uint<8>` (it is not a Compact `enum`), and these are the values the daemon and the website
+ * will send. See `playerMove` in table.compact and docs/table-interface.md.
+ */
+export const MOVE_OPEN = 0;
+export const MOVE_HOLD = 1;
+export const MOVE_SCORE = 2;
+
+/** The canonical "no mask" sentinel every kind but `hold` must carry. */
+export const NO_MASK = (): boolean[] => [false, false, false, false, false];
+
+/** The canonical "no entropy" sentinel every kind but `open` must carry. */
+export const ZERO_BYTES32 = (): Uint8Array => new Uint8Array(32);
+
 /** Constructor arguments for a table. */
 export type TableConfig = {
   tableId: Uint8Array;
@@ -434,10 +451,18 @@ export type TableConfig = {
 /**
  * Testbed for table.compact.
  *
- * Every mutating method takes `now` (the value the circuit is TOLD the time is) and optionally
- * `blockTime` (what the chain says it is). They default to the same value, which is the honest
- * case; passing them apart is how the `stampTime` sandwich is tested, and it is the only way to
- * exercise a caller lying about the clock.
+ * TWO KINDS OF METHOD, and the split is the redesign's whole point. `join` and `closeRound` are
+ * the only circuits that DECLARE a time, so they take `now` (the value the circuit is told the
+ * time is) and optionally `blockTime` (what the chain says it is); they default to the same
+ * value, which is the honest case, and passing them apart is the only way to exercise a caller
+ * lying about the clock -- see `describe('the declared-time sandwich')`.
+ *
+ * Everything else takes `blockTime` alone, because it declares nothing: its deadlines are kernel
+ * predicates evaluated against a stored `roundDeadline`. There is nothing to under-declare in
+ * `eliminate`, `settle`, `redeem`, `abortTable` or any of the three resolves.
+ *
+ * `blockTime` is still explicit everywhere. `createCircuitContext` defaults it to wall clock,
+ * which makes any block-time-dependent test non-reproducible (docs/bugs-found.md #12).
  */
 export class TableSimulator extends BaseSimulator<TablePrivateState> {
   table: TableContract<TablePrivateState>;
@@ -491,86 +516,123 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     return this.run('join', (ctx) => this.table.impureCircuits.join(ctx, payoutTo, BigInt(now)));
   }
 
-  takeTurn(
+  /**
+   * The player's move: open a turn, hold dice, or score and stop.
+   *
+   * Declares no time -- the round's deadline was stamped by `closeRound`. Returns the seat's
+   * next stage, which is the circuit's own view of where the turn now is.
+   *
+   * Prefer `openTurn` / `hold` / `score` below; this is the raw form, and the one a test uses
+   * when it wants to send a non-canonical argument on purpose.
+   */
+  playerMove(
+    seat: number,
+    kind: number,
     entropy: Uint8Array,
-    policy: number,
-    param: number,
+    mask: boolean[],
     category: number,
-    now: number,
-    blockTime = now,
-  ): Promise<[]> {
+    blockTime = DEFAULT_BLOCK_TIME,
+  ): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('takeTurn', (ctx) =>
-      this.table.impureCircuits.takeTurn(
+    return this.run('playerMove', (ctx) =>
+      this.table.impureCircuits.playerMove(
         ctx,
+        BigInt(seat),
+        BigInt(kind),
         entropy,
-        BigInt(policy),
-        BigInt(param),
+        mask,
         BigInt(category),
-        BigInt(now),
       ),
     );
   }
 
+  /** `playerMove(open)`: prove the secret, declare the forced entropy, await roll 1. */
+  openTurn(seat: number, entropy: Uint8Array, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+    return this.playerMove(seat, MOVE_OPEN, entropy, NO_MASK(), 0, blockTime);
+  }
+
+  /** `playerMove(hold)`: keep these dice and roll again. */
+  hold(seat: number, mask: boolean[], blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+    return this.playerMove(seat, MOVE_HOLD, ZERO_BYTES32(), mask, 0, blockTime);
+  }
+
+  /** `playerMove(score)`: score the dice as they stand and end the turn. */
+  score(seat: number, category: number, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+    return this.playerMove(seat, MOVE_SCORE, ZERO_BYTES32(), NO_MASK(), category, blockTime);
+  }
+
   /**
-   * One roll of the operator's move. The three steps must run in order; each asserts the
-   * `rollStep` it is the successor of, so a skipped or repeated step is refused on chain.
+   * One roll of the operator's move, for one seat. The three steps must run in order; each
+   * asserts the `stage` it is the successor of, so a skipped or repeated step is refused on
+   * chain. Six seats have six independent pipelines and may be interleaved freely.
    */
-  resolveRoll1(now: number, blockTime = now): Promise<TableDice> {
+  resolveRoll1(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<TableDice> {
     this.blockTime = blockTime;
     return this.run('resolveRoll1', (ctx) =>
-      this.table.impureCircuits.resolveRoll1(ctx, BigInt(now)),
+      this.table.impureCircuits.resolveRoll1(ctx, BigInt(seat)),
     );
   }
 
-  resolveRoll2(now: number, blockTime = now): Promise<TableDice> {
+  resolveRoll2(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<TableDice> {
     this.blockTime = blockTime;
     return this.run('resolveRoll2', (ctx) =>
-      this.table.impureCircuits.resolveRoll2(ctx, BigInt(now)),
+      this.table.impureCircuits.resolveRoll2(ctx, BigInt(seat)),
     );
   }
 
-  resolveRoll3(now: number, blockTime = now): Promise<TableDice> {
+  resolveRoll3(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<TableDice> {
     this.blockTime = blockTime;
     return this.run('resolveRoll3', (ctx) =>
-      this.table.impureCircuits.resolveRoll3(ctx, BigInt(now)),
+      this.table.impureCircuits.resolveRoll3(ctx, BigInt(seat)),
     );
   }
 
   /**
-   * The operator's whole move: all three rolls, in order, returning the turn's final dice.
+   * There is deliberately NO `resolveTurn` convenience here.
    *
-   * A convenience over the three circuits and NOT a circuit itself -- on chain these are three
-   * separate transactions (table.compact, decision 9). Kept because almost every test cares
-   * about the turn rather than about the split, and because a test that reads as
-   * `resolveTurn()` is a test that still describes the game.
-   *
-   * `now` is the declared time for all three steps. `BaseSimulator.run` commits state only on
-   * success, so a step that throws leaves the table exactly where the previous step left it --
-   * which is what lets the rejection tests below assert on step 1 without cleanup.
+   * Under pre-declared policies the operator's three rolls were one uninterrupted sequence, so
+   * wrapping them read as "the operator's move". With interactive holds the player's own
+   * transactions sit BETWEEN them -- open, roll 1, hold, roll 2, hold, roll 3, score -- and a
+   * helper that ran the three rolls back to back would describe a turn nobody can play. Turn
+   * sequencing lives in `GameDriver.playTurn`, where both parties' moves are visible in order.
    */
-  async resolveTurn(now: number, blockTime = now): Promise<TableDice> {
-    await this.resolveRoll1(now, blockTime);
-    await this.resolveRoll2(now, blockTime);
-    return await this.resolveRoll3(now, blockTime);
+
+  /** Advance the whole table one round. The second of the two circuits that declare a time. */
+  closeRound(now: number, blockTime = now): Promise<bigint> {
+    this.blockTime = blockTime;
+    return this.run('closeRound', (ctx) => this.table.impureCircuits.closeRound(ctx, BigInt(now)));
   }
 
-  /** `settle` needs no time: no deadline is involved and the outcome is already determined. */
+  /**
+   * Knock out a seat that let the round deadline pass. Declares no time -- `roundDeadline` is
+   * compared against real block time by the kernel.
+   */
+  eliminate(seat: number, q: bigint, rem: bigint, blockTime: number): Promise<bigint> {
+    this.blockTime = blockTime;
+    return this.run('eliminate', (ctx) =>
+      this.table.impureCircuits.eliminate(ctx, BigInt(seat), q, rem),
+    );
+  }
+
+  /** `settle` declares no time: the seed-waiver deadline is a kernel predicate. */
   settle(seed: Uint8Array, q: bigint, r: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.blockTime = blockTime;
     return this.run('settle', (ctx) => this.table.impureCircuits.settle(ctx, seed, q, r));
   }
 
-  claimTimeout(now: number, blockTime = now): Promise<bigint> {
+  /** Pay one seat what it is personally owed. Legal only once the table is terminal. */
+  redeem(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('claimTimeout', (ctx) =>
-      this.table.impureCircuits.claimTimeout(ctx, BigInt(now)),
-    );
+    return this.run('redeem', (ctx) => this.table.impureCircuits.redeem(ctx, BigInt(seat)));
   }
 
-  abortTable(now: number, blockTime = now): Promise<bigint> {
+  /**
+   * End a table that cannot finish. `q`/`rem` are the PER-SEAT rake on `tier`, required
+   * unconditionally even on the two paths that pay no rake.
+   */
+  abortTable(q: bigint, rem: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('abortTable', (ctx) => this.table.impureCircuits.abortTable(ctx, BigInt(now)));
+    return this.run('abortTable', (ctx) => this.table.impureCircuits.abortTable(ctx, q, rem));
   }
 }
 

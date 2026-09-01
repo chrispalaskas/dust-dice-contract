@@ -1,246 +1,297 @@
 # Table contract design
 
-One deployment per table. This document is the state-machine and randomness design; custody
-mechanics follow the Gate 0, Q1 verdict (see architecture.md).
+One deployment per table. This document is the state-machine and randomness design as **shipped**.
 
-## Who computes the dice — the two-step turn
+> **This document was rewritten.** It previously described the SEAT-CURSOR model with
+> PRE-DECLARED HOLD POLICIES, in which five players waited while one played and each turn's
+> rerolls were driven by one of six deterministic rules chosen before any dice existed. Both are
+> gone. The redesign that replaced the cursor is
+> [simultaneous-rounds.md](simultaneous-rounds.md), which is still the authoritative note on
+> _why_; interactive holds landed on top of it. What survived unchanged: the commit–reveal
+> randomness scheme, forced per-round entropy, native unshielded NIGHT custody, the
+> witness-checked rake, and the rule that every reachable state has a permissionless exit.
 
-The contract holds only `H(seed)`; no circuit can derive dice from a commitment, and the
-player must not know the seed. So a turn is a player step and an operator step, by two
-different parties (four transactions as built — see the amendment below):
+Companion documents:
 
-1. **`takeTurn` (player):** submits their per-round entropy (see below), a hold-policy choice,
-   and the scoring category **for their previous turn's dice** (pipelined — see next section).
-2. **`resolveRoll1` / `resolveRoll2` / `resolveRoll3` (operator):** supplies the seed as a
-   **witness** (private — never disclosed mid-game), each circuit asserts
-   `H(seed) == seedCommitment`, and between them they derive the three rolls with holds applied
-   per the declared policy and write the resulting dice into the turn log.
+- [table-interface.md](table-interface.md) — the exact circuit signatures and argument
+  encodings. **If you are writing a client, read that, not this.**
+- [table-circuit.md](table-circuit.md) §0 — measured k, instruction counts, key sizes.
+- [simultaneous-rounds.md](simultaneous-rounds.md) — why the round model looks like this.
+- [concurrency-probe.md](concurrency-probe.md) — the measured platform behaviour it rests on.
 
-This is the one place ZK genuinely works in the base game: the dice are _proven_ correct
-against the seed commitment without revealing the seed while the game is live.
+---
 
-> **Amendment, after the E2E run** ([e2e-report.md](e2e-report.md)). The operator's move was
-> designed as ONE transaction, `resolveTurn`, and is built as **three**. The one-circuit version
-> compiles to a PLONK domain of k=17 and the proof server bundles only k=9..15, so it could
-> never have produced a transaction. The cut is one roll per transaction, which the existing
-> measurements already forced: one roll is k=15, two are k=16. The dice, the digest chain and the
-> settlement verifier are **unchanged** — the same three roll hashes in the same order under the
-> same latched mask. What changes is throughput (a turn is four transactions, not two) and that
-> the intermediate hands are public, which is exploitable by nobody because the only player
-> choice in a turn is made in `takeTurn`, before any roll exists. Full rationale in
-> `table.compact`, decision 9.
+## The shape of a game
 
-The player experiences 13–14 wallet prompts per game; the operator automates three resolves per
-turn from its own wallet (strictly sequential — one wallet per process).
+Thirteen rounds, numbered 0..12, one scoring category each. **Every seat plays every round
+independently**; the round advances when all of them have finished. There is no turn cursor and
+no waiting.
 
-## Pipelined category choice — keep the skill
+Within a round, a seat's turn is:
 
-Pre-declaring the category before seeing the dice (naive shape (a)) costs too much skill
-expression. Instead, `takeTurn` k carries:
+1. **open** — the player proves knowledge of their seat secret and declares this round's forced
+   entropy.
+2. **roll 1** — the operator derives five dice, proving them against a seed commitment made
+   before any player existed.
+3. **hold** — the player names the dice to keep, having seen them.
+4. **roll 2** — the operator rerolls the rest.
+5. **hold**, **roll 3** — again.
+6. **score** — the player takes a category.
 
-- the **category choice for turn k−1's dice** (which the player has seen — they were resolved
-  on-chain), and
-- the **entropy + hold policy for turn k**.
+**The player may score at any point after a roll has resolved**, skipping the remaining holds and
+rolls. That is a full three-roll turn at 4 player + 3 operator transactions, and a stop-after-roll-1
+turn at 2 + 1. The arithmetic is in [table-interface.md](table-interface.md) §9.
 
-Concretely: `takeTurn` for round r carries the category for round r−1 (omitted at r=0) and
-the entropy + hold policy for round r (omitted in the final score-only round 13). Per seat:
-14 `takeTurn`s, 13 resolves. Category choice — the dominant skill decision in Yahtzee —
-stays fully manual; holds are policy-driven and latched from roll 1.
+### Why the category is no longer pipelined
 
-**Hold-policy set, as built and measured** (docs/table-circuit.md): all six policies from
-api/src/policies.ts shipped — Stand, RerollAll, KeepModal, KeepFace(1–6), ChaseStraight,
-KeepPairsPlus — encoding mirrored exactly. Modal-face cannot be _computed_ in-circuit
-(compiler defect #1: re-reads × DAG size), so KeepModal is witness-checked: the operator
-witnesses the modal face `m`, the circuit verifies canonical-modality via counts, the mask
-is `die == m` — proven equivalent to the reference over all 252 sorted hands. Whole-hand
-count-based masks (ChaseStraight, KeepPairsPlus) compile fine: fan-in alone was never the
-trigger, fan-in × re-reads is.
+The cursor model made `takeTurn` at round _r_ score the dice resolved at round _r−1_, and it
+bought a fourteenth score-only round plus two sentinel cases at the ends. That existed for a
+compiler reason, not a game reason: a circuit that both derived dice and scored them could not be
+compiled at all ([bugs-found.md #1](bugs-found.md) — cost is re-reads × DAG size, and a merged die
+read forty times by `applyScore` never terminates).
 
-**Residual, stated honestly (policy grinding):** entropy is forced, but the policy is a free
-per-turn choice made after the digest is public — so a _seed-knowing_ player can preview all
-eleven legal policy choices and pick the best. Bounded (best-of-11, not best-of-2^256),
-inherent to any design that preserves turn-time choice, and it requires the seed — i.e. it
-falls under the existing "operator must not play / collude" assumption. Documented in
-table.compact's header.
+An interactive turn already splits derivation from scoring across transactions: a resolve writes
+the dice to the ledger and `playerMove(score)` reads them back as a ledger **leaf**. So the
+constraint is satisfied without the pipeline, and a seat scores the dice it just rolled. Thirteen
+rounds, no sentinels, no round without a category.
 
-## Randomness: commit–reveal hardened against operator–player collusion
+### Why the holds are interactive
 
-Base scheme: operator commits `H("seed", tableId, seed)` at table open, before any player
-exists. `tableId` is inside the commitment (a post-review fix — see
-[security-review.md](security-review.md) §2's High): `settle` publishes the seed by design, so
-without the binding a seed accidentally reused at two tables would carry one commitment for both
-and the first table's reveal would hand any observer the second, still-live table's entire future
-randomness. The seat's join-time key commitment is bound the same way, `C_s = H("entkey",
-tableId, sk_s)`, which closes cross-table seat linkability for a client that reuses a secret.
+Pre-declaring the reroll rule cost the game its most-played decision. It also cost the contract a
+witnessed modal face and a canonical-modality check that existed purely because a 6-way argmax
+over face counts could not be computed in-circuit. All of that is deleted. A hold is five bits
+the player sends after looking at the dice.
 
-**The attack the naive scheme misses:** a player colluding with the operator knows the seed,
-and if players choose per-turn entropy freely, the colluding player grinds their entropy at
-turn time for perfect dice. Fixes, layered:
+The price is transactions — see the residual on collusion below, and the cost table in the
+interface note.
 
-1. **Entropy is non-grindable at turn time.** At `join`, each player registers
-   `C_s = H(tableId, sk_s)` for a fresh secret `sk_s`. Turn entropy is forced:
-   `entropy_s(r) = H(sk_s, tableId, r)`, proven in-circuit against `C_s` (sk is a witness,
-   entropy is disclosed). A player cannot pick their entropy per turn at all.
-2. **Entropy is non-grindable at join time.** Rolls also mix in a **running game digest**:
-   `gameDigest' = H(gameDigest, <event>)` updated by every `join` and every completed turn
-   (`resolveRoll3`).
-   As built, the digest is folded into the entropy one hash early
-   (`mixEntropy(entropy_s(r), gameDigest)` feeding the measured `RollContext`) rather than
-   widening the roll-hash input set — same security argument, keeps the measured dice
-   circuits and their cross-check corpus intact. Because seat
-   order = join order, every player's first roll digest includes joins that happened _after_
-   theirs (or, for late seats, earlier turns' resolutions), so no one — even knowing the
-   seed — can simulate their own future dice while still free to choose `sk_s`.
-   A cheater would need to control **every** seat at the table, at which point they are
-   playing themselves.
+---
+
+## Randomness: commit–reveal, hardened against operator–player collusion
+
+The operator commits `H("seed", tableId, seed)` at table open, before any player exists.
+`tableId` is inside the commitment: `settle` publishes the seed by design, so without the binding
+a seed accidentally reused at two tables would carry one commitment for both, and the first
+table's reveal would hand any observer the second, still-live table's entire future randomness.
+The seat's join-time key commitment is bound the same way, `C_s = H("entkey", tableId, sk_s)`,
+which closes cross-table seat linkability for a client that reuses a secret.
+
+**The attack the naive scheme misses:** a player colluding with the operator knows the seed, and
+if players choose per-turn entropy freely, they grind it for perfect dice. Fixes, layered:
+
+1. **Entropy is non-grindable at turn time.** At `join` each player registers `C_s`, and turn
+   entropy is forced: `entropy_s(r) = H(sk_s, tableId, r)`, proven in-circuit against `C_s` on
+   every `playerMove`. A player cannot pick their entropy at all.
+2. **Entropy is non-grindable at join time.** Rolls mix in a running digest that absorbs every
+   `join` and every completed round, so a player choosing `sk_s` at join time cannot know the
+   digest their later rolls will hash against.
 3. **The operator alone can never steer:** with the seed but no player's `sk`, every roll is
-   fully determined the moment the turn comes up; there is nothing left to choose.
+   fully determined the moment the round opens.
 
-**Residual, documented honestly:** a seed-knowing operator can _selectively withhold_
-resolution (griefing) when upcoming dice displease it. It cannot alter an outcome — only
-freeze the table, which the timeout path converts into a refund. The operator must not seat
-itself at tables it operates; the site says so, and anonymous seating (stretch) does not
-change this analysis.
+### The digest is frozen per round — a requirement, not a simplification
 
-**Verifiability:** `settle` takes the seed as a **public** argument (asserted against the
-commitment, disclosed on-chain). Anyone re-derives all rolls from the public log: joins,
-entropies, digests, seed. The browser "verify this game" panel and the CLI verifier both
-replay it with the same TS mirror of the dice ladder.
+This is the one thing simultaneous rounds _had_ to change. Under the cursor, resolves happened in
+fixed seat order and a running digest gave the operator no ordering discretion. With six seats
+live at once, transactions land in whatever order the chain picks — and a digest that kept
+folding results as they landed would let the operator choose that order for its own resolves,
+feeding every subsequent roll. That is exactly the influence the commit–reveal scheme exists to
+deny it.
 
-### Settlement past the table deadline — the seed check is waived
+So every seat in round _r_ derives its rolls from `roundDigest` **as it stood when round _r_
+opened**, and `closeRound` advances it once, at the boundary, folding the round's results **in
+seat order**:
 
-**The trap this closes.** A game that runs to completion lands in
-(`Playing`, `WaitPlayer`, `round >= 14`). `claimTimeout` refuses it (it requires `round < 14`),
-`abortTable` refuses it (`operatorStalled` requires `WaitResolve`), and `takeTurn` refuses it. So
-`settle` was the only exit and `settle` needed the operator's seed — an operator that vanished, or
-that simply lost its seed file, locked every stake **permanently**. That contradicted the design's
-own core invariant, that every reachable state has a permissionless exit. Found by the security
-review as its second Critical.
+```
+roundDigest' = H("yahtzee:v1:round", roundDigest, r, seatCount, [ {dice, out} × 6 ])
+```
 
-**The rule as built.** Once `blockTimeGt(lastActionAt + tableTimeoutSecs)` holds, `settle` no
-longer requires the supplied seed to open the commitment. Everything else is unchanged: the winner
-is still `winnerOfSeats` over the seats' public totals and finish times, the rake is still the
-unique `q*100 + r == pot, r < 100`, the payouts still go to the addresses recorded at `join`.
-Before the deadline the seed check is mandatory, exactly as before.
+All six slots are folded, seated or not. No participant's dice depend on who submitted first, and
+an offline verifier does not need to know the submission order at all.
 
-**Why that is sound.** Nothing about the payout ever depended on the seed. The winner is a function
-of public ledger state that was built up by circuits which each already proved their dice against
-the commitment as they ran. The seed reveal was never load-bearing for **soundness** — it is
-load-bearing for **verifiability**.
+**Every seat's dice stream is distinct because of `sk_s` and nothing else.** The roll context has
+no seat field; separation is entirely in the mixed entropy. `join` refuses a second seat for a
+`C_s` already registered, which is what makes that sound rather than merely likely.
 
-**What is lost, stated honestly.** A force-settled game is **unverifiable after the fact**.
-`revealedSeed` stays all-zero, and that zero is the marker: nobody — including the players — can
-re-derive the rolls from the log, and the verifier must report the game as _unverified_ rather than
-as _verification failed_. The dice were still proven correct one transaction at a time while the
-game was live; what is missing is the ability to re-check that offline, later, without trusting the
-chain's own verification. That is a real loss, and it is the right trade against losing the money.
+### The reroll consumes the fresh roll left to right
 
-**Why it pays the winner rather than refunding.** A refund would be strictly worse. An operator
-that had also seated a player — which the threat model forbids but the contract cannot detect —
-could watch that seat lose and then decline to settle, converting the loss into a refund. Paying
-the winner the game already produced removes every incentive to reach the timeout at all.
+If the player holds positions 0 and 3, the two dice they get back are `fresh[0]` and `fresh[1]`,
+not `fresh[1]` and `fresh[2]`. This closes a divergence the previous design documented and lived
+with: `api/src/policies.ts` always modelled rerolls as a left-to-right stream while the circuit
+merged positionally, and only one of the two could be the settlement verifier. They now agree.
+Cost: ten conditional selects, measured before being accepted because the resolve circuits sit at
+the SRS ceiling.
 
-Consumers must therefore treat `revealedSeed == 0` on a settled table as a meaningful state, never
-as "not settled yet". See [client-rules.md](client-rules.md) rule 4.
+### Residual, and it GREW
+
+A seed-knowing player with interactive holds can compute roll 2 and roll 3 for **all 32 hold
+masks** before choosing, and again after roll 2. That is an optimal decision under perfect
+information about the future, taken twice a turn, thirteen times a game — strictly stronger than
+the pre-declared design's best-of-eleven policy preview, whose "bounded" framing no longer
+applies and has been removed from the contract header.
+
+It still requires the seed, so it still falls under the assumption the design already relies on:
+**the operator must not seat itself at tables it operates, and must not leak the seed.** Under
+that assumption the exposure is zero. If it is violated, interactive holds make the violation
+worth substantially more, and the site's threat model should say so.
+
+The operator's own residual is unchanged: it can _selectively withhold_ resolution when upcoming
+dice displease it. It cannot alter an outcome, only freeze the table, which the timeout path
+converts into a refund.
 
 **Never** per-roll outcome commitments (N commitments can all open to the same value).
 
-## Ledger state (sketch — final layout follows circuit measurements)
+### Settlement past the table deadline — the seed check is waived
 
-- Constructor args: `tableId: Bytes<32>` (fresh random — `kernel.self()` is zeros in
-  constructors), `tier: Uint<64>`, `maxSeats: Uint<8>`, `rakeAddress`,
-  `seedCommitment: Bytes<32>`, timeout params `turnTimeoutSecs`, `tableTimeoutSecs`.
-- `phase: enum { Filling, Playing, Abandoned, Settled, Aborted }` — **Abandoned** is entered
-  when the last unforfeited seat forfeits: `settle` refuses it and `abortTable` refunds every
-  seat with nothing to rake. (Paying the last seat standing was rejected: it would make
-  _timing out last_ profitable.) A partial forfeit is deliberately asymmetric — the stake
-  stays in the pot and the forfeited seat still competes with what it scored.
-- `tier >= 100` is enforced at construction, so the 1% rake is never zero and no conditional
-  payment path exists in `settle`.
-- Per seat (≤6): player payout address, `C_s` entropy-key commitment, scorecard (13 packed
-  category scores + filled bitmap), `upperTotal`, `total`, `yahtzeeBonuses`,
-  `finishedAtTurn`, `forfeited: Boolean`
-- `currentSeat`, `round` (0–12), `turnIndex` (global), `pendingTurn` (entropy, policy,
-  awaiting-resolve flag, resolved dice of previous turn per seat)
-- `gameDigest: Bytes<32>`
-- `lastActionAt: Uint<64>` — **declared, not read**: the kernel exposes block-time
-  _predicates_ only, no accessor, so each state-advancing call declares `now` and the circuit
-  traps it in `(blockTime − timeSlackSecs(), blockTime]` plus monotonicity against the stored
-  value. Deadlines stay exact; predicates are strict and seconds-based with no tolerance widening.
-  `timeSlackSecs()` is **120 s** (it was 600) and the constructor refuses any `turnTimeoutSecs` or
-  `tableTimeoutSecs` that is not strictly greater than `timeSlackSecs() * 4` = **480 s**. Both
-  halves are a security fix, not tuning: on a hand-off transition (`takeTurn`, `resolveRoll3`,
-  `claimTimeout`) the deadline a caller stamps belongs to the **next** actor, so under-declaring is
-  free to the declarer and shrinks someone else's window. With a timeout comparable to the slack,
-  the victim's deadline is already expired when they receive the turn and a permissionless
-  `claimTimeout` forfeits them on the spot, cascading seat by seat. See
-  [security-review.md](security-review.md) §2's Critical.
-- `tier` is bounded **above** as well as below: `100 <= tier <= 10^15`. The upper bound keeps
-  `abortTable`'s `tier * seatCount` inside `Uint<64>`, so an overflow can never deny the refund
-  path while leaving `settle` working.
-- `join` refuses a zero `payoutTo`. Both terminal circuits pay the address recorded at join and
-  nothing else, so a seat that records zeros has staked into a burn.
-- Pot custody: **native unshielded NIGHT, proven by Gate 0** — `join` calls
-  `receiveUnshielded(nativeToken(), tier)` (the joining wallet consents by balancing);
-  `settle`/`abortTable` call `sendUnshielded` to the payout addresses **recorded at join**,
-  so no circuit ever needs to learn its caller and no external "who won" assertion exists —
-  `settle` computes the winner in-circuit and pays that seat's stored address.
-- Transaction-size floor: every circuit call must produce a ≥ ~8 KB transaction
-  (`OutsideTimeToDismiss` — gate0-report.md). Real turn circuits likely clear it; `join`
-  and `claimTimeout` may need fallible-phase padding writes. Verified per circuit in tests.
+A game that runs to completion lands in (`playing`, `openRound == 13`). Every other circuit
+refuses that state, so `settle` is the only exit — and an operator that vanished, or simply lost
+its seed file, would lock every stake permanently. Once
+`blockTimeGt(roundDeadline + tableTimeoutSecs)` holds, `settle` no longer requires the seed to
+open the commitment.
 
-## Exported circuits (8 — deploy ceiling is ~11 circuits, measured upstream)
+Sound because nothing about the payout ever depended on the seed: the winner is a function of
+public ledger state built up by circuits that each already proved their dice against the
+commitment as they ran. The seed reveal is load-bearing for **verifiability**, not soundness.
 
-| circuit        | caller   | does                                                                                                                                                                                                                                                 |
-| -------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `join`         | player   | stake in, register `C_s`, take next seat; last join flips to Playing and stamps `lastActionAt`                                                                                                                                                       |
-| `takeTurn`     | player   | score previous dice (category, joker rules), declare entropy `H(sk,tableId,r)` + policy for this turn; advances `lastActionAt`                                                                                                                       |
-| `resolveRoll1` | operator | witness seed; derive roll 1; check the witnessed modal face; latch the mixed entropy and the hold mask                                                                                                                                               |
-| `resolveRoll2` | operator | witness seed; reroll once under the latched mask                                                                                                                                                                                                     |
-| `resolveRoll3` | operator | witness seed; reroll again; write the turn's dice, update the digest, advance the turn pointer                                                                                                                                                       |
-| `settle`       | anyone   | all seats finished/forfeited; seed disclosed + checked (check **waived** past `tableTimeoutSecs`, leaving `revealedSeed` zero — see above); winner via tie-break; pay winner (pot − q) and rake (q) with witness-checked `q*100 + r == pot, r < 100` |
-| `claimTimeout` | anyone   | only while waiting on a **player** (`WaitPlayer`): `blockTimeGt(lastActionAt + turnTimeoutSecs)` forfeits the stalled seat (remaining categories score 0, stake stays in the pot), advance turn                                                      |
-| `abortTable`   | anyone   | `blockTimeGt(lastActionAt + tableTimeoutSecs)` while waiting on the **operator** (`WaitResolve`) or while `Filling` never completed: refund `tier` to every seated player, nothing to rake                                                           |
+What is lost, plainly: a force-settled game is **unverifiable after the fact**. `revealedSeed`
+stays all-zero, and that zero is the marker — the verifier must report the game as _unverified_,
+never as _verification failed_. Consumers must treat `revealedSeed == 0` on a settled table as a
+meaningful state, never as "not settled yet".
 
-Authorisation is structural, not address-based: each `resolveRoll`'s authority is knowledge of
-the seed (only the operator has it), re-checked at every step because every step derives a roll
-from it; `takeTurn`'s is knowledge of the seat's `sk_s`;
-`settle`/`claimTimeout`/`abortTable` are permissionless because their outcomes are fully
-determined by on-chain state. No circuit ever needs the caller's address.
+It pays the winner rather than refunding because a refund would be strictly worse: an operator
+that had also seated a player could watch that seat lose and decline to settle, converting the
+loss into a refund.
 
-Turn sub-state: `WaitPlayer(currentSeat)` → takeTurn → `WaitResolve` → resolveRoll1 →
-resolveRoll2 → resolveRoll3 → advance (skip forfeited seats; bounded scan over ≤6). The three
-resolve steps are sequenced by a `rollStep` counter, each asserting the value it is the successor
-of, so the operator cannot skip, repeat or reorder a roll. A stall at any of the three is still
-`WaitResolve`, so `abortTable` covers them all without a new case — tested at all three stop
-points. One consequence of the split is worth writing down: **every one of the three steps stamps
-`lastActionAt`**, so an operator that takes each step at the last legal second holds a table for
-roughly `3 × tableTimeoutSecs`. That is correct (each step is a genuine state advance) but it means
-the parameter bounds one step's silence, not one turn's, and an operator SLA has to be written
-against that. No division anywhere: `currentSeat`
-and `round` advance incrementally, never derived from `turnIndex`.
+---
 
-Timeout deadlines use the sandwich discipline from the field notes: the claim is a
-refund/forfeit, never compensation, so a tight deadline can't be farmed.
+## Elimination is economic, not absolute
 
-Scoring in-circuit: the 13-category mux over 5 dice, upper bonus at 63, Yahtzee bonus.
-Whether the full forced-joker placement rule fits the circuit budget is decided with
-measurements; if it must simplify (extra Yahtzee = +100 + any open category at full joker
-value, no forced placement), the TS rules engine and the site rules text change with it —
-the two must never diverge.
+A seat that lets the round deadline pass while owing a move is eliminated by anyone, permanently.
+
+- **Penalty `stake × (r + 1) / 13`**, where `r` is the contract's 0-based round. A thirteenth for
+  a seat that never played at all, the whole stake for one that quits in the last round. The
+  forfeited share **stays in the pot** and goes to the winner; the rest becomes the seat's
+  `redeemable` and leaves the pot, so the winner can never be paid an eliminated player's refund.
+  Compact has no division, so the split is a witness-and-assert Euclidean identity with exactly
+  one solution.
+- **Eliminated seats cannot win.** They have already been handed back `tier − penalty`; letting
+  one also take the pot would pay it twice. This is a change from the cursor model, where a
+  forfeited seat still competed with what it had scored.
+- **Only the player's silence counts.** A turn has seven sub-states; the even ones are the
+  player's to discharge and the odd ones the operator's. `eliminate` covers all four even
+  states — never opened, and abandoned after each of the three rolls — and refuses all three odd
+  ones. Punishing a player for the operator's failure to resolve would punish the wrong party;
+  `abortTable` is the remedy for that, and it refunds everyone.
+- **All seats eliminated ⇒ penalties waived.** Penalties exist to compensate the players who kept
+  playing; when nobody did there is nobody to compensate. Every seat redeems its full stake less
+  the 1% rake — and the rake **is** still paid, because the operator did its work regardless.
+  Applied by a single permissionless `abortTable` call, which is why `abandoned` is a _pending_
+  terminal state rather than a redeemable one.
+
+---
+
+## Custody
+
+```
+contract balance  ==  pot  +  SUM(seatRedeemable)
+```
+
+`pot` is the winner's; `seatRedeemable[s]` is seat `s`'s personally and is paid only by `redeem`,
+only to the address recorded at `join`. Keeping the two apart is what makes an eliminated
+player's money impossible to award to the winner by accident. Asserted in-circuit by `settle`
+and `abortTable`, which are the two circuits that zero the pot, and by `eliminate`, which is the
+one that moves money between them.
+
+**`redeem` is refused while the table is live.** Nothing is paid out mid-game, so decision 1's
+waiver can be applied uniformly at the end with no claw-back and no top-up. The cost is latency
+for an eliminated player; accepted deliberately, because the alternative needs per-seat withdrawal
+history and delta payments — more state and more ways to get custody wrong, for money that is not
+at risk either way.
+
+`abortTable` **pays nobody directly**: it converts the pot into per-seat refunds and leaves the
+sending to `redeem`. One payout path instead of two, and no risk of sending to a pre-inserted
+zero address.
+
+The contract never asserts its own token balance. `unshieldedBalance(nativeToken())` returns 0
+under compact-runtime 0.19.0 whatever `receiveUnshielded` was handed
+([bugs-found.md #11](bugs-found.md)), so custody is tracked by the contract's own bookkeeping and
+the ledger-vs-bookkeeping cross-check moves to the E2E devnet run.
+
+---
+
+## Concurrency
+
+The constraint that shapes the whole state layout, and it is measured rather than assumed
+([concurrency-probe.md](concurrency-probe.md), 96 real transactions):
+
+- Binding is **per-read**. A transaction is rejected only if a ledger value its transcript
+  actually _read_ has changed since it was proved.
+- **A `Map.lookup` binds exactly as a scalar read does.** Per-seat storage is necessary but not
+  sufficient — a circuit that writes one seat but reads all six collides with all six.
+- Two transactions writing the **same** map key both land, last-write-wins, silently. So a seat's
+  entries are only ever written by a transaction that proved knowledge of that seat's `sk_s`.
+
+**The rule: a player's move writes only its own seat's entries and read-modify-writes no shared
+scalar.** It reads `phase`, `openRound`, `seatCount` and `tableId` — all sealed or frozen for the
+duration of a round — plus its own four map entries. `stampTime()`'s shared `lastActionAt`, which
+seven of the eight old circuits wrote, is gone; the per-round `roundDeadline`, written once by
+`closeRound`, replaces it. Only `join` and `closeRound` declare a time at all.
+
+This is checked **mechanically against the compiled transcript** on every test run
+(`contract/src/test/ledger-access.ts`), not asserted in prose — a simulator runs one circuit at a
+time and can never observe a conflict.
+
+`pot` and `activeSeats` are the only shared accumulators, both written by `eliminate` only. Two
+concurrent eliminations conflict and one retries, which is correct and off the player's path.
+
+---
+
+## Timeouts, and the exit from every state
+
+Deadlines are exact: `blockTimeGt(stored)` is evaluated by the kernel against real block time.
+Only the two circuits that _stamp_ a deadline are told the time, and they pin the claim between
+`blockTimeGte(now)` and `blockTimeLt(now + 120)`.
+
+`closeRound` stamps the deadline the **next** round's players are judged against, and it is
+permissionless, so a hostile caller can shave up to the slack off everyone's window for free.
+That is [security-review.md](security-review.md)'s Critical C1, closed the same way as before:
+the slack is 120 s and the constructor refuses any timeout not strictly greater than
+`120 × 4 = 480 s`, so the most a hostile declarer can take is a quarter of the window. The
+attack surface shrank from seven circuits to two.
+
+`turnTimeoutSecs` covers a **whole round**, not a move — up to four player transactions and three
+operator ones per seat. An operator SLA has to be written against that.
+
+| state                                    | permissionless exit                                  |
+| ---------------------------------------- | ---------------------------------------------------- |
+| filling, never fills                     | `abortTable` past `roundDeadline`                    |
+| playing, a seat owes a move              | `eliminate` past `roundDeadline`, then `closeRound`  |
+| playing, every seat has finished a round | `closeRound` — not gated by any deadline             |
+| playing, a seat awaits the operator      | `abortTable` past `roundDeadline + tableTimeoutSecs` |
+| abandoned (all eliminated)               | `abortTable`, no waiting                             |
+| playing, `openRound == 13`               | `settle`, with the seed waived past the deadline     |
+| settled / aborted                        | `redeem`, per seat                                   |
+
+**`abortTable` while playing requires some seat to be waiting on the operator**, and that
+condition is load-bearing rather than decoration. Without it a losing player could stop playing,
+let both deadlines pass and abort the game into a full refund. With it, a table where every
+seat's next move is its own has only `eliminate` and `closeRound` as exits — both permissionless
+and both available a whole table-timeout earlier — so the stall is answered by the remedy that
+costs the staller a penalty, not by the one that gives them their money back.
+
+---
 
 ## Operator service consequences
 
-- The seed is the thing whose loss costs a table its verifiability: persisted to disk at commit
-  time, before the table opens, keyed by table address. Since the deadline-bypass fix its loss is
-  survivable rather than fatal — the table can still be force-settled and the winner still paid —
-  but the game becomes unreplayable, so the persistence discipline stands unchanged.
-- Fresh `seed` and fresh `tableId` per table, both from a CSRNG. `tableId` is a domain separator on
-  every roll hash, so a reused id replays another table's dice; the contract cannot generate it for
-  itself because `kernel.self()` is zeros in a constructor.
-- Timeout parameters must clear the constructor's floor of `timeSlackSecs() * 4` = 480 s. Full
-  client and operator obligations are in [client-rules.md](client-rules.md).
-- One wallet per daemon; resolves strictly sequential — and there are now three per turn, so an
-  operator serves ~3× the transaction rate the original design assumed.
-- The operator never holds discretion over an outcome — resolves are mechanical, timeouts are
-  permissionless (anyone can call), and settlement is verifiable by anyone.
+- The seed is persisted to disk at commit time, before the table opens, keyed by table address.
+  Since the deadline-bypass fix its loss is survivable rather than fatal, but the game becomes
+  unreplayable, so the discipline stands.
+- Fresh `seed` and fresh `tableId` per table, both from a CSRNG. `tableId` is a domain separator
+  on every roll hash; the contract cannot generate it because `kernel.self()` is zeros in a
+  constructor.
+- **The operator is now the bottleneck, and more so than before.** Player transactions are
+  parallel across seats; the operator's are not — one wallet's spends must be sequential. At six
+  seats it submits up to 18 resolves per round. An operator that wants the full width of
+  simultaneous rounds needs a pool of wallets, one per seat.
+- The operator never holds discretion over an outcome: resolves are mechanical, the seat it
+  resolves first changes nobody's dice, timeouts are permissionless, and settlement is verifiable
+  by anyone.
