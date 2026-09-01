@@ -484,17 +484,32 @@ export ledger seatProgress: Map<Uint<8>, SeatProgress>;
 export ledger joinedKeys: Set<Bytes<32>>;
 
 /** Sink for the transaction padding, so the compiler cannot drop it. See decision 8. */
-export ledger padStore: Bytes<2048>;
+export ledger padStore: Bytes<4096>;
 
 /**
- * The 2 KB of transaction padding, as a COMPILE-TIME CONSTANT. See decision 8.
+ * The 4 KB of transaction padding, as a COMPILE-TIME CONSTANT. See decision 8.
  *
  * The width appears twice -- here and in `padStore`'s type -- and language 0.26 has no way to
  * write it once, because `pad`'s length argument must be a literal. Keep the two in step by
  * hand; a mismatch is a compile error, not a silent shrink.
+ *
+ * RAISED FROM 2 KB after a real rejection, not a measurement: with 2 KB the operator's
+ * `claimTimeout` was refused by the node with `OutsideTimeToDismiss` (client error 231) on a
+ * live table, even though the E2E run had measured every circuit clearing the floor. Nothing
+ * about the circuit changed -- a transaction's size also depends on how many UTXOs the paying
+ * wallet contributes, so the same call is smaller from a wallet holding fewer, larger notes.
+ * `claimTimeout` is the leanest circuit here (k=11, the smallest proof), so it is the first to
+ * fall under the floor when that varies, and it is also the worst one to lose: it is a
+ * permissionless timeout path, and a timeout that cannot be admitted is how a pot gets trapped.
+ * The margin is now large enough that wallet-shape variation cannot cross it.
+ *
+ * Padding can only ever help admission: it is written after `kernel.checkpoint()`, so it adds to
+ * the size the allowance is computed from (`max(15ms, 0.002ms/byte)`) while landing in the
+ * fallible cost that `time_to_dismiss` never sums. Bigger is strictly safer, bounded only by
+ * the 1 MiB transaction limit and the fee.
  */
-pure circuit paddingConstant(): Bytes<2048> {
-  return pad(2048, "yahtzee:v1:pad");
+pure circuit paddingConstant(): Bytes<4096> {
+  return pad(4096, "yahtzee:v1:pad");
 }
 
 // ===========================================================================================

@@ -68,10 +68,10 @@ export ledger openedCount: Map<Uint<8>, Uint<32>>;
 export ledger closedCount: Map<Uint<8>, Uint<32>>;
 
 /** Sink for the transaction padding. Same lever as `table.compact`; see its decision 8. */
-export ledger padStore: Bytes<2048>;
+export ledger padStore: Bytes<4096>;
 
 /**
- * 2 KB of public padding, written after `kernel.checkpoint()` so it grows bytes, not cost.
+ * 4 KB of public padding, written after `kernel.checkpoint()` so it grows bytes, not cost.
  *
  * A COMPILE-TIME CONSTANT rather than a circuit argument, for the reason `table.compact`'s
  * decision 8 sets out: an argument costs two public inputs per 32-byte word and buys nothing,
@@ -79,8 +79,8 @@ export ledger padStore: Bytes<2048>;
  * the transcript -- and in the transaction's byte count -- for free. The width appears twice,
  * here and in `padStore`'s type; keep them in step by hand.
  */
-pure circuit paddingConstant(): Bytes<2048> {
-  return pad(2048, "yahtzee:v1:pad");
+pure circuit paddingConstant(): Bytes<4096> {
+  return pad(4096, "yahtzee:v1:pad");
 }
 
 /** The operator's key. Never disclosed; only the equality against the commitment is. */
