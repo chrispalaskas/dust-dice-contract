@@ -151,19 +151,15 @@ no division: the caller supplies `q` and `rem` with `q * 13 + rem == stake * r` 
 `q` is the penalty, `stake - q` becomes the seat's `redeemable`, and `pot` is reduced by
 `stake - q` so the winner can never be paid an eliminated player's refund.
 
-## Open question: when may an eliminated player redeem?
+## When may an eliminated player redeem? — decided: only once the table finishes
 
-Two options, and this is the one thing still worth deciding before implementation.
+`redeem` is refused while the table is live and allowed once it reaches a terminal phase
+(settled, aborted, or all-eliminated). Nothing is paid out mid-game, so decision 1's waiver can
+be applied uniformly at the end with no claw-back and no top-up, and the custody invariant stays
+a single line: balance == pot + Σ redeemable, with `settle` paying only from `pot` and `redeem`
+only from a seat's own `redeemable`.
 
-**A. Only once the table reaches a terminal phase.** Simple and safe: nothing has been paid out
-while the game is live, so decision 1's waiver ("penalties waived, everyone redeems in full") can
-be applied uniformly at the end without having to claw back or top up anyone. The cost is that a
-player eliminated in round 2 waits for the game to finish before seeing their money.
-
-**B. Immediately on elimination.** Better for the player, but decision 1 then has to reconcile
-with money already out the door: a seat that redeemed a penalised remainder in round 2 is owed a
-top-up if the table later ends all-eliminated. That means tracking what each seat has already
-withdrawn and paying deltas — more state, more paths, more ways to get custody wrong.
-
-**Recommendation: A.** The simplicity is worth more than the latency, and it keeps the custody
-invariant to a single line. Revisit if playtesting says otherwise.
+The cost is latency for the eliminated player: someone knocked out in round 2 waits for the game
+to end before withdrawing. Accepted deliberately — the alternative needs per-seat withdrawal
+history and delta payments, which is more state and more ways to get custody wrong, for money
+that is not at risk either way.
