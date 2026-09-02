@@ -817,6 +817,16 @@ fund and register wallets **CLI-side at 10,000,000 NIGHT via `mint-moth-wallet.t
 spend, and import the seed into the browser wallet** — never register from the wallet UI, and
 treat any first-spend-after-registration failure as a wedged chain (wipe, do not retry).
 
+**Fourth occurrence (2026-09-02 15:52, and the size theory is dead).** A chain that had been
+healthy for ~90 minutes wedged the moment a **10,000,000-NIGHT** registration landed — the same
+size as every previously successful registration. The distinguishing variable this time: the
+UTXO had been funded **39 minutes earlier** (by a provisioning run that hung between funding and
+registering). Every registration known to have succeeded on this stack registered its coin
+within seconds of the funding transfer; the failures now include 300k/22s, 1M/~60s and
+10M/39min, so neither size nor delay alone explains it — but "fund, then register immediately"
+remains the only pattern with zero failures, and this project's provisioning now does exactly
+that (service/src/chain.ts `provisionLane` registers as soon as the funding is visible).
+
 **Workaround — worked-around.** Only a fresh chain clears it, which §0 #8/#22 already said and
 this confirms with a clean before/after: an identical deploy from an identical wallet succeeded
 on the **first attempt** on a newly started node with the same image and the same code.
