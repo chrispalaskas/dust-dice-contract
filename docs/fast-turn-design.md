@@ -114,10 +114,23 @@ bumpShared` — three calls, one `withContractScopedTransaction`, ONE submitted 
   not the ledger. The settlement shape (`resolveRoll1, playerMove, resolveReroll, playerMove,
 resolveReroll, playerMove`) alternates entry points and never hits it.
 
-Remaining open before implementation: the TWO-IDENTITY assembly (player's 4 proofs + the
-operator's 3 in one intent — the probe used one wallet and one private state; the settlement
-needs `createUnprovenCallTx` + manual threading or cooperative intent assembly), the fast-open
-flag's k budget in `playerMove` (14 of 15), and fast-mode deadline semantics.
+**TWO-IDENTITY ASSEMBLY: settled by execution (probe part 2, experiments 4-8).** All the
+mechanics the cooperative settlement needs are proven on ledger-9.1:
+
+- two wallets' calls merged into ONE transaction with ONE balancer paying for both (exp 4);
+- a call built by one party against the PREDICTED output state of another party's call — the
+  exact pre-proving a settlement requires (exp 7);
+- DETERMINISTIC ordering via explicit intent segment ids (exp 7: 3/3; exp 8's reversed
+  segments rejected on cue). The SDK's default is `fromPartsRandomized` — random segments,
+  random execution order, the root cause of every earlier flake (bugs-found #18) — so the
+  settlement assembler re-keys each part's intent to segments 1..6 in transcript order before
+  merging.
+
+So the settlement recipe is: player pre-proves each move against the predicted state during
+the off-chain ping-pong and ships the unproven-call parts; the operator builds its resolves,
+re-keys everything to explicit ascending segments, merges, balances (operator pays the fee),
+and submits ONE transaction. Remaining before implementation: the fast-open flag's k budget in
+`playerMove` (14 of 15) and fast-mode deadline semantics (both sketched above).
 
 ## What an implementation must build
 

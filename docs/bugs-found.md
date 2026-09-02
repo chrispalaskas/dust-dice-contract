@@ -827,6 +827,19 @@ within seconds of the funding transfer; the failures now include 300k/22s, 1M/~6
 remains the only pattern with zero failures, and this project's provisioning now does exactly
 that (service/src/chain.ts `provisionLane` registers as soon as the funding is visible).
 
+**Fifth occurrence (2026-09-02 21:08, probe chain — the recipe sharpens).** A wallet funded
+with 10,000,000 NIGHT whose registration landed **~35 minutes later** (the provisioning run was
+killed in between) wedged the chain within seconds of the registration, identically to the
+fourth occurrence's 39-minute gap. The tally across every occurrence with known parameters:
+registrations of a 10M-NIGHT coin submitted immediately (seconds) after the funding transfer
+have succeeded every time (~10 runs); every deviation observed — 300k/22s, 1M/~60s, 10M/39min,
+10M/35min — wedged its chain. The operational recipe is therefore exactly: **fund 10M, register
+the moment the coin is visible, and treat a provisioning flow that was interrupted between the
+two steps as radioactive — top up if needed and expect the registration to kill the chain.**
+Self-healing provisioning that re-verifies balances on a cache hit (probes/concurrency
+`ensureActor`, service `provisionLane`) narrows the window but cannot remove the underlying
+defect.
+
 **Workaround — worked-around.** Only a fresh chain clears it, which §0 #8/#22 already said and
 this confirms with a clean before/after: an identical deploy from an identical wallet succeeded
 on the **first attempt** on a newly started node with the same image and the same code.
@@ -968,3 +981,47 @@ the RPC error detail) carries `Custom error: 104`.
 same-circuit calls in one `withContractScopedTransaction` scope; expected either a working
 transaction or a client-side error naming the limitation, not a node rejection of an
 SDK-built transcript.
+
+## 18. midnight-js 5.0.0-beta.7: every call transaction gets a RANDOM segment id, so multi-call composition executes in random order — **worked-around**
+
+**Symptom.** Multi-call transactions built by the SDK — `withContractScopedTransaction`, or
+manual `Transaction.merge` of single-call transactions — succeed or fail **at random** when the
+calls are order-dependent. The same code produced two successes on one chain and three
+rejections on the next (`Transcript(Execution(ReadMismatch))`, or error 104 via the scoped
+path). Order-independent compositions (blind writes) always land, which is what makes the
+nondeterminism look like anything but what it is.
+
+**Root cause, found in source and confirmed by execution.** `createUnprovenLedgerCallTx`
+(midnight-js-contracts) assembles every call transaction with `Transaction.fromPartsRandomized`
+— documented as "randomizing the segment ID to better allow merging". A transaction's intents
+execute in **ascending segment order**, so a merged transaction's cross-call state threading
+holds or breaks by lottery over random segment ids in 1..65535. The two "successes" recorded
+under the ledger-9.1 composition probe's first runs were lucky draws.
+
+**Workaround — worked-around, and it is fully load-bearing for the fast turn.** Re-key each
+part's single intent to an explicit segment before merging:
+
+```ts
+const tx = part.private.unprovenTx; // one intent per single-call tx
+const [, intent] = [...tx.intents.entries()][0];
+tx.intents = new Map([[desiredSegment, intent]]);
+```
+
+Probed on ledger-9.1 (probes/concurrency `npm run compose2`, experiments 7/8): with explicit
+segments 1 and 2, a cross-party read-modify-write chain — alice's call built against live
+state, bob's built against the PREDICTED post-alice state, merged, bob balancing and paying —
+landed **3 of 3 times** (txs `8d8080b1…`, `23b3c1df…`, `5558f70c…`); with the segments
+reversed it was rejected deterministically. Ordering is entirely the assembler's once segments
+are explicit.
+
+**Relation to #17.** The random ordering explains the nondeterminism observed there and in
+every order-dependent composition since. Whether ADJACENT identical entry points additionally
+carry a distinct defect (error 104, `TransactionInvalid(Transcript)`, rather than the plain
+ReadMismatch seen for wrong-order distinct calls) remains open; explicit segmenting sidesteps
+both.
+
+**Intended upstream action.** Issue against `midnight-js`: `withContractScopedTransaction`
+composes order-dependent calls whose execution order it does not control, so the feature's
+output is randomly invalid; either thread scoped calls into ONE intent's ordered action array,
+assign ascending segments explicitly, or expose the `SegmentSpecifier` the ledger already
+defines (`{ tag: 'specific', value: n }`) through the call-transaction APIs.
