@@ -133,7 +133,8 @@ export function assertFieldMapIsComplete(): void {
       );
     }
   };
-  expect('0,7', 'phase');
+  // `fastMode` (0,7) slotted in before it; the ADT block and its anchors did not move.
+  expect('0,8', 'phase');
   expect('1,6', 'finalDigest');
   expect('1,14', 'padStore');
 }

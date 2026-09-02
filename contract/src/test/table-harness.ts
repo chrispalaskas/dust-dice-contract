@@ -154,6 +154,8 @@ export type TableOptions = {
   turnTimeoutSecs?: bigint;
   tableTimeoutSecs?: bigint;
   rakeAddress?: UserAddress;
+  /** Deploy the table in fast mode (defaults to the on-chain interactive mode). */
+  fastMode?: boolean;
 };
 
 export function tableConfig(opts: TableOptions): TableConfig {
@@ -174,6 +176,7 @@ export function tableConfig(opts: TableOptions): TableConfig {
     // test.
     turnTimeoutSecs: opts.turnTimeoutSecs ?? 3_600n,
     tableTimeoutSecs: opts.tableTimeoutSecs ?? 7_200n,
+    fastMode: opts.fastMode ?? false,
   };
 }
 

@@ -551,6 +551,30 @@ export sealed ledger turnTimeoutSecs: Uint<64>;
  */
 export sealed ledger tableTimeoutSecs: Uint<64>;
 
+/**
+ * The table's play mode, fixed at deploy and consented to by joining (docs/fast-turn-design.md).
+ *
+ * `false` — every roll on-chain: holds and resolves are individual transactions, so the
+ * no-lookahead ORDERING (each hold committed before the next roll was revealed) is proven to
+ * anyone by block order.
+ *
+ * `true` — the fast table: the turn's interaction happens off-chain against the operator (who
+ * reveals each roll only after holding the player's signed, pre-proven move) and lands as ONE
+ * composed settlement transaction of these same circuits. The dice remain exactly as verifiable
+ * (they are deterministic in the revealed seed); what becomes operator-ATTESTED rather than
+ * chain-proven is the ordering. Between transactions a fast seat only ever rests at stage 0 or
+ * stage 1 — the intermediate stages exist solely inside the settlement — which is why no
+ * circuit needs to police the interactive path shut: there is no on-chain state for a defecting
+ * hold to bind to, provided the operator never resolves a fast seat outside a settlement (its
+ * published policy; an operator that breaks it is the colluding operator the threat model
+ * already excludes, since it holds the seed).
+ *
+ * The one circuit that reads this is `eliminate`: on a fast table the stage-parity rule is
+ * waived, because "odd stage = the operator's silence" is only meaningful when resolves are
+ * on-chain obligations.
+ */
+export sealed ledger fastMode: Boolean;
+
 export ledger phase: Phase;
 
 /** Seats taken so far. Also the next seat index while `filling`. */
@@ -1111,6 +1135,7 @@ constructor(id: Bytes<32>,
             seedCommit: Bytes<32>,
             turnTimeout: Uint<64>,
             tableTimeout: Uint<64>,
+            fast: Boolean,
             ) {
   assert(seats >= 2, "a table needs at least 2 seats");
   assert(seats <= maxSeats(), "a table holds at most 6 seats");
@@ -1137,6 +1162,7 @@ constructor(id: Bytes<32>,
   seedCommitment = disclose(seedCommit);
   turnTimeoutSecs = disclose(turnTimeout);
   tableTimeoutSecs = disclose(tableTimeout);
+  fastMode = disclose(fast);
 
   phase = Phase.filling;
   roundDigest = genesisDigest(disclose(id));
@@ -1824,7 +1850,12 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
   assert(vol || prog.round == r, "eliminate: this seat has already played the open round");
 
   const pend = seatTurn.lookup(s);
-  assert(vol || playerOwes(pend.stage),
+  // On a FAST table the stage-parity shield is waived: resolves are off-chain there, so a seat
+  // parked at stage 1 past the deadline is a stalled fast turn, not an operator debt -- and
+  // between transactions a fast seat can rest at no other odd stage. On-chain-mode tables keep
+  // the rule exactly: an odd stage is the operator's silence and eliminating it would punish
+  // the wrong party.
+  assert(vol || fastMode || playerOwes(pend.stage),
          "eliminate: this seat is waiting on the operator, not the other way round"
          );
 

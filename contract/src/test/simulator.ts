@@ -446,6 +446,8 @@ export type TableConfig = {
   seedCommitment: Uint8Array;
   turnTimeoutSecs: bigint;
   tableTimeoutSecs: bigint;
+  /** The table's play mode (docs/fast-turn-design.md): false = every roll on-chain. */
+  fastMode: boolean;
 };
 
 /**
@@ -492,6 +494,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         config.seedCommitment,
         config.turnTimeoutSecs,
         config.tableTimeoutSecs,
+        config.fastMode,
       ),
     );
     return sim;

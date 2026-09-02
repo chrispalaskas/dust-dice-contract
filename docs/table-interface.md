@@ -15,7 +15,12 @@ Measurements: [table-circuit.md](table-circuit.md).
 
 ## 1. The shape of a game
 
-One deployment per table. A table fills, plays **thirteen rounds**, and settles.
+One deployment per table. A table fills, plays **thirteen rounds**, and settles. The
+constructor's final argument, `fast: Boolean`, fixes the table's PLAY MODE for life in the
+sealed ledger field `fastMode`: `false` is the on-chain interactive mode this document mostly
+describes; `true` is the fast table (docs/fast-turn-design.md) whose turns happen off-chain
+against the operator and land as one composed settlement transaction of these same circuits.
+Joining is consent to the mode — it is public state any client can read before staking.
 
 ```
 filling ──(last join)──> playing ──(closeRound at round 12)──> playing, openRound == 13
@@ -149,8 +154,10 @@ nine and nine exist):
 
 - **`voluntary == false` (timeout)** — anyone. Requires `blockTimeGt(roundDeadline)`,
   `seatProgress[seat].round == openRound`, `!eliminated`, and the seat's stage to be **even**
-  (0, 2, 4 or 6 — the player's silence). An odd stage is the operator's and is refused.
-  Penalty split: `q * 13 + rem == tier * (openRound + 1)`, `rem < 13`.
+  (0, 2, 4 or 6 — the player's silence). An odd stage is the operator's and is refused —
+  **except on a fast table** (`fastMode == true`), where resolves are off-chain and a seat
+  parked at stage 1 past the deadline is a stalled fast turn, so the stage-parity rule is
+  waived. Penalty split: `q * 13 + rem == tier * (openRound + 1)`, `rem < 13`.
 - **`voluntary == true` (resignation)** — the seat itself: the `playerEntropySecret` witness must
   open `seatIdentity[seat].keyCommit`, the same authorisation `playerMove` demands. The deadline,
   stage-parity and played-this-round guards are all waived — resign any time while the table is

@@ -1222,6 +1222,48 @@ describe('elimination', () => {
     await assert.rejects(() => g.sim.eliminate(0, q, rem, past), /already played the open round/);
   });
 
+  it('FAST tables: an odd-stage seat is eliminable past the deadline; on-chain tables keep the shield', async () => {
+    // On a fast table resolves are off-chain, so a seat parked at stage 1 past the round
+    // deadline is a stalled fast turn, not an operator debt (docs/fast-turn-design.md). The
+    // stage-parity rule is waived there — and ONLY there: the same state on an on-chain-mode
+    // table still refuses, because that silence is genuinely the operator's.
+    for (const fast of [true, false] as const) {
+      const g = await seated({ seats: 2, fastMode: fast }, { holds: alwaysStopEarly });
+      assert.equal(g.ledger().fastMode, fast, 'the mode is public, sealed ledger state');
+      const seat = 0;
+      g.sim.asPlayer(g.players[seat]!.sk);
+      await g.sim.openTurn(seat, g.entropyFor(seat, 0), g.tick());
+      assert.equal(g.ledger().seatTurn.lookup(0n).stage, BigInt(STAGE.awaitRoll1));
+
+      const past = Number(g.ledger().roundDeadline) + 1;
+      const { q, rem } = penaltySplit(g.config.tier, 0);
+      g.sim.asOperator();
+      if (fast) {
+        const refund = await g.sim.eliminate(seat, q, rem, past);
+        assert.equal(refund, g.config.tier - q);
+        assert.equal(g.ledger().seatProgress.lookup(0n).eliminated, true);
+      } else {
+        await assert.rejects(
+          () => g.sim.eliminate(seat, q, rem, past),
+          /waiting on the operator, not the other way round/,
+        );
+      }
+    }
+  });
+
+  it('FAST tables: the deadline still gates involuntary elimination', async () => {
+    // The waiver is of stage parity only — a fast seat in time is exactly as safe as a slow one.
+    const g = await seated({ seats: 2, fastMode: true }, { holds: alwaysStopEarly });
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.openTurn(0, g.entropyFor(0, 0), g.tick());
+    const { q, rem } = penaltySplit(g.config.tier, 0);
+    g.sim.asOperator();
+    await assert.rejects(
+      () => g.sim.eliminate(0, q, rem, Number(g.ledger().roundDeadline)),
+      /deadline has not passed/,
+    );
+  });
+
   it('covers every player-owed sub-state of an abandoned turn', async () => {
     // THE requirement interactive holds added: a seat can now walk away in four different
     // places, and all four are the player's silence. Stage 0 (never opened) is covered above;
