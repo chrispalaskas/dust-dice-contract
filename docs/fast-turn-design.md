@@ -95,10 +95,29 @@ seven calls must interleave (open, r1, hold, r2, hold, r3, score), so they likel
 ONE intent's action array**, built cooperatively: the player proves their calls against
 predicted intermediate states (computable off-chain by both parties, since the sequence is
 deterministic once choices are made), ships them to the operator, who proves its three and
-assembles. Whether the tooling allows appending calls to one intent — vs. only merging
-intents — is the FIRST thing the prototype must probe. Fallback if it does not: settle in 2-3
-transactions (player tx + operator tx), still ~3× fewer than today and with the same
-instant-dice feel.
+assembles. Fallback: settle in 2-3 transactions (player tx + operator tx), still ~3× fewer
+than today and with the same instant-dice feel.
+
+## EXECUTED PROBE RESULTS (2026-09-02, ledger-9.1 devnet — probes/concurrency `npm run compose`)
+
+The composition question is now settled by execution, not reading:
+
+- **Sequential same-contract composition: CONFIRMED on our stack.** `bumpShared → setCell →
+bumpShared` — three calls, one `withContractScopedTransaction`, ONE submitted transaction
+  (`1be46a4f…` block 44; reproduced `e57d20e6…` block 64). The shared read-modify-write chain
+  threaded through all three calls (`touches` +2 in one transaction, three contract actions per
+  the indexer), which is only possible if each call's transcript read the previous call's
+  write. The ledger-8 source reading holds on the ledger-9.1 line.
+- **One limitation found (deterministic, measured twice): two ADJACENT calls to the same entry
+  point in one scope are rejected** — node error 104, `TransactionInvalid(Transcript)`. Logged
+  as docs/bugs-found.md #17 with the repro; the evidence points at the SDK's scope builder,
+  not the ledger. The settlement shape (`resolveRoll1, playerMove, resolveReroll, playerMove,
+resolveReroll, playerMove`) alternates entry points and never hits it.
+
+Remaining open before implementation: the TWO-IDENTITY assembly (player's 4 proofs + the
+operator's 3 in one intent — the probe used one wallet and one private state; the settlement
+needs `createUnprovenCallTx` + manual threading or cooperative intent assembly), the fast-open
+flag's k budget in `playerMove` (14 of 15), and fast-mode deadline semantics.
 
 ## What an implementation must build
 

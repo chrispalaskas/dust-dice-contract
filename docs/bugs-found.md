@@ -931,3 +931,40 @@ written; (3) ideally, let a large contract's verifier keys be deployed increment
 current shape makes the maximum useful contract size a function of how many circuits happen to
 need k >= 13. Also worth filing against `midnight-js`: the SDK can measure the deploy's size
 locally and refuse with a diagnosis, exactly as §3 asks for calls.
+
+## 17. midnight-js 5.0.0-beta.7 / node 2.0.0-rc.4: two ADJACENT calls to the same entry point in one scoped transaction build an invalid transcript — **worked-around**
+
+**Symptom.** `withContractScopedTransaction` with two consecutive calls to the SAME circuit
+(same contract, same entry point, different arguments) submits a transaction the node rejects
+with `1010: Invalid Transaction: Custom error: 104` — `TransactionInvalid(Transcript)`, "the
+transaction transcript is invalid". Deterministic: measured twice on a fresh ledger-9.1 devnet
+(probes/concurrency, `npm run compose`, experiment 2 — two `bumpShared` calls with distinct
+random nonce arguments).
+
+**What it is NOT.** Not a ledger prohibition on repeated entry points, and not a limit on
+same-contract composition: the very next experiment composes `bumpShared`, `setCell`,
+`bumpShared` — the same entry point twice, NON-adjacent — into one transaction that is
+**accepted**, with the read-modify-write chain threading through all three calls (`touches`
++2 in one tx, three contract actions per the indexer; txs `1be46a4f…` block 44 and
+`e57d20e6…` block 64 on the probe chain). Sequential same-contract composition per se is
+CONFIRMED on the ledger-9.1 line, matching the `apply_actions` running-accumulator reading of
+the ledger source.
+
+**Root cause.** Not established; the shape of the evidence points at the SDK's scope builder
+rather than the node: the accumulated call data inside `TransactionContextImpl` appears keyed
+or cached in a way that mis-threads a call whose `(address, entryPoint)` equals its immediate
+predecessor's, emitting a transcript the node correctly rejects. The node's own uniqueness
+check keys on `(address, entry_point, communication_commitment)` and did not fire here.
+
+**Workaround.** Order composed calls so no two adjacent ones share an entry point. The
+fast-turn settlement (docs/fast-turn-design.md) alternates player and operator circuits
+(`resolveRoll1, playerMove, resolveReroll, playerMove, resolveReroll, playerMove`) and never
+hits the pattern. Where an adjacent pair is unavoidable, split into two transactions.
+
+**Detection.** Client sees the generic `Transaction submission error`; only the node log (or
+the RPC error detail) carries `Custom error: 104`.
+
+**Intended upstream action.** Issue against `midnight-js`: minimal repro is two consecutive
+same-circuit calls in one `withContractScopedTransaction` scope; expected either a working
+transaction or a client-side error naming the limitation, not a node rejection of an
+SDK-built transcript.
