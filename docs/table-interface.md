@@ -158,7 +158,13 @@ Knocks out a seat that let `roundDeadline` pass while owing a move. Returns the 
 
 Pays the winner `pot - q` and the rake `q`. Returns the winning seat.
 
-- Requires `openRound >= 13` and at least one un-eliminated seat.
+- Requires `openRound >= 13` **or `activeSeats == 1` (the walkover)**, and at least one
+  un-eliminated seat. The walkover: a playing table cannot be joined and eliminated seats cannot
+  win, so with one active seat the outcome is decided — settling early pays the survivor and
+  unlocks every eliminated seat's `redeem` instead of making one person play out the remaining
+  rounds. It cannot be forced (`eliminate` fires only on genuinely timed-out seats), and the
+  operator's policy prefers eliminating a delinquent survivor (reaching `abandoned`, where every
+  penalty is waived) over crowning them.
 - `q * 100 + r == pot`, `r < 100`. The remainder goes to the winner.
 - **`seed` is public here** and must open `seedCommitment` — unless
   `blockTimeGt(roundDeadline + tableTimeoutSecs)`, past which the check is waived and

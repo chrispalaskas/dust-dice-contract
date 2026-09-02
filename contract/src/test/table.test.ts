@@ -1685,10 +1685,60 @@ describe('abortTable', () => {
 describe('settlement guards', () => {
   // =======================================================================================
 
-  it('refuses to settle before the game is finished', async () => {
+  it('refuses to settle before the game is finished while several seats still play', async () => {
     const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
     await g.playRound(0);
     await assert.rejects(() => g.sim.settle(g.config.seed, 0n, 0n), /not finished/);
+  });
+
+  it('settles a walkover: one active seat left ends the game right there', async () => {
+    // Nobody can join a playing table and `winnerSeat` only considers non-eliminated seats, so
+    // the moment the field is one, eleven more solo rounds would change nothing but the
+    // calendar. The last player is paid immediately and — just as important — the eliminated
+    // seat's redeem unlocks, since redeem is gated on a terminal phase.
+    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    await g.playRound(0);
+    await g.playTurn(1, 1); // seat 1 plays round 1; seat 0 goes silent
+    await g.eliminate(0, 1);
+
+    const led = g.ledger();
+    assert.equal(led.activeSeats, 1n);
+    assert.ok(led.openRound < BigInt(ROUND_COUNT), 'this is genuinely an early settle');
+    const potBefore = led.pot;
+    const owedSeat0 = led.seatRedeemable.lookup(0n);
+    assert.ok(owedSeat0 > 0n, 'the eliminated seat is owed its stake minus the penalty');
+
+    const [q, r] = g.rakeSplit();
+    const winner = await g.sim.settle(g.config.seed, q, r);
+    assert.equal(winner, 1n, 'the sole survivor wins the walkover');
+
+    const after = g.ledger();
+    assert.equal(after.phase, PHASE.settled);
+    assert.equal(after.pot, 0n, 'settle drains the pot exactly');
+    assert.deepEqual(after.revealedSeed, g.config.seed, 'a walkover settle still reveals the seed');
+
+    // The whole point: the eliminated seat can now collect without waiting out eleven rounds.
+    const refunded = await g.sim.redeem(0);
+    assert.equal(refunded, owedSeat0);
+    assert.equal(g.ledger().seatRedeemable.lookup(0n), 0n);
+    // Custody to the atom: pot paid out (winner + rake) and the redeem left the contract.
+    assert.equal(q * 100n + r, potBefore);
+  });
+
+  it('a walkover among six pays the one survivor, not the best score', async () => {
+    // Seat 0 posts a real score, then everyone but seat 5 times out. Seat 5 has scored nothing —
+    // and still wins, because eliminated seats are ineligible however good their card looks.
+    // This is the deliberate consequence of "he's gone from this game".
+    const g = await seated({ seats: 6 }, { holds: alwaysStopEarly });
+    for (const s of [0, 1, 2, 3, 4, 5]) await g.playTurn(s, 0);
+    await g.closeRound(0);
+    await g.playTurn(5, 1);
+    for (const s of [0, 1, 2, 3, 4]) await g.eliminate(s, 1);
+
+    assert.equal(g.ledger().activeSeats, 1n);
+    const [q, r] = g.rakeSplit();
+    const winner = await g.sim.settle(g.config.seed, q, r);
+    assert.equal(winner, 5n);
   });
 
   it('refuses a settle seed that does not open the commitment', async () => {

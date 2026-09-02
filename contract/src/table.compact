@@ -1907,10 +1907,29 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>): Uint<64> {
  *
  * `settle` takes no `now`: the deadline is evaluated by the kernel against real block time, so
  * there is nothing to declare and nothing to under-declare.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * THE WALKOVER. A game may also settle BEFORE thirteen rounds when exactly one active seat
+ * remains. Nobody can join a table once it is playing, and `winnerSeat` already restricts
+ * eligibility to non-eliminated seats, so with `activeSeats == 1` the winner is decided no
+ * matter what else happens -- eleven more solo rounds would change nothing but the calendar.
+ * Settling immediately pays the survivor and, just as importantly, unlocks every eliminated
+ * seat's `redeem`, which is gated on a terminal phase.
+ *
+ * The walkover cannot be forced: `eliminate` only fires on a seat that owes a move past the
+ * round deadline, so the sole-survivor state is reachable only through opponents genuinely
+ * timing out. And it stays subordinate to the all-eliminated waiver -- an operator whose last
+ * active seat is itself delinquent can eliminate it instead, reaching `abandoned` where every
+ * penalty is refunded; this circuit merely permits the early exit, the operator's published
+ * policy (service/src/lifecycle.ts) decides which applies. `activeSeats` was already read and
+ * asserted below, so this adds no ledger binding that was not here before.
  */
 export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
   assert(phase == Phase.playing, "settle: table is not playing");
-  assert(openRound >= roundCount(), "settle: the game is not finished");
+  assert(
+    openRound >= roundCount() || activeSeats == 1,
+    "settle: the game is not finished and more than one seat is still playing"
+    );
   assert(activeSeats > 0, "settle: no seat is left to pay");
 
   const s = disclose(seed);
