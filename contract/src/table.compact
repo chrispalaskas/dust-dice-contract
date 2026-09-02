@@ -1774,28 +1774,67 @@ pure circuit roundResultOf(p: SeatProgress): RoundResult {
  * pot/redeemable arithmetic slip at the exact moment money moves between the two, and the
  * `seatReceipt` hash, which records the penalty arithmetic publicly and permanently. Measured
  * before being kept. See section 3 of the header.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * VOLUNTARY RESIGNATION rides the same circuit (a tenth circuit is over the deploy ceiling).
+ * With `voluntary` set, the caller proves knowledge of the SEAT'S OWN entropy secret -- the
+ * exact authorisation `playerMove` demands -- and in exchange three involuntary-only guards are
+ * waived: the round deadline (you may leave now, not when the clock says so), the player-owes
+ * stage parity (you may leave while a resolve is in flight; returning the turn to idle below
+ * makes the in-flight resolve unlandable, which is correct -- the dice were for a game you have
+ * left), and the played-this-round check (you may leave right after scoring, without waiting
+ * for the next round to open). The PENALTY IS IDENTICAL -- `tier * (openRound + 1) / 13` -- so
+ * resigning is never cheaper than being timed out at the same point, only faster for everyone:
+ * with the walkover in `settle`, a two-player resignation pays the survivor and unlocks the
+ * resigner's redeem about a minute later, instead of after a full round clock.
+ *
+ * THE INCENTIVE: a resignation is charged one round less than a timeout at the same point --
+ * `tier * openRound / 13` instead of `tier * (openRound + 1) / 13`. Leaving loudly is always
+ * strictly cheaper than leaving silently, which is the point: a leaver who presses the button
+ * costs the table a minute; one who walks away costs it the whole round clock. The corollary is
+ * accepted deliberately: resigning during round one is free (0/13), so a join-and-quit costs
+ * only fees -- tolerable on a demo, and the griefed opponent is made whole by the walkover
+ * settle minus the rake.
+ *
+ * A false `voluntary` is byte-for-byte the old circuit: the witness is still invoked (circuits
+ * have no conditional calls), but its value only reaches an assertion behind `voluntary`, so
+ * the operator's placeholder secret proves nothing and gates nothing.
  */
-export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>): Uint<64> {
+export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: Boolean): Uint<64> {
   assert(phase == Phase.playing, "eliminate: table is not playing");
 
   const s = disclose(seat);
   assert(s < seatCount, "eliminate: no such seat");
 
+  const vol = disclose(voluntary);
+  // Resignation is self-authorised: knowing the seat's entropy secret is exactly what playerMove
+  // accepts as "being" the seat. Nothing about the secret leaks -- the commitment is already on
+  // chain, the comparison is boolean.
+  const sk = playerEntropySecret();
+  assert(disclose(!vol || entropyKeyCommitment(tableId, sk) == seatIdentity.lookup(s).keyCommit),
+         "eliminate: resigning needs this seat's own entropy secret"
+         );
+
   const r = openRound;
   assert(r < roundCount(), "eliminate: the game is over");
-  assert(blockTimeGt(roundDeadline), "eliminate: the round deadline has not passed");
+  assert(vol || blockTimeGt(roundDeadline), "eliminate: the round deadline has not passed");
 
   const prog = seatProgress.lookup(s);
   assert(!prog.eliminated, "eliminate: this seat is already out");
-  assert(prog.round == r, "eliminate: this seat has already played the open round");
+  assert(vol || prog.round == r, "eliminate: this seat has already played the open round");
 
   const pend = seatTurn.lookup(s);
-  assert(playerOwes(pend.stage),
+  assert(vol || playerOwes(pend.stage),
          "eliminate: this seat is waiting on the operator, not the other way round"
          );
 
-  // Rounds are 0..12 here and 1..13 in the design note. See the doc comment.
-  const charged = (r + 1) as Uint<64>;
+  // Rounds are 0..12 here and 1..13 in the design note. See the doc comment. A RESIGNATION IS
+  // CHARGED ONE ROUND LESS: the open round does not count, so hitting the button during round
+  // ten costs 9/13 where letting round ten time out costs 10/13 -- the deliberate incentive to
+  // leave loudly instead of silently (and in round one, resigning is a free exit). The identity
+  // below pins whichever `charged` applies, so a resigner cannot claim the timeout rate or vice
+  // versa: `voluntary` is a public argument and the verifier recomputes the schedule from it.
+  const charged = (vol ? (r as Uint<64>) : ((r + 1) as Uint<64>));
   const penalty = disclose(q);
   const slack = disclose(rem);
   // Field arithmetic on both sides, no narrowing cast: a checked cast here would abort instead

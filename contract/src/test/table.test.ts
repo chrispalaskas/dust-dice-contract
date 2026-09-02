@@ -1725,6 +1725,82 @@ describe('settlement guards', () => {
     assert.equal(q * 100n + r, potBefore);
   });
 
+  it('a seat resigns voluntarily: cheaper than the timeout, walkover pays the survivor', async () => {
+    // Round index 2: a timeout would charge 3/13 of the stake; resigning charges 2/13 — the
+    // open round does not count, which is the whole incentive to press the button.
+    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    await g.playRound(0);
+    await g.playRound(1);
+    await g.playTurn(1, 2); // seat 1 plays round 2; seat 0 decides to leave mid-round
+
+    const led = g.ledger();
+    const tier = g.config.tier;
+    const resignCharge = (tier * 2n) / 13n; // openRound == 2, charged at 2, not 3
+    const q = resignCharge;
+    const rem = tier * 2n - q * 13n;
+
+    g.sim.asPlayer(g.players[0]!.sk);
+    const refund = await g.sim.resign(0, q, rem);
+    assert.equal(refund, tier - q, 'resign refunds tier minus the discounted penalty');
+    const timeoutCharge = (tier * 3n) / 13n;
+    assert.ok(q < timeoutCharge, 'resigning must be strictly cheaper than timing out');
+
+    const after = g.ledger();
+    assert.equal(after.seatProgress.lookup(0n).eliminated, true);
+    assert.equal(after.activeSeats, 1n);
+    assert.equal(after.seatRedeemable.lookup(0n), refund);
+    assert.equal(after.pot, led.pot - refund, 'the discounted penalty stays in the pot');
+
+    // The walkover follows: the survivor is paid, and the resigner's redeem unlocks.
+    const [sq, sr] = g.rakeSplit();
+    g.sim.asOperator();
+    const winner = await g.sim.settle(g.config.seed, sq, sr);
+    assert.equal(winner, 1n);
+    assert.equal(await g.sim.redeem(0), refund);
+  });
+
+  it('resigning in round one is a free exit — the documented corollary', async () => {
+    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    g.sim.asPlayer(g.players[0]!.sk);
+    const refund = await g.sim.resign(0, 0n, 0n); // tier * 0 == 0: q = 0, rem = 0
+    assert.equal(refund, g.config.tier, 'round-one resignation returns the whole stake');
+  });
+
+  it('refuses a resignation without the seat’s own secret', async () => {
+    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    g.sim.asPlayer(g.players[1]!.sk); // seat 1's secret, trying to resign seat 0
+    await assert.rejects(
+      () => g.sim.resign(0, 0n, 0n),
+      /resigning needs this seat's own entropy secret/,
+    );
+    // And the operator (no player secret at all) cannot use the voluntary path either.
+    g.sim.asOperator();
+    await assert.rejects(
+      () => g.sim.resign(0, 0n, 0n),
+      /resigning needs this seat's own entropy secret/,
+    );
+  });
+
+  it('a resignation is legal mid-resolve and after scoring — states a timeout cannot touch', async () => {
+    // Awaiting the operator (odd stage): eliminate refuses this, resign does not — the player
+    // renounces the roll they paid for; idling the turn makes the in-flight resolve unlandable.
+    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.openTurn(0, g.entropyFor(0, 0)); // seat 0 now at stage 1, awaiting roll 1
+    const tier = g.config.tier;
+    const refund = await g.sim.resign(0, 0n, 0n);
+    assert.equal(refund, tier);
+    assert.equal(g.ledger().seatTurn.lookup(0n).stage, BigInt(STAGE.idle));
+
+    // Already scored the open round (progress.round > openRound): also resignable.
+    const h = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    await h.playTurn(0, 0);
+    assert.equal(h.ledger().seatProgress.lookup(0n).round, 1n);
+    h.sim.asPlayer(h.players[0]!.sk);
+    const refund2 = await h.sim.resign(0, 0n, 0n);
+    assert.equal(refund2, h.config.tier);
+  });
+
   it('a walkover among six pays the one survivor, not the best score', async () => {
     // Seat 0 posts a real score, then everyone but seat 5 times out. Seat 5 has scored nothing —
     // and still wins, because eliminated seats are ineligible however good their card looks.

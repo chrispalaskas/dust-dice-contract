@@ -142,17 +142,26 @@ Refuses unless every seat is done: `seat >= seatCount || eliminated || seatProgr
 openRound`. **Declares a time.** Permissionless, so a player whose operator has gone quiet can
 advance the table.
 
-### `eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>): Uint<64>` — anyone
+### `eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: Boolean): Uint<64>` — anyone / the seat itself
 
-Knocks out a seat that let `roundDeadline` pass while owing a move. Returns the seat's refund.
+Knocks out a seat. Returns the seat's refund. Two modes on one circuit (the deploy ceiling is
+nine and nine exist):
 
-- Requires `blockTimeGt(roundDeadline)`, `seatProgress[seat].round == openRound`,
-  `!eliminated`, and the seat's stage to be **even** (0, 2, 4 or 6 — the player's silence).
-  An odd stage is the operator's and is refused.
-- `q` and `rem` are the penalty split the client computes: `q * 13 + rem == tier * (round + 1)`
-  and `rem < 13`. `q` is the penalty, which **stays in the pot**; `tier - q` becomes the seat's
-  `seatRedeemable`.
-- Pays the caller nothing. **Declares no time.**
+- **`voluntary == false` (timeout)** — anyone. Requires `blockTimeGt(roundDeadline)`,
+  `seatProgress[seat].round == openRound`, `!eliminated`, and the seat's stage to be **even**
+  (0, 2, 4 or 6 — the player's silence). An odd stage is the operator's and is refused.
+  Penalty split: `q * 13 + rem == tier * (openRound + 1)`, `rem < 13`.
+- **`voluntary == true` (resignation)** — the seat itself: the `playerEntropySecret` witness must
+  open `seatIdentity[seat].keyCommit`, the same authorisation `playerMove` demands. The deadline,
+  stage-parity and played-this-round guards are all waived — resign any time while the table is
+  playing, even mid-resolve or right after scoring. **Charged one round less**:
+  `q * 13 + rem == tier * openRound` — the open round does not count, so resigning always
+  returns strictly more than timing out at the same point (and resigning in round one is free).
+  This is the deliberate incentive to leave loudly; with the walkover in `settle`, a two-player
+  resignation pays the survivor and unlocks the resigner's redeem within about a minute.
+
+In both modes `q` is the penalty, which **stays in the pot**; `tier - q` becomes the seat's
+`seatRedeemable`. Pays the caller nothing. **Declares no time.**
 
 ### `settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8>` — anyone
 

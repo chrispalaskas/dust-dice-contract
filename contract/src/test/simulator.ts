@@ -610,7 +610,19 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   eliminate(seat: number, q: bigint, rem: bigint, blockTime: number): Promise<bigint> {
     this.blockTime = blockTime;
     return this.run('eliminate', (ctx) =>
-      this.table.impureCircuits.eliminate(ctx, BigInt(seat), q, rem),
+      this.table.impureCircuits.eliminate(ctx, BigInt(seat), q, rem, false),
+    );
+  }
+
+  /**
+   * `eliminate` with `voluntary` set: the seat resigns itself, authorised by its own entropy
+   * secret (call `asPlayer(sk)` first — the witness supplies it). Charged one round LESS than a
+   * timeout: `q * 13 + rem == tier * openRound`.
+   */
+  resign(seat: number, q: bigint, rem: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+    this.blockTime = blockTime;
+    return this.run('eliminate', (ctx) =>
+      this.table.impureCircuits.eliminate(ctx, BigInt(seat), q, rem, true),
     );
   }
 
