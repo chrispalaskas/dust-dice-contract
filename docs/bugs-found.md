@@ -785,6 +785,38 @@ wallet, all failed identically. A retry loop written against §6 will therefore 
 against this, and the operator gets no signal that the chain — rather than the transaction — is
 what is broken.
 
+**Second occurrence (2026-09-02, different chain, sharper correlation).** A fresh devnet wedged
+identically ~3.5 h after genesis. The last transaction the chain ever accepted (block **2289**,
+01:34:18 UTC, `010060c3…`) was a **fee-less DUST registration** submitted from the Moth browser
+wallet — a self-send of a single 1,000,000-NIGHT UTXO whose only dust event is one
+`DustInitialUtxo`, no `DustSpendProcessed`. The first rejection followed within 90 seconds
+(01:35:46), and from then on every dust spend from every wallet failed — four Moth join attempts
+and, decisively, a plain funding transfer from the **genesis wallet via the CLI stack whose
+identical transfer had landed at 01:17** (`cli/src/probe-join.ts` is the probe that isolated
+this). Both occurrences now share the same shape: a DUST registration lands, and the chain stops
+reconciling anyone's dust state within a minute or two. Registration is not sufficient on its
+own — the E2E runs register small wallets routinely — but two-for-two it is the immediately
+preceding write, both times involving large newly-registered UTXOs. Practical guidance until
+fixed upstream: **do not use Moth's manual "register for DUST" action on a devnet this project
+owns** — funding transfers already auto-create `DustInitialUtxo` for their outputs (proven: the
+Moth wallet paid a fee at 01:33 having never registered), so manual registration is unnecessary
+risk.
+
+**Third occurrence (2026-09-02, reproduced on demand — and the size theory killed).** On another
+fresh chain, `cli/src/probe-join.ts` funded a fresh wallet with **300,000 NIGHT** and registered
+it through this repo's own `prepare` path (no Moth anywhere). The registration landed, the wallet
+computed a healthy DUST balance — and its very next spend, and **every other wallet's** including
+genesis, failed `InvalidDustSpendProof` from that moment. Yet on the next fresh chain the same
+code registering **10,000,000 NIGHT** (E2E's exact `PLAYER_FUNDING`) worked twice in a row, each
+proven by a post-registration spend (`cli/src/mint-moth-wallet.ts`). So the trigger is a DUST
+registration, wallet implementation is irrelevant, and UTXO size is not monotonic — 10M is fine
+while 300k and 1M have each killed a chain. The remaining suspects are timing-shaped (chain age,
+proximity of the registration to other dust events, or the registration fee's projected-dust
+margin, which is far thinner on smaller UTXOs). Operational rule used by this project since:
+fund and register wallets **CLI-side at 10,000,000 NIGHT via `mint-moth-wallet.ts`, prove a
+spend, and import the seed into the browser wallet** — never register from the wallet UI, and
+treat any first-spend-after-registration failure as a wedged chain (wipe, do not retry).
+
 **Workaround — worked-around.** Only a fresh chain clears it, which §0 #8/#22 already said and
 this confirms with a clean before/after: an identical deploy from an identical wallet succeeded
 on the **first attempt** on a newly started node with the same image and the same code.
