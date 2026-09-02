@@ -116,7 +116,16 @@ award to the winner by accident.
 `abortTable` — **ten exported**, against a ceiling measured at 11–12 on this toolchain. That is
 real but tight, and it is a reason not to add an eleventh casually.
 
-`closeRound` is separate rather than folded into `resolveRoll3` for a hard reason:
+> **Corrected by measurement.** The 11–12 figure was inherited and untested. The real ceiling on
+> midnight-node 2.0.0-rc.4 is **nine** exported circuits: 9 deploys, 10 is refused with
+> `Transaction would exhaust the block limits`. It is really a limit on total verifier-key bytes
+> (19,071 lands, 21,190 does not), which couples it to `k` — a verifier key is 1,351 bytes at
+> k ≤ 12 and 2,119 at k ≥ 13, so clearing the admission floor costs deploy budget. As shipped the
+> contract has nine circuits: the three player moves are merged into `playerMove` and the two
+> rerolls into `resolveReroll`. See [bugs-found.md](bugs-found.md) #16 and
+> [table-circuit.md](table-circuit.md) §0.7.
+
+`closeRound` is separate rather than folded into a resolve for a hard reason:
 `resolveRoll1/2/3` already sit at **k=15 with zero headroom**, and the proof server has no SRS
 above 15. Anything that grows the roll path makes the contract unprovable rather than slow.
 Measure `k` for every circuit before writing the rest of this.

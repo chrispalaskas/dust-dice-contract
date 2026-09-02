@@ -75,8 +75,12 @@ function fieldNames(): Map<PathKey, string> {
   const start = source.indexOf('function ledger(');
   if (start < 0) throw new Error('generated ledger() accessor not found');
   const body = source.slice(start);
+  // Descriptor NUMBERS are not stable: they are assigned in order of first use, so removing or
+  // adding a circuit renumbers them all. An earlier version of this file matched
+  // `_descriptor_3` specifically and broke the moment two circuits were merged. Match any
+  // descriptor and rely on the structure instead.
   const re =
-    /get (\w+)\(\)[^]*?path: \[ \{ tag: 'value', value: \{ value: _descriptor_3\.toValue\((\d+)n\), alignment: _descriptor_3\.alignment\(\) \} \}, \{ tag: 'value', value: \{ value: _descriptor_3\.toValue\((\d+)n\)/g;
+    /get (\w+)\(\)[^]*?path: \[ \{ tag: 'value', value: \{ value: _descriptor_\d+\.toValue\((\d+)n\), alignment: _descriptor_\d+\.alignment\(\) \} \}, \{ tag: 'value', value: \{ value: _descriptor_\d+\.toValue\((\d+)n\)/g;
   const out = new Map<PathKey, string>();
   const seen = new Set<string>();
   let m: RegExpExecArray | null;

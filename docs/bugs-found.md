@@ -819,3 +819,73 @@ it stands one error code covers a retryable race, a configuration mismatch and a
 chain state; (b) a node whose dust state has diverged such that no wallet can pay a fee should
 say so once at the node level rather than only per-rejected-transaction. Supersedes nothing —
 §6's transient is real and separate.
+
+## 16. node 2.0.0-rc.4: a contract's deploy ceiling is ~19-21 KB of verifier key, and the error names nothing — **worked-around**
+
+**Symptom.** A contract that compiles cleanly, whose every circuit is provable (`npm run k -w
+cli` all green, k in 13..15), and whose constructor is a few hundred bytes of state, cannot be
+deployed. Every attempt is refused before it reaches a block:
+
+```
+1010: Invalid Transaction: Transaction would exhaust the block limits
+```
+
+The node's own log shows the transaction being _validated for the mempool_ and then simply never
+included — blocks continue at `extrinsics_count: 4` with `end: NoMoreTransactions`. Nothing
+mentions verifier keys, contract size, or which limit was hit. The client sees only the string
+above, from `submitAndWatchExtrinsic`.
+
+Hit while adding two exported circuits to `table.compact` (8 -> 10). Cost: a demo run that
+generated three wallets, funded two, waited out two DUST registrations and deployed a lobby
+before failing on the table.
+
+**Root cause.** A deploy carries **one verifier key per exported circuit** as part of the
+contract's initial state. Measured by deploying real contracts and nothing else, on the same
+node, same wallet, same session:
+
+| exported circuits | verifier-key bytes | deploy                     |
+| ----------------: | -----------------: | -------------------------- |
+|                 8 |             15,416 | lands                      |
+|                 9 |             19,071 | lands                      |
+|                10 |             21,190 | **refused, every attempt** |
+
+So the ceiling is between 19,071 and 21,190 bytes of verifier key. Reducing the constructor's
+own work — moving eighteen `Map.insert`s out of it, including six 27-field scorecards — changed
+nothing, which is what identifies the keys rather than the state as the driver.
+
+**The sharp edge: it is bytes, and verifier-key size is a step function of `k`.** A verifier key
+is **1,351 bytes at k <= 12** and **2,119 bytes at k >= 13**. So this limit is in direct tension
+with §3's admission floor, which pushes small circuits UP to k >= 13:
+
+|           | §3 admission floor           | this ceiling                  |
+| --------- | ---------------------------- | ----------------------------- |
+| `k <= 12` | risks `OutsideTimeToDismiss` | small key, deploy-friendly    |
+| `k >= 13` | safe                         | 2,119 B of deploy budget each |
+
+The previous revision of this contract fitted eight circuits partly _because_ two of them sat at
+k=11 and k=12 with small keys — and the k=11 one is exactly what §3 recorded failing admission
+1,610 times. A contract must choose which limit to pay; there is no free setting of `k`.
+
+**Worse, the widely-repeated figure was wrong.** "A deploy ceiling of ~11-12 circuits" appears
+throughout this project's earlier docs and was inherited from a neighbouring project without
+ever being tested. Anyone budgeting circuits against it is over by two to three.
+
+**Workaround — worked-around.** Keep every circuit at k >= 13 (so nothing is refused at
+admission) and cap the contract at **nine** exported circuits, merging behaviour behind `kind`
+discriminators instead of adding entry points. `table.compact` merges three player moves into
+`playerMove` and two rerolls into `resolveReroll` for exactly this reason.
+
+`cli/src/deploy-probe.ts` (`npm run deploy-probe -w cli`) answers "does this contract deploy?"
+in about forty seconds, from the genesis wallet, with no game setup. It belongs next to
+`npm run k -w cli` in any pre-flight: `k` answers whether each circuit can be _proved_, this
+answers whether the contract can be _deployed_, and neither implies the other.
+
+**Intended upstream action.** Issue against `midnightntwrk/midnight-node` /
+`midnight-ledger`. Three asks: (1) the rejection should name the limit and the measured value —
+"contract state of N bytes exceeds the per-transaction limit of M" — rather than a generic
+`ExhaustsResources`, which is indistinguishable from a fee problem; (2) document the limit and
+its relationship to verifier-key size, so a contract's circuit budget is knowable before it is
+written; (3) ideally, let a large contract's verifier keys be deployed incrementally, since the
+current shape makes the maximum useful contract size a function of how many circuits happen to
+need k >= 13. Also worth filing against `midnight-js`: the SDK can measure the deploy's size
+locally and refuse with a diagnosis, exactly as §3 asks for calls.

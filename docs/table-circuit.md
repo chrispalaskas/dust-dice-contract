@@ -139,6 +139,54 @@ emits one `.zkir` and one key pair per _exported_ circuit. Neither do `pure` cir
 `dice-core`, `scoring-core` and `policy-core`: a pure circuit produces no prover key, no verifier
 key and no zkir at all.
 
+### 0.7 The deploy ceiling is NINE circuits, and it fights the k floor
+
+The figure "a deploy ceiling measured at 11-12" appeared in every previous revision of this
+document and of `table.compact`. It was inherited from a neighbouring project, was never tested
+here, and is **wrong**.
+
+A deploy transaction carries one verifier key per exported circuit, and the node refuses it
+outright when the total is too large -- with an error that names neither the contract nor the
+cause:
+
+```
+1010: Invalid Transaction: Transaction would exhaust the block limits
+```
+
+Measured by deploying real contracts and nothing else (`npm run deploy-probe -w cli`, ~40 s per
+answer) on midnight-node `2.0.0-rc.4`:
+
+| exported circuits | verifier-key bytes | deploy                     |
+| ----------------: | -----------------: | -------------------------- |
+|                 8 |             15,416 | lands (block 288)          |
+|                 9 |             19,071 | lands                      |
+|                10 |             21,190 | **refused, every attempt** |
+
+So the limit is between 19,071 and 21,190 bytes of verifier key.
+
+**IT IS BYTES, NOT CIRCUITS, AND THAT COUPLES IT TO k.** A verifier key is **1,351 bytes at
+k <= 12** and **2,119 bytes at k >= 13**. So §0.1's rule -- lift every circuit to k >= 13 to
+clear the node's proof-size admission floor -- is in direct tension with this one:
+
+|           | admission floor (§0.1)       | deploy ceiling (§0.7)         |
+| --------- | ---------------------------- | ----------------------------- |
+| `k <= 12` | risks `OutsideTimeToDismiss` | small key, deploy-friendly    |
+| `k >= 13` | safe                         | 2,119 B of deploy budget each |
+
+The previous design could afford eight circuits partly BECAUSE two of them had small keys --
+`claimTimeout` at k=11 and `abortTable` at k=12 -- and `claimTimeout` at k=11 is precisely the
+circuit that was then refused at admission 1,610 times in live play. **There is no setting of k
+that is free**, and a contract has to pick which limit to pay.
+
+This one keeps every circuit at k >= 13, so nothing is ever refused at admission, and pays with
+a hard cap of nine exported circuits. New on-chain behaviour has to go behind an existing
+circuit's kind discriminator.
+
+**How this was found is worth recording**: not by reading a spec, but by a demo run that
+bootstrapped three wallets, funded two of them, deployed a lobby, and then failed on the table
+deploy with an error that says nothing about verifier keys. `src/deploy-probe.ts` exists so the
+next person spends forty seconds on the same question.
+
 ### 0.6 Conflict-freedom, read off the compiled transcript
 
 Not a measurement of size but of the property the layout exists for, and it is checked

@@ -44,9 +44,9 @@ when `closeRound` is called, and `closeRound` refuses until every live seat has 
 | 1   | player   | `playerMove(seat, 0, …)` open  | 1 `awaitRoll1`   |
 | 2   | operator | `resolveRoll1(seat)`           | 2 `rolled1`      |
 | 3   | player   | `playerMove(seat, 1, …)` hold  | 3 `awaitRoll2`   |
-| 4   | operator | `resolveRoll2(seat)`           | 4 `rolled2`      |
+| 4   | operator | `resolveReroll(seat)`          | 4 `rolled2`      |
 | 5   | player   | `playerMove(seat, 1, …)` hold  | 5 `awaitRoll3`   |
-| 6   | operator | `resolveRoll3(seat)`           | 6 `rolled3`      |
+| 6   | operator | `resolveReroll(seat)`          | 6 `rolled3`      |
 | 7   | player   | `playerMove(seat, 2, …)` score | 0 `idle`         |
 
 **The player may score at stage 2, 4 or 6** — that is, after any resolved roll. Scoring early
@@ -59,10 +59,10 @@ skips the remaining holds and rolls entirely.
 
 ## 2. Exported circuits
 
-Ten, against a deploy ceiling measured at 11–12 on this toolchain. Every argument to an exported
-circuit is a **public input** to the proof, and its width feeds the proving domain
-([bugs-found.md #14](bugs-found.md)), which is why the three player moves are one circuit rather
-than three.
+**Nine, and nine is the measured hard limit** — see §11. Every argument to an exported circuit is
+a **public input** to the proof, and its width feeds the proving domain
+([bugs-found.md #14](bugs-found.md)), which is one reason the three player moves are one circuit
+rather than three; the deploy ceiling is the other, and it is the binding one.
 
 `Uint<8>` arrives from TypeScript as `bigint`, `Bytes<32>` as `Uint8Array`, `Vector<5, Boolean>`
 as `boolean[]` of length 5, `UserAddress` as `{ bytes: Uint8Array }`.
@@ -117,15 +117,17 @@ All-true is legal but pointless — score instead.
 Derives five fresh dice and latches this seat's mixed entropy. Requires stage 1 and
 `seatTurn[seat].round == openRound`. Returns the dice.
 
-### `resolveRoll2(seat: Uint<8>): Dice` — operator
+### `resolveReroll(seat: Uint<8>): Dice` — operator
 
-Rerolls the positions `hold1` does not keep. Requires stage 3.
+Rerolls the positions the seat's pending mask does not keep. Requires stage 3 **or** 5, and
+reads which reroll it is from that stage: at 3 it applies `hold1` with roll hash 1, at 5 it
+applies `hold2` with roll hash 2.
 
-### `resolveRoll3(seat: Uint<8>): Dice` — operator
+**One circuit for both rerolls**, because they are the same computation and the deploy budget has
+room for nine circuits, not ten (§11). A useful side effect: skipping, repeating or reordering a
+roll is now _unrepresentable_ rather than merely refused.
 
-Rerolls the positions `hold2` does not keep. Requires stage 5.
-
-All three require the caller's private state to hold `rollSeed` opening `seedCommitment`. That
+Both require the caller's private state to hold `rollSeed` opening `seedCommitment`. That
 is the operator's entire authority — there is no operator address in the contract. **The seat is
 an argument**: several seats can be awaiting a roll at once, so the operator must say which.
 Which seat it resolves first changes nothing about anyone's dice (§4). **No time check**: a
@@ -452,3 +454,40 @@ operator that wants the full width of simultaneous rounds needs a pool of wallet
    player can compute all 32 hold outcomes before choosing — see the residual note in
    `table.compact`'s header. This is stronger than the old policy preview and the site's threat
    model should say so.
+
+---
+
+## 11. The deploy ceiling — nine circuits, and why
+
+**This contract cannot grow past nine exported circuits.** Not "should not": the deploy
+transaction is refused by the node.
+
+A deploy carries one verifier key per exported circuit. Measured on midnight-node
+`2.0.0-rc.4` with `npm run deploy-probe -w cli`, which deploys a table and nothing else:
+
+| exported circuits | verifier-key bytes | deploy                                                                      |
+| ----------------: | -----------------: | --------------------------------------------------------------------------- |
+|                 8 |             15,416 | lands                                                                       |
+|                 9 |             19,071 | lands                                                                       |
+|                10 |             21,190 | **`1010: Invalid Transaction: Transaction would exhaust the block limits`** |
+
+So the limit sits between 19,071 and 21,190 bytes of verifier key. The previously documented
+figure of "11–12 circuits" was inherited from a neighbouring project, had never been tested
+here, and is wrong.
+
+**It is bytes, not circuits, and that couples it to `k`:** a verifier key is **1,351 bytes at
+k ≤ 12** and **2,119 bytes at k ≥ 13**. Which means the deploy ceiling and the admission floor
+(§ the `k` discussion in [table-circuit.md](table-circuit.md) §0.1) pull in **opposite
+directions**:
+
+- `k ≤ 12` — small verifier key, deploy-friendly, but risks `OutsideTimeToDismiss` at admission.
+  The previous design's `claimTimeout` sat at k=11 and was refused 1,610 times in live play.
+- `k ≥ 13` — clears the admission floor, but costs 2,119 bytes of deploy budget per circuit.
+
+This contract keeps every circuit at k ≥ 13 so nothing is ever refused at admission, and pays
+for it with a hard cap of nine circuits. That is why `playerMove` merges three player moves and
+`resolveReroll` merges two rolls.
+
+**For a client author this means one thing:** if you need new on-chain behaviour, it has to go
+behind an existing circuit's kind discriminator, not into a new circuit. `npm run deploy-probe
+-w cli` answers the question in about forty seconds.

@@ -573,17 +573,17 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     );
   }
 
-  resolveRoll2(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<TableDice> {
+  /**
+   * Rolls 2 AND 3, from one circuit.
+   *
+   * Which reroll this is comes from the seat's own `stage`, so there is no step argument -- and
+   * no way for a caller to ask for the wrong one. The merge is forced by the deploy ceiling; see
+   * section 8 of table.compact's header.
+   */
+  resolveReroll(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<TableDice> {
     this.blockTime = blockTime;
-    return this.run('resolveRoll2', (ctx) =>
-      this.table.impureCircuits.resolveRoll2(ctx, BigInt(seat)),
-    );
-  }
-
-  resolveRoll3(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<TableDice> {
-    this.blockTime = blockTime;
-    return this.run('resolveRoll3', (ctx) =>
-      this.table.impureCircuits.resolveRoll3(ctx, BigInt(seat)),
+    return this.run('resolveReroll', (ctx) =>
+      this.table.impureCircuits.resolveReroll(ctx, BigInt(seat)),
     );
   }
 

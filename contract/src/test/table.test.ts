@@ -179,7 +179,7 @@ describe('conflict-freedom', () => {
     // them from `playerMove` would serialise the seats against each other -- which is exactly
     // what `stampTime`'s `lastActionAt` did in the cursor model, in seven of eight circuits.
     const moving = ['activeSeats', 'pot', 'roundDeadline', 'roundDigest', 'seatRedeemable'];
-    for (const circuit of ['playerMove', 'resolveRoll2', 'resolveRoll3']) {
+    for (const circuit of ['playerMove', 'resolveReroll']) {
       const reads = ledgerReads(circuit);
       for (const field of moving) {
         assert.ok(!reads.has(field), `${circuit} must not read ${field}`);
@@ -197,10 +197,10 @@ describe('conflict-freedom', () => {
     ]);
   });
 
-  it('keeps the three circuits with no k headroom down to a single map', () => {
-    // resolveRoll1/2/3 are at k=15 against an SRS ceiling of 15. Touching a second map is not
-    // merely slower, it risks a contract that cannot be proved at all.
-    for (const circuit of ['resolveRoll1', 'resolveRoll2', 'resolveRoll3']) {
+  it('keeps the two circuits with no k headroom down to a single map', () => {
+    // resolveRoll1 and resolveReroll are at k=15 against an SRS ceiling of 15. Touching a second
+    // map is not merely slower, it risks a contract that cannot be proved at all.
+    for (const circuit of ['resolveRoll1', 'resolveReroll']) {
       assert.deepEqual(sorted(ledgerWrites(circuit)), ['padStore', 'seatTurn'], circuit);
     }
   });
@@ -210,8 +210,8 @@ describe('conflict-freedom', () => {
       const writers = [
         'playerMove',
         'resolveRoll1',
-        'resolveRoll2',
-        'resolveRoll3',
+        'resolveReroll',
+        'resolveReroll',
         'eliminate',
       ].filter((c) => ledgerWrites(c).has(field));
       assert.deepEqual(writers, [], `${field} must be written only by closeRound (and join)`);
@@ -409,8 +409,7 @@ describe('the interactive turn', () => {
     await assert.rejects(() => g.sim.hold(seat, KEEP_ALL(), g.clock), /a hold needs a resolved/);
     await assert.rejects(() => g.sim.score(seat, 0, g.clock), /nothing has been rolled/);
     g.sim.asOperator();
-    await assert.rejects(() => g.sim.resolveRoll2(seat, g.clock), /not awaiting its second roll/);
-    await assert.rejects(() => g.sim.resolveRoll3(seat, g.clock), /not awaiting its third roll/);
+    await assert.rejects(() => g.sim.resolveReroll(seat, g.clock), /not awaiting a reroll/);
 
     // open -> awaitRoll1: only roll 1 is legal.
     g.sim.asPlayer(g.players[seat]!.sk);
@@ -423,13 +422,13 @@ describe('the interactive turn', () => {
     await assert.rejects(() => g.sim.hold(seat, KEEP_ALL(), g.clock), /a hold needs a resolved/);
     await assert.rejects(() => g.sim.score(seat, 0, g.clock), /nothing has been rolled/);
     g.sim.asOperator();
-    await assert.rejects(() => g.sim.resolveRoll2(seat, g.clock), /not awaiting its second roll/);
+    await assert.rejects(() => g.sim.resolveReroll(seat, g.clock), /not awaiting a reroll/);
 
     // roll 1 -> rolled1: hold or score.
     await g.sim.resolveRoll1(seat, g.tick());
     assert.equal(cell().stage, BigInt(STAGE.rolled1));
     await assert.rejects(() => g.sim.resolveRoll1(seat, g.clock), /not awaiting its first roll/);
-    await assert.rejects(() => g.sim.resolveRoll2(seat, g.clock), /not awaiting its second roll/);
+    await assert.rejects(() => g.sim.resolveReroll(seat, g.clock), /not awaiting a reroll/);
 
     // hold -> awaitRoll2.
     g.sim.asPlayer(g.players[seat]!.sk);
@@ -439,15 +438,18 @@ describe('the interactive turn', () => {
     await assert.rejects(() => g.sim.score(seat, 0, g.clock), /nothing has been rolled/);
     g.sim.asOperator();
     await assert.rejects(() => g.sim.resolveRoll1(seat, g.clock), /not awaiting its first roll/);
-    await assert.rejects(() => g.sim.resolveRoll3(seat, g.clock), /not awaiting its third roll/);
+    // NOTE there is no "you asked for the wrong reroll" case any more, and that is the point of
+    // the merge: `resolveReroll` reads which reroll it is from the seat's own stage, so asking
+    // for roll 3 while roll 2 is due is not refused -- it is UNREPRESENTABLE. The operator's
+    // inability to skip, repeat or reorder a roll is now structural rather than asserted.
 
-    await g.sim.resolveRoll2(seat, g.tick());
+    await g.sim.resolveReroll(seat, g.tick());
     assert.equal(cell().stage, BigInt(STAGE.rolled2));
     g.sim.asPlayer(g.players[seat]!.sk);
     await g.sim.hold(seat, maskOf(1), g.tick());
     assert.equal(cell().stage, BigInt(STAGE.awaitRoll3));
     g.sim.asOperator();
-    await g.sim.resolveRoll3(seat, g.tick());
+    await g.sim.resolveReroll(seat, g.tick());
     assert.equal(cell().stage, BigInt(STAGE.rolled3));
 
     // rolled3: no rolls left, so a hold is refused and only a score can end the turn.
@@ -457,7 +459,7 @@ describe('the interactive turn', () => {
       /a hold needs a resolved roll with another roll left/,
     );
     g.sim.asOperator();
-    await assert.rejects(() => g.sim.resolveRoll3(seat, g.clock), /not awaiting its third roll/);
+    await assert.rejects(() => g.sim.resolveReroll(seat, g.clock), /not awaiting a reroll/);
   });
 
   it('lets a player stop after roll 1, for two player transactions and one operator one', async () => {
@@ -555,17 +557,17 @@ describe('the interactive turn', () => {
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, mask, g.tick());
     g.sim.asOperator();
-    const roll1 = diceToArray(await g.sim.resolveRoll2(0, g.tick()));
+    const roll1 = diceToArray(await g.sim.resolveReroll(0, g.tick()));
     for (const i of [0, 2, 4]) assert.equal(roll1[i], roll0[i], `held die ${i} moved`);
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, mask, g.tick());
     g.sim.asOperator();
-    const roll2 = diceToArray(await g.sim.resolveRoll3(0, g.tick()));
+    const roll2 = diceToArray(await g.sim.resolveReroll(0, g.tick()));
     for (const i of [0, 2, 4]) assert.equal(roll2[i], roll0[i], `held die ${i} moved on roll 3`);
   });
 
   it('writes each hold into the cell the next roll reads, and no other', async () => {
-    // The v2 seam: `hold1` is read only by `resolveRoll2` and `hold2` only by `resolveRoll3`.
+    // The v2 seam: `hold1` is read only by `resolveReroll` and `hold2` only by `resolveReroll`.
     const g = await seated({ seats: 2 });
     await rolledOnce(g, 0);
     g.sim.asPlayer(g.players[0]!.sk);
@@ -574,7 +576,7 @@ describe('the interactive turn', () => {
     assert.deepEqual(cell.hold1.bits, maskOf(1, 3));
     assert.deepEqual(cell.hold2.bits, REROLL_ALL(), 'the second hold must still be empty');
     g.sim.asOperator();
-    await g.sim.resolveRoll2(0, g.tick());
+    await g.sim.resolveReroll(0, g.tick());
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, maskOf(4), g.tick());
     cell = g.ledger().seatTurn.lookup(0n);
@@ -651,7 +653,7 @@ describe('the interactive turn', () => {
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, REROLL_ALL(), g.tick());
     g.sim.asOperator();
-    const roll1 = diceToArray(await g.sim.resolveRoll2(0, g.tick()));
+    const roll1 = diceToArray(await g.sim.resolveReroll(0, g.tick()));
     const mixed = g.ledger().seatTurn.lookup(0n).mixed;
     assert.deepEqual(
       roll1,
@@ -702,7 +704,7 @@ describe('simultaneous rounds', () => {
       await g.sim.hold(seat, masks[seat]!, g.tick());
     }
     g.sim.asOperator();
-    for (let seat = 0; seat < 6; seat++) await g.sim.resolveRoll2(seat, g.tick());
+    for (let seat = 0; seat < 6; seat++) await g.sim.resolveReroll(seat, g.tick());
 
     // Every seat's dice must still be its own -- i.e. what the mirror derives from ITS entropy
     // under ITS mask.
@@ -855,13 +857,13 @@ describe('closeRound', () => {
     await g.sim.hold(seat, maskOf(0), g.tick());
     await assert.rejects(() => g.sim.closeRound(g.tick()), /not every seat has finished/);
     g.sim.asOperator();
-    await g.sim.resolveRoll2(seat, g.tick());
+    await g.sim.resolveReroll(seat, g.tick());
     await assert.rejects(() => g.sim.closeRound(g.tick()), /not every seat has finished/);
     g.sim.asPlayer(g.players[seat]!.sk);
     await g.sim.hold(seat, maskOf(1), g.tick());
     await assert.rejects(() => g.sim.closeRound(g.tick()), /not every seat has finished/);
     g.sim.asOperator();
-    await g.sim.resolveRoll3(seat, g.tick());
+    await g.sim.resolveReroll(seat, g.tick());
     await assert.rejects(() => g.sim.closeRound(g.tick()), /not every seat has finished/);
 
     g.sim.asPlayer(g.players[seat]!.sk);
@@ -1095,13 +1097,13 @@ describe('the three-transaction resolve', () => {
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, maskOf(0), g.tick());
     g.sim.asOperator();
-    await withWrongSeed(() => g.sim.resolveRoll2(0, g.clock));
-    await g.sim.resolveRoll2(0, g.tick());
+    await withWrongSeed(() => g.sim.resolveReroll(0, g.clock));
+    await g.sim.resolveReroll(0, g.tick());
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, maskOf(1), g.tick());
     g.sim.asOperator();
-    await withWrongSeed(() => g.sim.resolveRoll3(0, g.clock));
-    await g.sim.resolveRoll3(0, g.tick());
+    await withWrongSeed(() => g.sim.resolveReroll(0, g.clock));
+    await g.sim.resolveReroll(0, g.tick());
   });
 
   it('refuses a resolve for a pending turn from another round', async () => {
@@ -1235,13 +1237,13 @@ describe('elimination', () => {
         g.sim.asPlayer(g.players[seat]!.sk);
         await g.sim.hold(seat, maskOf(0), g.tick());
         g.sim.asOperator();
-        await g.sim.resolveRoll2(seat, g.tick());
+        await g.sim.resolveReroll(seat, g.tick());
       }
       if (stopAt === STAGE.rolled3) {
         g.sim.asPlayer(g.players[seat]!.sk);
         await g.sim.hold(seat, maskOf(1), g.tick());
         g.sim.asOperator();
-        await g.sim.resolveRoll3(seat, g.tick());
+        await g.sim.resolveReroll(seat, g.tick());
       }
       assert.equal(g.ledger().seatTurn.lookup(BigInt(seat)).stage, BigInt(stopAt));
 
@@ -1273,7 +1275,7 @@ describe('elimination', () => {
       }
       if (stopAt === STAGE.awaitRoll3) {
         g.sim.asOperator();
-        await g.sim.resolveRoll2(seat, g.tick());
+        await g.sim.resolveReroll(seat, g.tick());
         g.sim.asPlayer(g.players[seat]!.sk);
         await g.sim.hold(seat, maskOf(1), g.tick());
       }
@@ -1625,7 +1627,7 @@ describe('abortTable', () => {
       }
       if (stopAfter >= 2) {
         g.sim.asOperator();
-        await g.sim.resolveRoll2(0, g.tick());
+        await g.sim.resolveReroll(0, g.tick());
         g.sim.asPlayer(g.players[0]!.sk);
         await g.sim.hold(0, maskOf(1), g.tick());
       }
@@ -1874,8 +1876,8 @@ describe('the stall matrix: every reachable state has a permissionless exit', ()
           g.sim.asPlayer(g.players[0]!.sk);
           await g.sim.hold(0, maskOf(i), g.tick());
           g.sim.asOperator();
-          if (i === 1) await g.sim.resolveRoll2(0, g.tick());
-          else await g.sim.resolveRoll3(0, g.tick());
+          if (i === 1) await g.sim.resolveReroll(0, g.tick());
+          else await g.sim.resolveReroll(0, g.tick());
         }
       }
 
@@ -1918,7 +1920,7 @@ describe('the stall matrix: every reachable state has a permissionless exit', ()
       }
       if (stopAfter >= 2) {
         g.sim.asOperator();
-        await g.sim.resolveRoll2(0, g.tick());
+        await g.sim.resolveReroll(0, g.tick());
         g.sim.asPlayer(g.players[0]!.sk);
         await g.sim.hold(0, maskOf(1), g.tick());
       }
@@ -1974,8 +1976,7 @@ describe('the declared-time sandwich', () => {
     for (const circuit of [
       'playerMove',
       'resolveRoll1',
-      'resolveRoll2',
-      'resolveRoll3',
+      'resolveReroll',
       'eliminate',
       'settle',
       'redeem',

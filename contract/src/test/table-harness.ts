@@ -676,8 +676,8 @@ export class GameDriver {
       this.sim.asOperator();
       const rolled =
         i === 0
-          ? diceToArray(await this.sim.resolveRoll2(seat, this.tick()))
-          : diceToArray(await this.sim.resolveRoll3(seat, this.tick()));
+          ? diceToArray(await this.sim.resolveReroll(seat, this.tick()))
+          : diceToArray(await this.sim.resolveReroll(seat, this.tick()));
       this.operatorTx += 1;
       rolls.push(rolled);
       assert.deepEqual(

@@ -18,11 +18,15 @@
 // witness-checked modal-face machinery they needed -- a hold is now five explicit bits the
 // player sends after seeing the dice.
 //
-// TEN exported circuits -- join, playerMove, resolveRoll1/2/3, closeRound, eliminate, settle,
-// redeem, abortTable -- against a deploy ceiling measured at 11-12. The interactive turn wants
-// three player entry points where the old one wanted one (open a turn, hold, score), which
-// would be twelve; they are MERGED into a single `playerMove` with a kind discriminator and
-// canonical sentinels for the arguments a given kind does not use. See `playerMove`.
+// NINE exported circuits -- join, playerMove, resolveRoll1, resolveReroll, closeRound,
+// eliminate, settle, redeem, abortTable -- against a deploy ceiling MEASURED AT NINE on this
+// node. See section 8: the old "11-12" figure was inherited, never tested, and is wrong.
+//
+// Two merges got the count there and both are load-bearing rather than tidiness. The
+// interactive turn wants three player entry points where the old one wanted one (open a turn,
+// hold, score); they are merged into a single `playerMove` with a kind discriminator. And rolls
+// 2 and 3 are the same computation under different stored masks, so they are merged into
+// `resolveReroll`, dispatched on the seat's own stage.
 //
 // Building blocks are `include`d verbatim and NOT reimplemented:
 //   dice-core.compact     byte-threshold ladder, roll derivation      (measured)
@@ -126,9 +130,10 @@
 // 4. THE OPERATOR'S MOVE IS STILL THREE TRANSACTIONS, AND STILL AT THE CEILING
 // -------------------------------------------------------------------------------------------
 //
-// `resolveRoll1/2/3` sit at k=15 with zero headroom: the domain is set by the roll hash and its
-// rejection ladder, not by the transcript. Measured before this file was rewritten -- the
-// interactive shape is 811 / 870 / 870 instructions and all three are still k=15.
+// Three transactions, now from TWO circuits: `resolveRoll1` once and `resolveReroll` twice.
+// Both sit at k=15 with zero headroom: the domain is set by the roll hash and its rejection
+// ladder, not by the transcript. Measured before this file was rewritten -- the interactive
+// shape is 811 / 870 / 870 instructions and all of them are still k=15, merge included.
 //
 // The interactive redesign paid for itself here twice over. `resolveRoll1` lost the modal-face
 // check and the mask computation, which is where its 1,173 instructions went; rolls 2 and 3
@@ -136,6 +141,45 @@
 // under the old figures. Anything that grows this path from here makes the contract
 // UNPROVABLE rather than slow, which is why `closeRound` is a separate circuit and why the
 // resolve steps touch exactly one map.
+//
+// -------------------------------------------------------------------------------------------
+// 8. THE DEPLOY HAS ITS OWN CEILING, AND IT IS NINE CIRCUITS -- NOT THE INHERITED 11-12
+// -------------------------------------------------------------------------------------------
+//
+// Every previous revision of this file said "against a deploy ceiling measured at 11-12". That
+// figure was inherited from a neighbouring project and had never been tested here. It is wrong,
+// and the real limit is both lower and differently shaped.
+//
+// A deploy transaction carries ONE VERIFIER KEY PER EXPORTED CIRCUIT, and the node refuses the
+// transaction outright when the total is too large:
+//
+//     1010: Invalid Transaction: Transaction would exhaust the block limits
+//
+// Measured on midnight-node 2.0.0-rc.4, by deploying real contracts and nothing else
+// (`npm run deploy-probe -w cli`):
+//
+//     8 circuits, 15,416 verifier bytes   ->  deploys
+//     9 circuits, 19,071 verifier bytes   ->  deploys
+//    10 circuits, 21,190 verifier bytes   ->  REFUSED
+//
+// So the limit is between 19,071 and 21,190 bytes of verifier key, and it is BYTES rather than
+// circuits: a verifier key is 1,351 bytes at k <= 12 and 2,119 bytes at k >= 13.
+//
+// THAT LAST FACT IS THE TRAP, and it is the direct opposite of section 3. Raising a small
+// circuit's k to clear the node's proof-size ADMISSION floor also enlarges its verifier key and
+// pushes the DEPLOY toward the block limit. The two limits pull in opposite directions:
+//
+//     k <= 12   small verifier key (1,351 B), deploy-friendly, RISKS OutsideTimeToDismiss
+//     k >= 13   clears the admission floor,   verifier key 2,119 B, costs deploy budget
+//
+// The previous design could afford eight circuits partly BECAUSE two of them (`claimTimeout` at
+// k=11 and `abortTable` at k=12) had small keys -- and `claimTimeout` at k=11 is exactly the
+// circuit that then failed admission 1,610 times. There is no setting of k that is free.
+//
+// This contract resolves it by keeping every circuit at k >= 13 -- so nothing is ever refused at
+// admission -- and paying for that with a hard cap of NINE exported circuits. That is why
+// `playerMove` and `resolveReroll` are merged, and it is why adding a tenth circuit is not a
+// judgement call: it does not deploy.
 //
 // -------------------------------------------------------------------------------------------
 // 5. TIME IS DECLARED AND SANDWICHED, IN THE TWO CIRCUITS THAT STILL NEED IT
@@ -1115,10 +1159,23 @@ constructor(id: Bytes<32>,
   winnerSeatIndex = 0;
   finalDigest = default<Bytes<32>>;
 
-  // Pre-insert all six slots so every runtime `lookup` is total. See section 7.
+  // Pre-insert the three maps that are read AT A FIXED INDEX 0..5, so every runtime `lookup` is
+  // total. See section 7.
+  //
+  // `seatIdentity`, `seatCard` and `seatReceipt` are NOT among them: every lookup of those is at
+  // an index the caller has already asserted is below `seatCount`, so `join` writes a seat's
+  // three entries when it takes the seat. Moving them off the constructor is not tidiness -- the
+  // deploy transaction was REJECTED by the node with "Transaction would exhaust the block
+  // limits" while it wrote all six maps, and a scorecard is 27 fields. Six of those, six
+  // identities and six receipts is the difference between a deployable contract and one that
+  // is not. See docs/e2e-report.md.
+  //
+  // The three that remain cannot move: `closeRound` and `settle` read `seatProgress` at 0..5,
+  // `totalRedeemable` reads `seatRedeemable` at 0..5, and `abortTable`'s `awaitingOperatorAt`
+  // reads `seatTurn` at 0..5. A circuit has no branches, so `s < seatCount && ...lookup(s)` does
+  // NOT skip the lookup for an absent slot -- the transcript op is emitted either way, and a
+  // lookup of an absent key aborts.
   for (const s of 0..6) {
-    seatIdentity.insert(s as Uint<8>, default<SeatIdentity>);
-    seatCard.insert(s as Uint<8>, emptyScorecard());
     seatProgress.insert(
       s as Uint<8>,
       SeatProgress { round: 0,
@@ -1138,7 +1195,6 @@ constructor(id: Bytes<32>,
                  roll: Dice { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1 }, }
       );
     seatRedeemable.insert(s as Uint<8>, 0);
-    seatReceipt.insert(s as Uint<8>, default<Bytes<32>>);
   }
 }
 
@@ -1190,7 +1246,11 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   assert(!joinedKeys.member(commit), "join: this entropy key already holds a seat");
 
   const seat = seatCount;
+  // The seat's own three entries, written here rather than pre-inserted by the constructor
+  // because every lookup of them is at an index below `seatCount`. See the constructor.
   seatIdentity.insert(seat, SeatIdentity { addr: who, keyCommit: commit });
+  seatCard.insert(seat, emptyScorecard());
+  seatReceipt.insert(seat, default<Bytes<32>>);
   joinedKeys.insert(commit);
 
   receiveUnshielded(nativeToken(), tier as Uint<128>);
@@ -1506,84 +1566,63 @@ export circuit resolveRoll1(seat: Uint<8>): Dice {
 }
 
 /**
- * Roll 2 of 3: reroll exactly the positions the player did not hold.
+ * Rolls 2 AND 3: reroll exactly the positions the player did not hold.
+ *
+ * ONE CIRCUIT FOR BOTH REROLLS, and the merge is forced by a limit nobody had measured. See
+ * section 8 of this header: the deploy transaction carries one verifier key per exported
+ * circuit, and at ten circuits it is refused by the node with "Transaction would exhaust the
+ * block limits". Nine deploy; ten do not. So one circuit had to go, and these two were the
+ * right pair to lose:
+ *
+ *   * they are the SAME computation. Roll 2 and roll 3 differ only in which roll hash they
+ *     draw from and which of the two stored masks they apply -- both of which the seat's own
+ *     `stage` already determines, so the merge needs no new argument and grants the operator no
+ *     new discretion.
+ *   * merging them costs no PLONK step. The domain of a reroll is set by the roll hash and its
+ *     rejection ladder -- 30 `div_mod_power_of_two` and ~120 `less_than` -- and the merge adds
+ *     seven conditional selects to that. Measured at k=15 before and after, which is the only
+ *     reason this pair was chosen over any other: every other candidate merge either doubled a
+ *     hash or joined two circuits with different read sets.
+ *   * it SIMPLIFIES the operator, which was already dispatching on the stage to decide which of
+ *     `resolveRoll2` and `resolveRoll3` to call.
  *
  * The fresh roll is consumed LEFT TO RIGHT over the rerolled positions -- see `mergeStream` in
  * policy-core.compact. Writes no seat progress: the turn is still in progress and the player may
- * still stop and score after this.
+ * still stop and score after either reroll.
  */
-export circuit resolveRoll2(seat: Uint<8>): Dice {
-  assert(phase == Phase.playing, "resolveRoll2: table is not playing");
+export circuit resolveReroll(seat: Uint<8>): Dice {
+  assert(phase == Phase.playing, "resolveReroll: table is not playing");
 
   const s = disclose(seat);
   const t = seatTurn.lookup(s);
-  assert(t.stage == stageAwaitRoll2(), "resolveRoll2: this seat is not awaiting its second roll");
+  const second = t.stage == stageAwaitRoll2();
+  const third = t.stage == stageAwaitRoll3();
+  assert(second || third, "resolveReroll: this seat is not awaiting a reroll");
 
   const seed = rollSeed();
   assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
-         "resolveRoll2: seed does not open the table's seed commitment"
+         "resolveReroll: seed does not open the table's seed commitment"
          );
+
+  // Which mask and which roll hash, decided by the seat's own stage and by nothing else. The
+  // two hold cells exist precisely so that this selection is a read rather than a rewrite.
+  const hold = second ? t.hold1.bits : t.hold2.bits;
+  const rollIndex = (second ? 1 : 2) as Uint<8>;
 
   const dice = disclose(toDice(rerollUnderMask(
                                  tableId,
                                  seed,
                                  t.mixed,
                                  t.round,
-                                 1,
-                                 t.hold1.bits,
+                                 rollIndex,
+                                 hold,
                                  fromDice(t.roll)
                                  )
                                ));
 
   seatTurn.insert(
     s,
-    SeatTurn { stage: stageRolled2(),
-               round: t.round,
-               entropy: t.entropy,
-               mixed: t.mixed,
-               hold1: t.hold1,
-               hold2: t.hold2,
-               roll: dice, }
-    );
-
-  padTransaction();
-  return dice;
-}
-
-/**
- * Roll 3 of 3: the last reroll. After this the seat must score -- there are no rolls left.
- *
- * Identical to roll 2 but for the roll index and the stage it lands in. Kept as its own circuit
- * rather than parameterised because an exported circuit's arguments are public inputs and the
- * two are already at the SRS ceiling; a shared implementation would have cost a `rollIndex`
- * argument on both.
- */
-export circuit resolveRoll3(seat: Uint<8>): Dice {
-  assert(phase == Phase.playing, "resolveRoll3: table is not playing");
-
-  const s = disclose(seat);
-  const t = seatTurn.lookup(s);
-  assert(t.stage == stageAwaitRoll3(), "resolveRoll3: this seat is not awaiting its third roll");
-
-  const seed = rollSeed();
-  assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
-         "resolveRoll3: seed does not open the table's seed commitment"
-         );
-
-  const dice = disclose(toDice(rerollUnderMask(
-                                 tableId,
-                                 seed,
-                                 t.mixed,
-                                 t.round,
-                                 2,
-                                 t.hold2.bits,
-                                 fromDice(t.roll)
-                                 )
-                               ));
-
-  seatTurn.insert(
-    s,
-    SeatTurn { stage: stageRolled3(),
+    SeatTurn { stage: second ? stageRolled2() : stageRolled3(),
                round: t.round,
                entropy: t.entropy,
                mixed: t.mixed,
