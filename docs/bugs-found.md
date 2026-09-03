@@ -879,6 +879,25 @@ together. **Next step for this repo: pin ledger rc.4 (atomic node image + WASM b
 sixth occurrence (a reboot, no registration) is a data point the diagnosis must still absorb —
 either `root_history` does not survive a restart, or the wallets' post-restart ctime lags.
 
+**The rc.4 pin, attempted 2026-09-03 — BLOCKED upstream.** The pairing that exists: node
+`2.1.0-beta.1` (release notes: ledger 9.1.0.0-rc.4), `@midnightntwrk/ledger-v9@1.0.0-rc.4` on npm
+(forced through the SDK's twelve exact rc.3 pins with a root `overrides` entry and a clean
+reinstall), proof-server `9.0.0-rc.6` (built in the ledger rc.4 release). Typecheck and all 187
+contract + 70 service tests pass on the rc.4 WASM. But there is **no indexer built against ledger
+rc.4**: `indexer-standalone` `4.4.0-rc.2` and `4.4.0-rc.3` BOTH lock
+`crate-ledger-9.1.0.0-rc.3` in Cargo.lock, and the rc.3 image is not on Docker Hub anyway (its
+release says "images published"; the tag 404s; GHCR denies). Executed result on a fresh probe
+chain (node 2.1.0-beta.1 + indexer 4.4.0-rc.2 + proof-server rc.6 + WASM rc.4): the proof server
+answered every `/prove` in ~0.37 s and the node rejected **every** dust spend from the very
+first one, `InvalidDustSpendProof`, ten attempts over 2.5 minutes (the rc.3 fresh-chain
+transient clears in one to two). The wallet SDK takes its dust state from the indexer
+(`dustState` queries), so its Merkle tree is computed with rc.3 accounting — registration valued
+at the declared ctime — while the node's is rc.4's block-time accounting: different generation
+leaves, different root, every proof "invalid". That is also the mechanism behind the old README
+warning that "newer node images reject every fee-paying tx". **Pin reverted to the rc.3 pairing;
+re-attempt the moment an indexer tagged for ledger rc.4 is published** (the indexer's
+`Cargo.lock` `midnight-ledger-v9` source tag is the thing to check, not the release notes).
+
 **Workaround — worked-around.** Only a fresh chain clears it, which §0 #8/#22 already said and
 this confirms with a clean before/after: an identical deploy from an identical wallet succeeded
 on the **first attempt** on a newly started node with the same image and the same code.
