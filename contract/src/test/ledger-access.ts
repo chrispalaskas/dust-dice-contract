@@ -107,13 +107,16 @@ const FIELDS = fieldNames();
  * `assertFieldMapIsComplete` rather than as a silently mislabelled read.
  */
 const ADT_FIELDS: ReadonlyArray<readonly [PathKey, string]> = [
-  ['1,7', 'seatIdentity'],
-  ['1,8', 'seatCard'],
-  ['1,9', 'seatProgress'],
-  ['1,10', 'seatTurn'],
-  ['1,11', 'seatRedeemable'],
-  ['1,12', 'seatReceipt'],
-  ['1,13', 'joinedKeys'],
+  ['1,3', 'seatIdentity'],
+  ['1,4', 'seatCard'],
+  ['1,5', 'seatProgress'],
+  ['1,6', 'seatTurn'],
+  ['1,7', 'seatRedeemable'],
+  ['1,8', 'seatReceipt'],
+  ['1,9', 'joinedKeys'],
+  // Declared after `padStore` (1,10) with the other early-start fields, between `started` and
+  // `fillOpenedAt`.
+  ['1,13', 'seatPaid'],
 ];
 for (const [key, name] of ADT_FIELDS) FIELDS.set(key, name);
 
@@ -133,10 +136,15 @@ export function assertFieldMapIsComplete(): void {
       );
     }
   };
-  // `fastMode` (0,7) slotted in before it; the ADT block and its anchors did not move.
+  // The four fields added for early start / leave-while-filling were APPENDED after `padStore`,
+  // but the compiler rebalances the two buckets by total count, so bucket 1 now begins at
+  // `revealedSeed` and the ADT block sits at 1,3..1,9. Re-derived from the generated accessor
+  // on 2026-09-03; a future change to the declarations must come back through here.
   expect('0,8', 'phase');
-  expect('1,6', 'finalDigest');
-  expect('1,14', 'padStore');
+  expect('1,2', 'finalDigest');
+  expect('1,10', 'padStore');
+  expect('1,11', 'startAfterSecs');
+  expect('1,14', 'fillOpenedAt');
 }
 
 /**

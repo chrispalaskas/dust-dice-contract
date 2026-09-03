@@ -448,6 +448,8 @@ export type TableConfig = {
   tableTimeoutSecs: bigint;
   /** The table's play mode (docs/fast-turn-design.md): false = every roll on-chain. */
   fastMode: boolean;
+  /** Early-start wait after the last join; 0 disables (`abortTable` then only ever refunds). */
+  startAfterSecs: bigint;
 };
 
 /**
@@ -495,6 +497,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         config.turnTimeoutSecs,
         config.tableTimeoutSecs,
         config.fastMode,
+        config.startAfterSecs,
       ),
     );
     return sim;
@@ -645,9 +648,20 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * End a table that cannot finish. `q`/`rem` are the PER-SEAT rake on `tier`, required
    * unconditionally even on the two paths that pay no rake.
    */
-  abortTable(q: bigint, rem: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+  /**
+   * `now` is the declared time (needed for the early start's round deadline); it defaults to
+   * `blockTime`, the honest case. Pass them apart only to exercise the sandwich.
+   */
+  abortTable(
+    q: bigint,
+    rem: bigint,
+    blockTime = DEFAULT_BLOCK_TIME,
+    now: number = blockTime,
+  ): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('abortTable', (ctx) => this.table.impureCircuits.abortTable(ctx, q, rem));
+    return this.run('abortTable', (ctx) =>
+      this.table.impureCircuits.abortTable(ctx, q, rem, BigInt(now)),
+    );
   }
 }
 

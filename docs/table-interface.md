@@ -79,8 +79,11 @@ Take the next seat and stake `tier`. Returns the seat index.
 - The joining wallet consents by balancing its own UTXO — `receiveUnshielded` names no payer.
 - Requires the caller's private state to hold `playerEntropySecret` = this seat's fresh `sk_s`.
 - `payoutTo` **must not be the zero address**; it is where this seat is paid, forever.
-- **Declares a time.** See §5.
-- The last join flips the table to `playing` and opens round 0.
+- **Declares a time.** See §5. It is also recorded as `fillOpenedAt`, the early-start clock's
+  origin (see `abortTable`).
+- The join that brings `activeSeats` to `seatLimit` flips the table to `playing` and opens round 0. **Slots and players differ**: a seat that left while filling keeps its slot (indices are
+  positional), so `seatCount` counts slots taken and `activeSeats` counts players present. A
+  table is "full" when `activeSeats == seatLimit`; the hard ceiling on slots is six.
 - **Not conflict-free, deliberately**: two simultaneous joins bind to `seatCount` and one is
   rejected with a `ReadMismatch`. Retry after re-reading `seatCount`. If both landed they would
   take the same seat index and one player's identity would be silently overwritten.
@@ -161,7 +164,12 @@ nine and nine exist):
 - **`voluntary == true` (resignation)** — the seat itself: the `playerEntropySecret` witness must
   open `seatIdentity[seat].keyCommit`, the same authorisation `playerMove` demands. The deadline,
   stage-parity and played-this-round guards are all waived — resign any time while the table is
-  playing, even mid-resolve or right after scoring. **Charged one round less**:
+  playing, even mid-resolve or right after scoring. **Also legal while the table is FILLING**
+  (only voluntarily: nobody owes anything before the start): `openRound` is 0, so the
+  schedule below charges `tier * 0 / 13` — a full refund, with `q = 0, rem = 0`. Such a seat is
+  marked with `finishedAtRound == 65534` (`leftBeforeStart`), keeps its slot, and may `redeem`
+  at once in any phase. If the last player leaves a filling table it stays `filling` — empty
+  again, still joinable — rather than becoming `abandoned`. **Charged one round less**:
   `q * 13 + rem == tier * openRound` — the open round does not count, so resigning always
   returns strictly more than timing out at the same point (and resigning in round one is free).
   This is the deliberate incentive to leave loudly; with the walkover in `settle`, a two-player
@@ -191,30 +199,45 @@ Pays the winner `pot - q` and the rake `q`. Returns the winning seat.
 
 Pays seat `seat` its `seatRedeemable` to the address it recorded at join. Returns the amount.
 
-- Requires `phase` to be `settled` (2) or `aborted` (3). **Refused while the table is live, and
-  refused in `abandoned` (4)** — see §6.
+- Requires `phase` to be `settled` (2) or `aborted` (3) — **or the seat to have left before the
+  start** (`seatProgress[seat].finishedAtRound == 65534`), which is paid in any phase. Otherwise
+  **refused while the table is live, and refused in `abandoned` (4)** — see §6.
 - Requires `seatRedeemable[seat] > 0`; a second call finds nothing.
+- Adds the amount to `seatPaid[seat]` (see §6).
 - Conflict-free: six seats can redeem in one block. **Declares no time.**
 
-### `abortTable(q: Uint<64>, rem: Uint<64>): Uint<64>` — anyone
+### `abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64>` — anyone
 
-Ends a table that cannot finish and converts the whole pot into per-seat refunds. **Pays no
-player directly** — it writes `seatRedeemable` and leaves the sending to `redeem`. Returns the
-per-seat share.
+Ends a table that cannot finish and converts the whole pot into per-seat refunds — **or STARTS
+a filling table early**. Pays no player directly on the refund paths — it writes `seatRedeemable`
+and leaves the sending to `redeem`. Returns the per-seat share (0 on a start).
 
-Legal in exactly three situations:
+Legal in exactly four situations, the first outranking the second:
 
-| situation        | condition                                                                                          | rake |
-| ---------------- | -------------------------------------------------------------------------------------------------- | ---- |
-| never filled     | `phase == filling && seatCount > 0 && blockTimeGt(roundDeadline)`                                  | none |
-| operator stalled | `phase == playing`, some seat at an **odd** stage, `blockTimeGt(roundDeadline + tableTimeoutSecs)` | none |
-| all eliminated   | `phase == abandoned`                                                                               | paid |
+| situation        | condition                                                                                                  | effect                            |
+| ---------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| early start      | `phase == filling && startAfterSecs > 0 && activeSeats >= 2 && blockTimeGt(fillOpenedAt + startAfterSecs)` | `playing`, round 0 opens; no rake |
+| never filled     | `phase == filling && seatCount > 0 && blockTimeGt(roundDeadline)` and not starting                         | refund `tier`; no rake            |
+| operator stalled | `phase == playing`, some seat at an **odd** stage, `blockTimeGt(roundDeadline + tableTimeoutSecs)`         | refund `tier`; no rake            |
+| all eliminated   | `phase == abandoned` (only a table that STARTED can be abandoned)                                          | refund `tier - q`; rake paid      |
 
 `q` and `rem` are the **per-seat** rake on `tier`, not on the pot: `q * 100 + rem == tier`,
-`rem < 100`. Required unconditionally even on the two paths that pay no rake, so the encoding
-stays canonical. Each seat gets `tier - q` on the all-eliminated path and `tier` on the others.
+`rem < 100`. Required unconditionally even on the paths that pay no rake, so the encoding stays
+canonical. **Seats that left before the start are skipped by every share-out** (they hold — or
+have withdrawn — their full refund already), and the rake is `q` times the seats that received a
+share.
 
-**Declares no time.**
+**Declares a time** (`now`, pinned like `join`'s): the early start stamps round 0's deadline
+`now + turnTimeoutSecs`.
+
+_Executed 2026-09-03 on the probe devnet against the real operator daemon
+(`cli/src/fast/filling-e2e.ts`, table `b9bdc777…`, 3 seats, `startAfterSecs` 180): two joins;
+player 1 left (`eliminate(voluntary)`, refund 100 NIGHT) and the daemon paid it 25 s later
+(`redeem` while filling, wallet +100); player 2 joined; the daemon started the table 196 s later
+with 2 active players in 3 slots (pot 200); both live seats played a fast turn through the channel
+and the daemon closed the round. Two earlier runs with a 60 s clock lost a same-block race — the
+daemon's start landed first and the leave failed its read binding — which is per-read binding
+working as designed._
 
 ---
 
@@ -312,7 +335,8 @@ deadline, not a per-move one. The constructor refuses any timeout at or below `1
 ## 6. Money
 
 ```
-contract balance  ==  pot  +  SUM(seatRedeemable)
+contract balance  ==  pot  +  SUM(seatRedeemable)            (what the chain holds)
+tier * seatCount  ==  pot  +  SUM(seatRedeemable)  +  SUM(seatPaid)   (asserted in-circuit)
 ```
 
 - `pot` goes to the winner and the rake. `join` puts `tier` into it.
@@ -322,9 +346,11 @@ contract balance  ==  pot  +  SUM(seatRedeemable)
 - `settle` pays out exactly `pot`.
 - `abortTable` moves the whole `pot` into `seatRedeemable`.
 
-**`redeem` is refused while the table is live**, so nothing is paid out mid-game. An eliminated
-player waits for the game to end. That is deliberate: it keeps the custody invariant to one line
-and lets the all-eliminated waiver be applied uniformly with no claw-back.
+**`redeem` is refused while the table is live** for seats eliminated DURING play, so nothing of
+a game in progress is paid out mid-game; such a player waits for the game to end, which lets the
+all-eliminated waiver be applied uniformly with no claw-back. The one exception is a seat that
+**left before the start**: its stake is its own again, it is paid whenever it asks, and every
+later share-out skips it — `seatPaid` is what keeps the invariant true once money has left.
 
 **`abandoned` is a pending terminal state, not a redeemable one.** When the last seat is
 eliminated the penalties are still in `pot` and each seat's `redeemable` is still net of its own
@@ -358,15 +384,17 @@ Read with a one-shot `queryContractState`, never `contractStateObservable`, for 
 ### Sealed configuration
 
 `tableId`, `tier`, `seatLimit`, `rakeAddress`, `seedCommitment`, `turnTimeoutSecs`,
-`tableTimeoutSecs`.
+`tableTimeoutSecs`, `fastMode`, `startAfterSecs` (0 = no early start).
 
 ### Table state
 
 | field             | type         | notes                                                                                                                           |
 | ----------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------- |
 | `phase`           | enum         | 0 filling, 1 playing, 2 settled, 3 aborted, 4 abandoned. **Comes back as a `number`, not a `bigint`** — it is a Compact `enum`. |
-| `seatCount`       | `bigint`     | seats taken; frozen once playing                                                                                                |
-| `activeSeats`     | `bigint`     | seats not eliminated; 0 means abandoned                                                                                         |
+| `seatCount`       | `bigint`     | SLOTS taken (a pre-start leaver keeps its slot); frozen once playing                                                            |
+| `activeSeats`     | `bigint`     | players present / not eliminated; 0 while playing means abandoned                                                               |
+| `started`         | `boolean`    | true once the game began (full house or early start)                                                                            |
+| `fillOpenedAt`    | `bigint`     | declared time of the last join; early start at `+ startAfterSecs`                                                               |
 | `openRound`       | `bigint`     | 0..12 while playing; 13 means the game is over                                                                                  |
 | `roundDigest`     | `Uint8Array` | frozen for the round                                                                                                            |
 | `roundDeadline`   | `bigint`     | see §5                                                                                                                          |
@@ -384,10 +412,12 @@ Read with a one-shot `queryContractState`, never `contractStateObservable`, for 
 | `seatProgress`   | `round`, `total`, `finishedAtRound`, `eliminated`, `dice`      |
 | `seatTurn`       | `stage`, `round`, `entropy`, `mixed`, `hold1`, `hold2`, `roll` |
 | `seatRedeemable` | `bigint`                                                       |
+| `seatPaid`       | `bigint` — what `redeem` has already sent this slot            |
 | `seatReceipt`    | `Uint8Array`                                                   |
 
 **Whether a slot is real is `seat < seatCount`, never map membership.**
-`finishedAtRound == 65535` is the never-finished sentinel.
+`finishedAtRound == 65535` is the never-finished sentinel; `65534` marks a seat that left before
+the start.
 
 ### Driving a UI off `seatTurn[seat].stage`
 

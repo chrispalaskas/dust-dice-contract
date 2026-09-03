@@ -156,6 +156,8 @@ export type TableOptions = {
   rakeAddress?: UserAddress;
   /** Deploy the table in fast mode (defaults to the on-chain interactive mode). */
   fastMode?: boolean;
+  /** Early-start wait after the last join. Defaults to 0 = disabled, so existing tests hold. */
+  startAfterSecs?: bigint;
 };
 
 export function tableConfig(opts: TableOptions): TableConfig {
@@ -177,6 +179,7 @@ export function tableConfig(opts: TableOptions): TableConfig {
     turnTimeoutSecs: opts.turnTimeoutSecs ?? 3_600n,
     tableTimeoutSecs: opts.tableTimeoutSecs ?? 7_200n,
     fastMode: opts.fastMode ?? false,
+    startAfterSecs: opts.startAfterSecs ?? 0n,
   };
 }
 
@@ -478,6 +481,7 @@ export class GameDriver {
   async join(seat: number): Promise<void> {
     const player = this.players[seat]!;
     this.sim.asPlayer(player.sk);
+    const before = this.ledger();
     const at = this.tick();
     const returned = await this.sim.join(player.addr, at);
     this.playerTx += 1;
@@ -495,9 +499,11 @@ export class GameDriver {
       this.digest,
       `roundDigest diverged after seat ${seat} joined`,
     );
-    assert.equal(led.seatCount, BigInt(seat + 1));
-    assert.equal(led.activeSeats, BigInt(seat + 1));
-    assert.equal(led.pot, this.config.tier * BigInt(seat + 1), 'pot must be tier x seatCount');
+    // Slots and active seats move by one each; they differ once a seat has left while filling.
+    assert.equal(led.seatCount, before.seatCount + 1n);
+    assert.equal(led.activeSeats, before.activeSeats + 1n);
+    // The pot holds the ACTIVE players' stakes: a pre-start leaver took its own back.
+    assert.equal(led.pot, before.pot + this.config.tier, 'a join adds exactly one stake');
     this.assertCustody();
   }
 
@@ -522,15 +528,21 @@ export class GameDriver {
   assertCustody(): void {
     const led = this.ledger();
     let owed = 0n;
-    for (let s = 0; s < MAX_SEATS; s++) owed += led.seatRedeemable.lookup(BigInt(s));
+    let paid = 0n;
+    for (let s = 0; s < MAX_SEATS; s++) {
+      owed += led.seatRedeemable.lookup(BigInt(s));
+      paid += led.seatPaid.lookup(BigInt(s));
+    }
     if (led.phase === PHASE.settled || led.phase === PHASE.aborted) {
       assert.equal(led.pot, 0n, 'a terminal table must hold no pot');
       return;
     }
+    // `paidOut` is what `redeem` has already sent -- pre-start leavers may withdraw while the
+    // table is still live, and their atoms are then neither in the pot nor owed.
     assert.equal(
-      led.pot + owed,
+      led.pot + owed + paid,
       this.config.tier * led.seatCount,
-      'custody invariant: pot + redeemable must equal tier x seatCount',
+      'custody invariant: pot + redeemable + paid must equal tier x seatCount',
     );
   }
 

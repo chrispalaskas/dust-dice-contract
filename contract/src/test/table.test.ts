@@ -230,16 +230,25 @@ describe('conflict-freedom', () => {
   it('lets six seats redeem in the same block', () => {
     // `redeem` runs only in a terminal phase, so `phase` cannot move under it and every other
     // field it reads is sealed or its own seat's.
+    // `seatProgress` (own seat: the pre-start-leaver mark) and `seatPaid` (own seat) joined the
+    // sets when early redeem arrived; both are keyed by the seat, so six still land together.
     assert.deepEqual(sorted(ledgerReads('redeem')), [
       'phase',
       'seatCard',
       'seatCount',
       'seatIdentity',
+      'seatPaid',
+      'seatProgress',
       'seatReceipt',
       'seatRedeemable',
       'tableId',
     ]);
-    assert.deepEqual(sorted(ledgerWrites('redeem')), ['padStore', 'seatReceipt', 'seatRedeemable']);
+    assert.deepEqual(sorted(ledgerWrites('redeem')), [
+      'padStore',
+      'seatPaid',
+      'seatReceipt',
+      'seatRedeemable',
+    ]);
   });
 
   it('accepts that eliminate serialises, and says which fields do it', () => {
@@ -1724,6 +1733,227 @@ describe('abortTable', () => {
 });
 
 // =========================================================================================
+describe('leaving a filling table, and starting one early', () => {
+  // =======================================================================================
+  // Two folds into existing circuits (the table sits at the nine-circuit deploy ceiling):
+  // `eliminate(voluntary)` is legal while FILLING and refunds the whole stake (`openRound` is 0,
+  // so the resignation schedule charges 0/13), and `abortTable` STARTS a filling table with two
+  // or more players once `startAfterSecs` has passed since the last join. `redeem` pays a
+  // pre-start leaver at once, which is why `paidOut` joined the custody invariant.
+  const WAIT = 300n;
+
+  it('a seat may leave while the table is filling, at no cost, and is paid at once', async () => {
+    const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT });
+    await g.join(0);
+    await g.join(1);
+    const tier = g.config.tier;
+
+    g.sim.asPlayer(g.players[0]!.sk);
+    const refund = await g.sim.resign(0, 0n, 0n); // openRound 0: charged tier * 0 / 13
+    assert.equal(refund, tier, 'leaving before the start refunds the whole stake');
+    let led = g.ledger();
+    assert.equal(led.phase, PHASE.filling);
+    assert.equal(led.activeSeats, 1n);
+    assert.equal(led.seatCount, 2n, 'the slot stays: seat indices are positional');
+    assert.equal(led.pot, tier);
+    assert.equal(led.seatProgress.lookup(0n).eliminated, true);
+    assert.equal(
+      led.seatProgress.lookup(0n).finishedAtRound,
+      65534n,
+      'marked as a pre-start leaver, distinct from a mid-game elimination',
+    );
+    g.assertCustody();
+
+    // Paid immediately -- no waiting for a game the leaver is not in.
+    assert.equal(await g.sim.redeem(0), tier);
+    led = g.ledger();
+    assert.equal(led.seatRedeemable.lookup(0n), 0n);
+    assert.equal(led.seatPaid.lookup(0n), tier);
+    g.assertCustody();
+    await assert.rejects(() => g.sim.redeem(0), /nothing to redeem/);
+  });
+
+  it('only a VOLUNTARY leave is possible while filling -- nobody owes anything yet', async () => {
+    const g = await GameDriver.open({ seats: 2 });
+    await g.join(0);
+    const far = DEFAULT_BLOCK_TIME + 10_000_000;
+    await assert.rejects(() => g.sim.eliminate(0, 0n, 0n, far), /not playing/);
+  });
+
+  it('leaving needs the seat’s own secret', async () => {
+    const g = await GameDriver.open({ seats: 3 });
+    await g.join(0);
+    await g.join(1);
+    g.sim.asPlayer(g.players[1]!.sk);
+    await assert.rejects(() => g.sim.resign(0, 0n, 0n), /own entropy secret/);
+  });
+
+  it('starts early with the players present once the wait has run', async () => {
+    const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT });
+    await g.join(0);
+    await g.join(1);
+    const startAt = Number(g.ledger().fillOpenedAt + WAIT);
+    const { q, rem } = perSeatRake(g.config.tier);
+    // Not before the clock -- and before it, with two players, nothing else is available.
+    await assert.rejects(() => g.sim.abortTable(q, rem, startAt), /neither stalled/);
+
+    const ret = await g.sim.abortTable(q, rem, startAt + 1);
+    assert.equal(ret, 0n, 'a start shares nothing out');
+    const led = g.ledger();
+    assert.equal(led.phase, PHASE.playing);
+    assert.equal(led.started, true);
+    assert.equal(led.openRound, 0n);
+    assert.equal(led.roundDeadline, BigInt(startAt + 1) + g.config.turnTimeoutSecs);
+    assert.equal(led.activeSeats, 2n);
+    assert.equal(led.seatCount, 2n);
+    assert.equal(led.pot, g.config.tier * 2n);
+    g.assertCustody();
+
+    // ...and it is a game: both seats play round 0 and the round closes over the two of them.
+    await g.playTurn(0, 0, alwaysStopEarly);
+    await g.playTurn(1, 0, alwaysStopEarly);
+    g.sim.asOperator();
+    await g.sim.closeRound(g.tick());
+    assert.equal(g.ledger().openRound, 1n);
+  });
+
+  it('a wait of 0 disables the early start: past the fill deadline the table refunds', async () => {
+    const g = await GameDriver.open({ seats: 3 }); // startAfterSecs defaults to 0
+    await g.join(0);
+    await g.join(1);
+    const { q, rem } = perSeatRake(g.config.tier);
+    const deadline = Number(g.ledger().roundDeadline);
+    await assert.rejects(() => g.sim.abortTable(q, rem, deadline), /neither stalled/);
+    await g.sim.abortTable(q, rem, deadline + 1);
+    assert.equal(g.ledger().phase, PHASE.aborted, 'refunded, not started');
+  });
+
+  it('with one player left the table never starts; the never-filled refund skips the leaver', async () => {
+    const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT });
+    await g.join(0);
+    await g.join(1);
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.resign(0, 0n, 0n);
+    assert.equal(await g.sim.redeem(0), g.config.tier, 'the leaver takes its stake now');
+
+    const { q, rem } = perSeatRake(g.config.tier);
+    const startAt = Number(g.ledger().fillOpenedAt + WAIT);
+    await assert.rejects(() => g.sim.abortTable(q, rem, startAt + 1), /neither stalled/);
+
+    const deadline = Number(g.ledger().roundDeadline);
+    const share = await g.sim.abortTable(q, rem, deadline + 1);
+    assert.equal(share, g.config.tier, 'no rake on a table that never played');
+    const led = g.ledger();
+    assert.equal(led.phase, PHASE.aborted);
+    assert.equal(led.seatRedeemable.lookup(0n), 0n, 'already paid: not paid twice');
+    assert.equal(led.seatRedeemable.lookup(1n), g.config.tier);
+    assert.equal(led.pot, 0n);
+    assert.equal(await g.sim.redeem(1), g.config.tier);
+  });
+
+  it('everyone leaves before the start: the table is empty again, and closes with no rake', async () => {
+    const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT });
+    await g.join(0);
+    await g.join(1);
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.resign(0, 0n, 0n);
+    g.sim.asPlayer(g.players[1]!.sk);
+    await g.sim.resign(1, 0n, 0n);
+    let led = g.ledger();
+    // NOT abandoned: only a playing table is. An empty filling table is still a table.
+    assert.equal(led.phase, PHASE.filling);
+    assert.equal(led.activeSeats, 0n);
+    assert.equal(led.pot, 0n);
+
+    // Newcomers may still take it...
+    await g.join(2);
+    assert.equal(g.ledger().activeSeats, 1n);
+    assert.equal(g.ledger().phase, PHASE.filling);
+
+    // ...and if nobody else comes, the fill clock closes it: no shares (the leavers hold their
+    // full refunds already, the newcomer gets its stake), and no rake -- there was no game.
+    const { q, rem } = perSeatRake(g.config.tier);
+    const deadline = Number(g.ledger().roundDeadline);
+    await assert.rejects(() => g.sim.abortTable(q, rem, deadline), /neither stalled/);
+    const share = await g.sim.abortTable(q, rem, deadline + 1);
+    assert.equal(share, g.config.tier, 'no rake: there was never a game to pay for');
+    led = g.ledger();
+    assert.equal(led.phase, PHASE.aborted);
+    assert.equal(
+      led.seatRedeemable.lookup(0n),
+      g.config.tier,
+      'the leave’s full refund, untouched',
+    );
+    assert.equal(led.seatRedeemable.lookup(1n), g.config.tier);
+    assert.equal(led.seatRedeemable.lookup(2n), g.config.tier);
+    assert.equal(led.pot, 0n);
+    for (let seat = 0; seat < 3; seat++) assert.equal(await g.sim.redeem(seat), g.config.tier);
+  });
+
+  it('an abandoned slot is not a seat: the next player fills the table and the game starts', async () => {
+    const g = await GameDriver.open({ seats: 2, startAfterSecs: WAIT });
+    await g.join(0);
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.resign(0, 0n, 0n);
+    await g.join(1); // slot 1: one active seat, still filling
+    assert.equal(g.ledger().phase, PHASE.filling);
+
+    const third = makePlayers(3)[2]!;
+    g.sim.asPlayer(third.sk);
+    const seat = await g.sim.join(third.addr, g.tick());
+    assert.equal(seat, 2n, 'slots are positional; the third player takes slot 2');
+    const led = g.ledger();
+    assert.equal(led.phase, PHASE.playing, 'two ACTIVE seats fill a two-seat table');
+    assert.equal(led.seatCount, 3n);
+    assert.equal(led.activeSeats, 2n);
+    assert.equal(led.pot, g.config.tier * 2n);
+    g.assertCustody();
+
+    const fourth = makePlayers(4)[3]!;
+    g.sim.asPlayer(fourth.sk);
+    await assert.rejects(() => g.sim.join(fourth.addr, g.tick()), /not filling/);
+  });
+
+  it('a leaver may withdraw during a game it is not in, and the waiver skips it afterwards', async () => {
+    const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT });
+    await g.join(0);
+    await g.join(1);
+    g.sim.asPlayer(g.players[1]!.sk);
+    await g.sim.resign(1, 0n, 0n);
+    await g.join(2); // seats 0 and 2 active, slot 1 left; three slots, still filling
+    const { q, rem } = perSeatRake(g.config.tier);
+    const startAt = Number(g.ledger().fillOpenedAt + WAIT);
+    await g.sim.abortTable(q, rem, startAt + 1);
+    let led = g.ledger();
+    assert.equal(led.phase, PHASE.playing);
+    assert.equal(led.activeSeats, 2n);
+    assert.equal(led.pot, g.config.tier * 2n);
+
+    // Mid-game, the pre-start leaver withdraws; the custody invariant carries it as paidOut.
+    assert.equal(await g.sim.redeem(1), g.config.tier);
+    g.assertCustody();
+
+    // Both players then resign in round 0 (charged 0/13): abandoned, STARTED, so the waiver
+    // runs and rakes -- for the two who played. The leaver is skipped: nothing to waive.
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.resign(0, 0n, 0n);
+    g.sim.asPlayer(g.players[2]!.sk);
+    await g.sim.resign(2, 0n, 0n);
+    led = g.ledger();
+    assert.equal(led.phase, PHASE.abandoned);
+    const share = await g.sim.abortTable(q, rem);
+    assert.equal(share, g.config.tier - q, 'the waiver share: stake less the 1% rake');
+    led = g.ledger();
+    assert.equal(led.phase, PHASE.aborted);
+    assert.equal(led.seatRedeemable.lookup(0n), g.config.tier - q);
+    assert.equal(led.seatRedeemable.lookup(2n), g.config.tier - q);
+    assert.equal(led.seatRedeemable.lookup(1n), 0n, 'the leaver was paid before and is skipped');
+    assert.equal(await g.sim.redeem(0), g.config.tier - q);
+    assert.equal(await g.sim.redeem(2), g.config.tier - q);
+  });
+});
+
+// =========================================================================================
 describe('settlement guards', () => {
   // =======================================================================================
 
@@ -2138,7 +2368,9 @@ describe('the declared-time sandwich', () => {
   it('names exactly the circuits that declare a time', () => {
     // A structural check, so a future circuit that starts stamping a deadline has to come back
     // through this test and this comment.
-    for (const circuit of ['join', 'closeRound']) {
+    // `abortTable` joined the list when it learned to START a table (early start stamps round
+    // 0's deadline), and it pins its declared `now` exactly as the other two do.
+    for (const circuit of ['join', 'closeRound', 'abortTable']) {
       assert.ok(ledgerWrites(circuit).has('roundDeadline'), `${circuit} stamps a deadline`);
     }
     for (const circuit of [
@@ -2148,7 +2380,6 @@ describe('the declared-time sandwich', () => {
       'eliminate',
       'settle',
       'redeem',
-      'abortTable',
     ]) {
       assert.ok(
         !ledgerWrites(circuit).has('roundDeadline'),

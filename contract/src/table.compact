@@ -665,6 +665,17 @@ export struct SeatIdentity {
  * This is the map `closeRound` reads all six of, so it is kept as small as the job allows --
  * the turn state lives in `seatTurn` and the money in `seatRedeemable`.
  */
+/**
+ * `finishedAtRound` sentinel for a seat that LEFT A FILLING TABLE before it started. Distinct
+ * from `noFinish()` (eliminated during play) because the two are treated differently ever
+ * after: a pre-start leaver was refunded in full and may `redeem` at once, and every later
+ * share-out (`abortTable`) skips it; a mid-game elimination waits for a terminal phase and is
+ * covered by the all-eliminated waiver.
+ */
+pure circuit leftBeforeStart(): Uint<16> {
+  return 65534;
+}
+
 export struct SeatProgress {
   /**
    * The next round this seat owes. `roundCount()` means finished (or eliminated).
@@ -797,6 +808,39 @@ export ledger joinedKeys: Set<Bytes<32>>;
 
 /** Sink for the transaction padding, so the compiler cannot drop it. See section 3. */
 export ledger padStore: Bytes<4096>;
+
+// -------------------------------------------------------------------------------------------
+// Fields added after `padStore` on purpose: the test-side ledger parser anchors on the ADT
+// block's addresses, and appending keeps every earlier address where it was.
+// -------------------------------------------------------------------------------------------
+
+/**
+ * How long after the LAST join a filling table may start with fewer players than `seatLimit`
+ * (but at least two). Zero disables early starts. Consented to by joining: the join panel
+ * states it before the stake.
+ */
+export sealed ledger startAfterSecs: Uint<64>;
+
+/**
+ * True once the game has started -- by filling every seat, or by `abortTable`'s early start.
+ * `abortTable` reads it to tell a table that was abandoned by everyone BEFORE it started (every
+ * stake already refunded in full; nothing to waive, no rake) from one abandoned mid-game (the
+ * penalty waiver, rake still paid).
+ */
+export ledger started: Boolean;
+
+/**
+ * What `redeem` has already paid each slot. The custody invariant is
+ * `pot + SUM(seatRedeemable) + SUM(seatPaid) == tier * seatCount` for the life of the table;
+ * without this term no seat could be paid before the table is terminal, and a player who leaves
+ * a filling table should not wait for a game they are not in. PER SEAT and not one accumulator
+ * on purpose: a shared scalar would make six redeems conflict, and `redeem` is conflict-free
+ * (contract/src/test/table.test.ts pins it). Pre-inserted 0..5 like `seatRedeemable`.
+ */
+export ledger seatPaid: Map<Uint<8>, Uint<64>>;
+
+/** Declared time of the most recent join -- the early-start clock's origin. */
+export ledger fillOpenedAt: Uint<64>;
 
 /**
  * The 4 KB of transaction padding, as a COMPILE-TIME CONSTANT.
@@ -1087,6 +1131,17 @@ circuit pinTime(now: Uint<64>): [] {
  * Six `Map.lookup`s, so it BINDS to all six -- only ever called from `settle` and `abortTable`,
  * which are terminal and serialised by construction (each asserts a phase it then leaves).
  */
+/** Everything `redeem` has paid out so far, over the six slots. */
+circuit totalPaid(): Uint<64> {
+  return (seatPaid.lookup(0) +
+          seatPaid.lookup(1) +
+          seatPaid.lookup(2) +
+          seatPaid.lookup(3) +
+          seatPaid.lookup(4) +
+          seatPaid.lookup(5))
+         as Uint<64>;
+}
+
 circuit totalRedeemable(): Uint<64> {
   return (seatRedeemable.lookup(0) +
           seatRedeemable.lookup(1) +
@@ -1108,8 +1163,8 @@ circuit totalRedeemable(): Uint<64> {
  * the failure mode a test can actually reach.
  */
 circuit assertCustody(): [] {
-  assert((pot + totalRedeemable()) == (tier * (seatCount as Uint<64>)),
-         "custody invariant broken: pot + redeemable != tier * seatCount"
+  assert((pot + totalRedeemable() + totalPaid()) == (tier * (seatCount as Uint<64>)),
+         "custody invariant broken: pot + redeemable + paid != tier * seatCount"
          );
 }
 
@@ -1136,6 +1191,7 @@ constructor(id: Bytes<32>,
             turnTimeout: Uint<64>,
             tableTimeout: Uint<64>,
             fast: Boolean,
+            startAfter: Uint<64>,
             ) {
   assert(seats >= 2, "a table needs at least 2 seats");
   assert(seats <= maxSeats(), "a table holds at most 6 seats");
@@ -1163,6 +1219,9 @@ constructor(id: Bytes<32>,
   turnTimeoutSecs = disclose(turnTimeout);
   tableTimeoutSecs = disclose(tableTimeout);
   fastMode = disclose(fast);
+  // Zero disables early starts. Any positive wait is allowed: the clock is a kernel predicate
+  // on the LAST join's pinned time, so there is no declared value for a caller to shade.
+  startAfterSecs = disclose(startAfter);
 
   phase = Phase.filling;
   roundDigest = genesisDigest(disclose(id));
@@ -1184,6 +1243,8 @@ constructor(id: Bytes<32>,
   revealedSeed = default<Bytes<32>>;
   winnerSeatIndex = 0;
   finalDigest = default<Bytes<32>>;
+  started = false;
+  fillOpenedAt = 0;
 
   // Pre-insert the three maps that are read AT A FIXED INDEX 0..5, so every runtime `lookup` is
   // total. See section 7.
@@ -1221,6 +1282,7 @@ constructor(id: Bytes<32>,
                  roll: Dice { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1 }, }
       );
     seatRedeemable.insert(s as Uint<8>, 0);
+    seatPaid.insert(s as Uint<8>, 0);
   }
 }
 
@@ -1251,7 +1313,11 @@ constructor(id: Bytes<32>,
  */
 export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   assert(phase == Phase.filling, "join: table is not filling");
-  assert(seatCount < seatLimit, "join: table is full");
+  // Slots, not players: a seat that left while filling keeps its slot (indices are
+  // positional), so a table can hold more slots than its limit. The game starts when the
+  // number of ACTIVE seats reaches the limit; six slots is the hard ceiling of the maps.
+  assert(seatCount < maxSeats(), "join: no free slot");
+  assert(activeSeats < seatLimit, "join: table is full");
 
   const t = disclose(now);
   const who = disclose(payoutTo);
@@ -1287,10 +1353,13 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   // know the digest their later rolls will hash against.
   roundDigest = joinDigest(roundDigest, seat, who, commit);
   const taken = (seatCount + 1) as Uint<8>;
+  const active = (activeSeats + 1) as Uint<8>;
   seatCount = taken;
-  activeSeats = taken;
+  activeSeats = active;
+  fillOpenedAt = t;
 
-  if (taken == seatLimit) {
+  if (active == seatLimit) {
+    started = true;
     // Round 0 opens now, and every seat gets a full turn timeout to play its first turn.
     phase = Phase.playing;
     openRound = 0;
@@ -1827,12 +1896,16 @@ pure circuit roundResultOf(p: SeatProgress): RoundResult {
  * the operator's placeholder secret proves nothing and gates nothing.
  */
 export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: Boolean): Uint<64> {
-  assert(phase == Phase.playing, "eliminate: table is not playing");
-
   const s = disclose(seat);
   assert(s < seatCount, "eliminate: no such seat");
 
   const vol = disclose(voluntary);
+  // A FILLING table may be left voluntarily -- and only voluntarily: nobody owes anything
+  // before the game starts, so there is no silence to punish. `openRound` is 0 while filling,
+  // so the resignation schedule below charges `tier * 0 / 13 == 0`: a full refund, with the
+  // same witness split the caller already knows how to compute.
+  const leaving = phase == Phase.filling && vol;
+  assert(phase == Phase.playing || leaving, "eliminate: table is not playing");
   // Resignation is self-authorised: knowing the seat's entropy secret is exactly what playerMove
   // accepts as "being" the seat. Nothing about the secret leaks -- the commitment is already on
   // chain, the comparison is boolean.
@@ -1886,7 +1959,8 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
                    // An eliminated seat never completed its card, so it loses every tie-break it
                    // would otherwise have drawn -- and `settle` excludes it from the winner
                    // computation outright. Written for the record either way.
-                   finishedAtRound: noFinish(),
+                   // A pre-start leaver is marked apart for good: see `leftBeforeStart`.
+                   finishedAtRound: leaving ? leftBeforeStart() : noFinish(),
                    eliminated: true,
                    dice: prog.dice, }
     );
@@ -1915,7 +1989,10 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
 
   const remaining = (activeSeats - 1) as Uint<8>;
   activeSeats = remaining;
-  if (remaining == 0) {
+  // Only a table that was PLAYING is abandoned when its last player goes. A filling table
+  // everyone has left is simply empty again -- its slots are spent but it holds no money, and
+  // the next arrivals may still fill it (or the fill clock closes it, sharing nothing).
+  if (remaining == 0 && phase == Phase.playing) {
     phase = Phase.abandoned;
   }
 
@@ -1996,10 +2073,9 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
  */
 export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
   assert(phase == Phase.playing, "settle: table is not playing");
-  assert(
-    openRound >= roundCount() || activeSeats == 1,
-    "settle: the game is not finished and more than one seat is still playing"
-    );
+  assert(openRound >= roundCount() || activeSeats == 1,
+         "settle: the game is not finished and more than one seat is still playing"
+         );
   assert(activeSeats > 0, "settle: no seat is left to pay");
 
   const s = disclose(seed);
@@ -2106,18 +2182,24 @@ pure circuit survivorRow(s: Uint<8>, n: Uint<8>, p: SeatProgress): SeatTotal {
  * a settlement would want to point at. See section 3 of the header.
  */
 export circuit redeem(seat: Uint<8>): Uint<64> {
-  assert(phase == Phase.settled || phase == Phase.aborted,
-         "redeem: the table is not finished -- nothing may be withdrawn while it is live"
-         );
-
   const s = disclose(seat);
   assert(s < seatCount, "redeem: no such seat");
+
+  // Terminal tables pay everyone owed. A seat that left BEFORE the start is paid whenever it
+  // asks: its stake is its own again, and no later share-out touches it (`leftBeforeStart`).
+  // Mid-game eliminations still wait -- the all-eliminated waiver may yet REPLACE their
+  // refund, and a refund already withdrawn cannot be replaced.
+  const left = seatProgress.lookup(s).finishedAtRound == leftBeforeStart();
+  assert(phase == Phase.settled || phase == Phase.aborted || left,
+         "redeem: the table is not finished -- nothing may be withdrawn while it is live"
+         );
 
   const amount = seatRedeemable.lookup(s);
   assert(amount > 0, "redeem: this seat has nothing to redeem");
 
   const who = seatIdentity.lookup(s).addr;
   seatRedeemable.insert(s, 0);
+  seatPaid.insert(s, (seatPaid.lookup(s) + amount) as Uint<64>);
   seatReceipt.insert(
     s,
     redeemDigest(seatReceipt.lookup(s), tableId, s, amount, who, seatCard.lookup(s))
@@ -2185,11 +2267,33 @@ export circuit redeem(seat: Uint<8>): Uint<64> {
  * `tier` alone, so it is always satisfiable, and demanding it keeps the argument encoding
  * canonical instead of leaving two ignored fields a caller could stuff with anything.
  *
- * NO `now`. Every deadline here is a kernel predicate against a stored value, so there is
- * nothing to declare.
+ * THE FOURTH CASE STARTS THE GAME INSTEAD. A filling table whose early-start clock has run --
+ * `startAfterSecs` after the last join -- with at least two active seats does not refund: it
+ * STARTS, with whoever is there, exactly as `join` starts a full one. This lives here and not in
+ * a circuit of its own because the table sits at the nine-circuit deploy ceiling, and "the
+ * filling period is over; what happens to the stakes?" is this circuit's question already. It
+ * outranks the never-filled refund whenever two players are present. `now` is needed for the
+ * new round deadline, pinned like `join`'s and `closeRound`'s.
+ *
+ * SEATS THAT LEFT BEFORE THE START are skipped by every share-out: their stake was refunded in
+ * full when they left and may already have been withdrawn. A table everyone left before it
+ * started closes with no shares and no rake -- there was no game to pay for.
  */
-export circuit abortTable(q: Uint<64>, rem: Uint<64>): Uint<64> {
-  const fillingStalled = phase == Phase.filling && seatCount > 0 && blockTimeGt(roundDeadline);
+export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
+  const t = disclose(now);
+  pinTime(t);
+
+  // Early start: the clock runs from the LAST join, so a table still attracting players keeps
+  // waiting for a full house, and one that stopped attracting them starts with who came.
+  const startClock = (fillOpenedAt + startAfterSecs) as Uint<64>;
+  const starting =
+          phase == Phase.filling &&
+          startAfterSecs > 0 &&
+          activeSeats >= 2 &&
+          blockTimeGt(startClock);
+
+  const fillingStalled =
+          phase == Phase.filling && seatCount > 0 && blockTimeGt(roundDeadline) && !starting;
 
   const graceExpired = blockTimeGt((roundDeadline + tableTimeoutSecs) as Uint<64>);
   const waiting = awaitingOperatorAt(0) ||
@@ -2202,7 +2306,7 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>): Uint<64> {
 
   const allOut = phase == Phase.abandoned;
 
-  assert(fillingStalled || operatorStalled || allOut,
+  assert(starting || fillingStalled || operatorStalled || allOut,
          "abortTable: the table is neither stalled past its deadline nor abandoned"
          );
 
@@ -2217,45 +2321,93 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>): Uint<64> {
   // The waiver: penalties refunded, the rake still paid. On the other two paths nobody has been
   // eliminated for a penalty worth waiving -- or if they have, the table never produced a game,
   // so the whole stake goes back and the rake is not earned.
-  const share = allOut ? (tier - rake) as Uint<64> : tier;
+  // A rake is due only when a game was played and then abandoned by everyone: the operator did
+  // its work. Never filled, operator stalled, or abandoned before the start: no rake.
+  const raking = allOut && started;
+  const share = raking ? (tier - rake) as Uint<64> : tier;
 
-  for (const s of 0..6) {
-    if ((s as Uint<8>) < seatCount) {
-      seatRedeemable.insert(s as Uint<8>, share);
-    }
+  // One pass over the six slots. A slot takes a share if it is a live seat, or a seat eliminated
+  // DURING PLAY (whose refund the waiver replaces). A slot that left before the start already
+  // holds -- or has withdrawn -- its full stake and is skipped. When STARTING nothing is shared.
+  const e0 = shareEligible(0);
+  const e1 = shareEligible(1);
+  const e2 = shareEligible(2);
+  const e3 = shareEligible(3);
+  const e4 = shareEligible(4);
+  const e5 = shareEligible(5);
+  if (e0 && !starting) {
+    seatRedeemable.insert(0, share);
   }
+  if (e1 && !starting) {
+    seatRedeemable.insert(1, share);
+  }
+  if (e2 && !starting) {
+    seatRedeemable.insert(2, share);
+  }
+  if (e3 && !starting) {
+    seatRedeemable.insert(3, share);
+  }
+  if (e4 && !starting) {
+    seatRedeemable.insert(4, share);
+  }
+  if (e5 && !starting) {
+    seatRedeemable.insert(5, share);
+  }
+  const shares = ((e0 ? 1 : 0) +
+                  (e1 ? 1 : 0) +
+                  (e2 ? 1 : 0) +
+                  (e3 ? 1 : 0) +
+                  (e4 ? 1 : 0) +
+                  (e5 ? 1 : 0))
+                 as Uint<64>;
+  const rakeTotal = (raking ? (rake * shares) : 0) as Uint<64>;
 
-  if (allOut) {
+  if (raking) {
     sendUnshielded(
       nativeToken(),
-      (rake * (seatCount as Uint<64>)) as Uint<128>,
+      rakeTotal as Uint<128>,
       right<ContractAddress, UserAddress>(rakeAddress)
       );
   }
 
-  pot = 0;
-  finalDigest =
-    finalDigestOf(
-      roundDigest,
-      tableId,
-      Phase.aborted as Uint<8>,
-      // `maxSeats()` is not a seat index, so it cannot be mistaken for a winner.
-      maxSeats(),
-      seatCount,
-      0,
-      allOut ? (rake * (seatCount as Uint<64>)) as Uint<64> : 0,
-      share,
-      false
-      );
-  phase = Phase.aborted;
+  if (starting) {
+    // Round 0 opens now for the seats that are here. The pot already holds exactly their
+    // stakes: every leaver took its own back at `eliminate`.
+    phase = Phase.playing;
+    started = true;
+    openRound = 0;
+    roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
+  } else {
+    pot = 0;
+    finalDigest =
+      finalDigestOf(
+        roundDigest,
+        tableId,
+        Phase.aborted as Uint<8>,
+        maxSeats(),
+        seatCount,
+        0,
+        rakeTotal,
+        share,
+        false
+        );
+    phase = Phase.aborted;
+  }
 
   padTransaction();
-  return share;
+  // A start shares nothing out; the refund paths return the per-seat share.
+  return starting ? 0 : share;
 }
 
 /** Is this slot's next move the operator's -- i.e. is a roll outstanding? */
 circuit awaitingOperatorAt(s: Uint<8>): Boolean {
   return s < seatCount && !playerOwes(seatTurn.lookup(s).stage);
+}
+
+/** Does this slot take a share in an abort: a seated player, or one eliminated during play? */
+circuit shareEligible(s: Uint<8>): Boolean {
+  const prog = seatProgress.lookup(s);
+  return s < seatCount && (!prog.eliminated || prog.finishedAtRound == noFinish());
 }
 
 export { UserAddress, ContractAddress };
