@@ -840,6 +840,45 @@ Self-healing provisioning that re-verifies balances on a cache hit (probes/concu
 `ensureActor`, service `provisionLane`) narrows the window but cannot remove the underlying
 defect.
 
+**Sixth occurrence (2026-09-03 17:38, probe chain — the recipe is NOT sufficient, and a new
+variable appears).** The probe chain from the fifth occurrence had run a full fast-turn E2E the
+evening before (genesis + two players funded 10M and registered within seconds — fine). The
+host then REBOOTED overnight; the node container came back on its persisted state and kept
+producing blocks. This afternoon two more players were provisioned exactly by the recipe (10M
+each, registration submitted within seconds of the coin being visible, both registrations landed
+at 17:36:43 and 17:37:25), and the very next genesis spend — a lobby deploy at 17:38:02 — hit 170
+on every attempt, still 170 from a fresh wallet instance at 17:48. Blocks kept coming. So either
+(a) the recipe merely lowers the odds rather than removing them, or (b) a node restart on
+persisted state is itself a trigger. **The main chain then answered (b):** it had survived the
+same reboot with NO registration afterwards — the operator daemon restarted and only READ state
+for four hours — and its first spend since the reboot (a table deploy from genesis at 17:51) hit
+170 twelve times straight, with every recent block empty. Two chains, one reboot, one of them
+with no DUST registration in the window: **a node restart on persisted state wedges the chain's
+fee-paying transactions on this build.** (Whether registrations are an independent trigger or
+were incidental all along is now the open question; occurrences 1–5 each also had a chain that
+had been running a while.) Practical consequence: after any host reboot, assume both devnets are
+dead and restart them from genesis before anything else — a `docker compose up` that reports the
+old chain height is not a recovery.
+
+**Diagnosis from a source-level investigation of midnight-node / midnight-ledger (2026-09-03,
+by a separate agent working in the node repo; inference, repro written but not yet run).** The
+wallet's `DustLocalState::spend` proves against the roots of its LIVE Merkle trees while the node
+verifies against `root_history.get(ctime)` — the root as of the DECLARED time, exact-or-
+predecessor, written once per block. Nothing couples the two (upstream has a `TODO: Fixme` on
+exactly this). So a spend is valid only if `ctime` falls in `[t_block_N, t_block_N + 12)` for the
+last block the wallet applied; a ctime one second earlier resolves to the previous block's root
+and fails as "InvalidDustSpendProof". While the shared trees are static every root is identical
+and any ctime works — which is why a chain plays fine for hours; a DUST registration inserts into
+both shared trees and arms the mismatch for EVERY wallet, matching occurrences 1–5. Each rejected
+retry also parks the UTXO (`pending_until = ctime + 3h`) before the tx is accepted, so retries
+make it worse. A second, independent defect: ledger rc.3 backdates a registration's DUST to the
+author-declared ctime (rc.4's one changelog entry fixes it: "dust registration accounting moved to
+block time"), which is the fund→register-delay correlation — and a DUST-inflation hole. rc.4 also
+adds nonce asserts to the spend circuit; its verifier key differs, so node and wallet must move
+together. **Next step for this repo: pin ledger rc.4 (atomic node image + WASM bump).** The
+sixth occurrence (a reboot, no registration) is a data point the diagnosis must still absorb —
+either `root_history` does not survive a restart, or the wallets' post-restart ctime lags.
+
 **Workaround — worked-around.** Only a fresh chain clears it, which §0 #8/#22 already said and
 this confirms with a clean before/after: an identical deploy from an identical wallet succeeded
 on the **first attempt** on a newly started node with the same image and the same code.
