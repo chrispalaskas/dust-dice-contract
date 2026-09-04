@@ -450,6 +450,8 @@ export type TableConfig = {
   fastMode: boolean;
   /** Early-start wait after the last join; 0 disables (`abortTable` then only ever refunds). */
   startAfterSecs: bigint;
+  /** `inviteCommitment(code)` for a private table; 32 zero bytes for a public one. */
+  inviteHash: Uint8Array;
 };
 
 /**
@@ -498,6 +500,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         config.tableTimeoutSecs,
         config.fastMode,
         config.startAfterSecs,
+        config.inviteHash,
       ),
     );
     return sim;
@@ -512,9 +515,9 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     this.privateState = createTablePrivateState({ rollSeed: this.config.seed });
   }
 
-  /** Act as the player holding `sk`. The seed is deliberately NOT available. */
-  asPlayer(sk: Uint8Array): void {
-    this.privateState = createTablePrivateState({ playerSecret: sk });
+  /** Act as the player holding `sk` (and, on a private table, knowing `inviteCode`). */
+  asPlayer(sk: Uint8Array, inviteCode?: Uint8Array): void {
+    this.privateState = createTablePrivateState({ playerSecret: sk, inviteCode });
   }
 
   join(payoutTo: UserAddress, now: number, blockTime = now): Promise<bigint> {

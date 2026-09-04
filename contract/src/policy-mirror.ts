@@ -148,6 +148,14 @@ export function seedCommitmentTs(tableId: Uint8Array, seed: Uint8Array): Uint8Ar
   return persistentHash(VEC3_BYTES32, [pad(32, TAG_SEED), tableId, seed]);
 }
 
+export const TAG_INVITE = 'yahtzee:v1:invite';
+const VEC2_BYTES32 = new CompactTypeVector(2, BYTES32);
+
+/** Mirror of `inviteCommitment`: a private table's sealed `H("invite", code)`. */
+export function inviteCommitmentTs(code: Uint8Array): Uint8Array {
+  return persistentHash(VEC2_BYTES32, [pad(32, TAG_INVITE), code]);
+}
+
 /**
  * Mirror of `mixEntropy`: folds the FROZEN round digest into the forced entropy.
  *

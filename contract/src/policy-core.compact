@@ -112,6 +112,18 @@ export pure circuit seedCommitmentOf(tableId: Bytes<32>, seed: Bytes<32>): Bytes
 }
 
 /**
+ * A private table's invite: `H("invite", code)`. The creator's browser generates `code`, sends
+ * ONLY this hash to the operator (who seals it into the table), and shares the code out of band;
+ * `join` proves knowledge of the code in zero knowledge. Not bound to `tableId` because the
+ * table does not exist yet when the code is made -- a creator may reuse a code across tables,
+ * which is the creator's choice to make. Two 32-byte inputs, so it cannot collide with the
+ * three-input commitments above.
+ */
+export pure circuit inviteCommitment(code: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "yahtzee:v1:invite"), code]);
+}
+
+/**
  * The player entropy that actually feeds the roll hash: the forced entropy folded together
  * with the round digest.
  *
