@@ -57,9 +57,11 @@ seed are never disclosed — only boolean assertion results — until the single
   operator can only freeze" into "operator or any player eliminates rivals on demand".
   **Fix:** constructor asserts `timeout > slack × 4` for both timeouts; shrink
   `timeSlackSecs()` to proving/submission-latency scale. Status: **FIXED**.
-  `timeSlackSecs()` is 120 (was 600); `timeoutSlackFactor()` is 4; the constructor asserts
+  `timeSlackSecs()` is 120 (was 600); `timeoutSlackFactor()` is 2 (was 4 until 2026-09-04, when
+  fast tables adopted 300 s rounds — the worst shave then leaves 180 s of a 300 s window, and the
+  slack was kept at 120 s because it must also absorb a wallet's approval prompt); the constructor asserts
   `turnTimeout > timeoutFloor` and `tableTimeout > timeoutFloor` with
-  `timeoutFloor = timeSlackSecs() * timeoutSlackFactor()` = 480 s, strictly. Tests:
+  `timeoutFloor = timeSlackSecs() * timeoutSlackFactor()` = 240 s, strictly. Tests:
   `refuses any timeout at or below four times the declared-time slack` (both timeouts, four
   values below the floor plus the boundary, then floor + 1 accepted, then the cascade itself: a
   seat that receives the turn after a maximally under-declared hand-off is **not** immediately

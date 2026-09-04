@@ -333,7 +333,9 @@ a time ahead of the chain is rejected outright, and passing one more than 120 s 
 
 `turnTimeoutSecs` covers a **whole round** — up to four player transactions and three operator
 ones per seat, plus the operator's round trips. Size it accordingly and show the player the round
-deadline, not a per-move one. The constructor refuses any timeout at or below `120 * 4 = 480 s`.
+deadline, not a per-move one. The constructor refuses any timeout at or below `120 * 2 = 240 s`
+(the factor was 4 until fast tables wanted five-minute rounds; a 300 s round survives the worst
+120 s shave with 180 s left).
 
 ---
 

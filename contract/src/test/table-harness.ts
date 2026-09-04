@@ -174,7 +174,7 @@ export function tableConfig(opts: TableOptions): TableConfig {
     rakeAddress: opts.rakeAddress ?? userAddress(0xee),
     seed,
     seedCommitment: opts.seedCommitment ?? seedCommitmentTs(tableId, seed),
-    // Both defaults must clear the constructor's floor of `timeSlackSecs() * 4` = 480 s, and
+    // Both defaults must clear the constructor's floor of `timeSlackSecs() * 2` = 240 s, and
     // must also cover a whole round: six seats x up to seven transactions each, at TICK apart.
     // Anything at or below the floor is refused at construction, which is itself covered by a
     // test.

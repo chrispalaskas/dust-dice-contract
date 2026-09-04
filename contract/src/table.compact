@@ -201,7 +201,8 @@
 // Critical C1 and it is closed the same way it was before: `timeSlackSecs()` is 120 rather than
 // 600, and the constructor refuses any timeout that is not strictly greater than
 // `timeSlackSecs() * timeoutSlackFactor()`, so the most a hostile declarer can take is a
-// quarter of the window.
+// bounded fraction of the window -- half, at the floor, since the factor became 2 to admit
+// five-minute rounds on fast tables (see `timeoutSlackFactor`).
 //
 // ONLY TWO CIRCUITS TAKE A `now`, and that is a deliberate reduction from seven. Nothing else
 // has a deadline to stamp: `playerMove`, the three resolves, `eliminate`, `settle`, `redeem`
@@ -436,11 +437,16 @@ pure circuit timeSlackSecs(): Uint<64> {
 /**
  * The multiple of `timeSlackSecs()` that every timeout parameter must strictly exceed.
  *
- * Four, so a caller who under-declares by the full slack can consume at most a quarter of the
- * next round's window and the players still get three quarters of the deadline promised.
+ * Two (was four): the floor is 240 s, so a fast table may run FIVE-MINUTE rounds -- a fast turn
+ * takes ~35 s, so five minutes is generous -- and a caller who under-declares by the full slack
+ * can consume at most 120 s of a 300 s window, leaving the players well over half of it. The
+ * slack itself stays 120 s rather than shrinking, because it also has to absorb a wallet's
+ * approval prompt between reading the chain time and the transaction landing; a tighter slack
+ * would turn a slow click into a rejected join. On-chain tables keep their 600/900 s rounds and
+ * are untouched by the floor.
  */
 pure circuit timeoutSlackFactor(): Uint<64> {
-  return 4;
+  return 2;
 }
 
 /** Rake denominator. 1% -- `scoring-core.compact`'s `rakeIsValid` hard-codes the 100. */

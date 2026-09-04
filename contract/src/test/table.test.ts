@@ -2156,13 +2156,14 @@ describe('settlement guards', () => {
     await assert.rejects(() => TableSimulator.create({ ...base, tier: 99n }), /at least 100/);
   });
 
-  it('refuses any timeout at or below four times the declared-time slack', async () => {
-    // `timeSlackSecs()` is 120 and `timeoutSlackFactor()` is 4, so the floor is 480 and it is
+  it('refuses any timeout at or below twice the declared-time slack', async () => {
+    // `timeSlackSecs()` is 120 and `timeoutSlackFactor()` is 2, so the floor is 240 and it is
     // strict. The reason is C1 in docs/security-review.md: `closeRound` stamps the deadline the
     // NEXT round's players are judged against, so a hostile caller who under-declares `now` by
-    // the full slack shaves it off everyone else's window for free.
+    // the full slack shaves it off everyone else's window for free. Two (not four) admits the
+    // fast tables' five-minute rounds; a 300 s round survives the worst shave with 180 s left.
     const base = tableConfig({ seats: 2 });
-    for (const bad of [0n, 1n, 479n, 480n]) {
+    for (const bad of [0n, 1n, 239n, 240n]) {
       await assert.rejects(
         () => TableSimulator.create({ ...base, turnTimeoutSecs: bad }),
         /turn timeout must exceed/,
