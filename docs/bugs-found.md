@@ -879,6 +879,19 @@ together. **Next step for this repo: pin ledger rc.4 (atomic node image + WASM b
 sixth occurrence (a reboot, no registration) is a data point the diagnosis must still absorb —
 either `root_history` does not survive a restart, or the wallets' post-restart ctime lags.
 
+**Seventh data point (2026-09-04 09:00, main chain — the restart hypothesis narrowed).** The
+host rebooted again overnight. The node container was brought back on its persisted state
+(height 5032) and, TWO MINUTES later, genesis funded a wallet, that wallet registered and proved
+a spend — all accepted. Same image, same chain, same restart shape as the sixth occurrence,
+where the first spend came FOUR HOURS after the restart and every one was rejected. So a restart
+on persisted state does not wedge a chain by itself; a restart followed by a long dormancy does.
+That fits the source-level diagnosis two paragraphs down better than (b) did: the root snapshot
+the node checks a spend against is looked up by the DECLARED time in a history that is pruned to
+an hour, and the wallet's declared time comes from a view that a long-idle node's history no
+longer covers — the window between "chain restarted" and "chain is dead to fee-payers" is the
+retention window, not the restart. Operational rule stands: after a reboot, write to the chain
+promptly; if it has sat idle for over an hour, treat it as wedged and start fresh.
+
 **The rc.4 pin, attempted 2026-09-03 — BLOCKED upstream.** The pairing that exists: node
 `2.1.0-beta.1` (release notes: ledger 9.1.0.0-rc.4), `@midnightntwrk/ledger-v9@1.0.0-rc.4` on npm
 (forced through the SDK's twelve exact rc.3 pins with a root `overrides` entry and a clean
