@@ -65,6 +65,7 @@ import {
   mixEntropyTs,
   modalFace,
   rerollUnderMaskTs,
+  inviteCommitmentTs,
 } from '../policy-mirror.ts';
 import {
   eliminateDigestTs,
@@ -1950,6 +1951,38 @@ describe('leaving a filling table, and starting one early', () => {
     assert.equal(led.seatRedeemable.lookup(1n), 0n, 'the leaver was paid before and is skipped');
     assert.equal(await g.sim.redeem(0), g.config.tier - q);
     assert.equal(await g.sim.redeem(2), g.config.tier - q);
+  });
+});
+
+// =========================================================================================
+describe('private tables: the invite code', () => {
+  // =======================================================================================
+  const CODE = bytes32(0x77);
+
+  it('refuses a join without the code, or with the wrong one, and admits the right one', async () => {
+    const g = await GameDriver.open({ seats: 2, inviteHash: inviteCommitmentTs(CODE) });
+    const p = g.players[0]!;
+    // No code (zeros): the witness returns zeros and the commitment cannot match.
+    g.sim.asPlayer(p.sk);
+    await assert.rejects(() => g.sim.join(p.addr, g.tick()), /invite code does not match/);
+    // A wrong code.
+    g.sim.asPlayer(p.sk, bytes32(0x78));
+    await assert.rejects(() => g.sim.join(p.addr, g.tick()), /invite code does not match/);
+    // The right one.
+    g.sim.asPlayer(p.sk, CODE);
+    assert.equal(await g.sim.join(p.addr, g.tick()), 0n);
+    assert.equal(g.ledger().seatCount, 1n);
+  });
+
+  it('a public table ignores whatever code a joiner supplies', async () => {
+    const g = await GameDriver.open({ seats: 2 });
+    const p = g.players[0]!;
+    g.sim.asPlayer(p.sk, bytes32(0x99));
+    assert.equal(await g.sim.join(p.addr, g.tick()), 0n);
+  });
+
+  it('the commitment mirror agrees with the circuit', () => {
+    assert.deepEqual(tablePure.inviteCommitment(CODE), inviteCommitmentTs(CODE));
   });
 });
 

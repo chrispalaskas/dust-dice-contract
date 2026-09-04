@@ -158,6 +158,8 @@ export type TableOptions = {
   fastMode?: boolean;
   /** Early-start wait after the last join. Defaults to 0 = disabled, so existing tests hold. */
   startAfterSecs?: bigint;
+  /** Seal an invite commitment to make the table private. Defaults to public. */
+  inviteHash?: Uint8Array;
 };
 
 export function tableConfig(opts: TableOptions): TableConfig {
@@ -180,6 +182,7 @@ export function tableConfig(opts: TableOptions): TableConfig {
     tableTimeoutSecs: opts.tableTimeoutSecs ?? 7_200n,
     fastMode: opts.fastMode ?? false,
     startAfterSecs: opts.startAfterSecs ?? 0n,
+    inviteHash: opts.inviteHash ?? new Uint8Array(32),
   };
 }
 

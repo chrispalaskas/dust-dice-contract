@@ -843,6 +843,13 @@ export ledger seatPaid: Map<Uint<8>, Uint<64>>;
 export ledger fillOpenedAt: Uint<64>;
 
 /**
+ * A PRIVATE table's sealed invite commitment, `inviteCommitment(code)`; all zeros on a public
+ * table. `join` proves knowledge of the code in zero knowledge -- the code itself never appears
+ * on chain, and the operator that deployed the table only ever saw this hash.
+ */
+export sealed ledger inviteHash: Bytes<32>;
+
+/**
  * The 4 KB of transaction padding, as a COMPILE-TIME CONSTANT.
  *
  * The width appears twice -- here and in `padStore`'s type -- and language 0.26 has no way to
@@ -878,6 +885,12 @@ pure circuit paddingConstant(): Bytes<4096> {
  * ever needs to learn its caller (which it could not anyway: docs/gate0-report.md).
  */
 witness playerEntropySecret(): Bytes<32>;
+
+/**
+ * The invite code for a private table, from the joiner's private state. Zeros for a public
+ * table (the check is skipped when `inviteHash` is zero) and for every call but `join`.
+ */
+witness inviteCode(): Bytes<32>;
 
 /**
  * The operator's roll seed, held off-chain until settlement.
@@ -1192,6 +1205,7 @@ constructor(id: Bytes<32>,
             tableTimeout: Uint<64>,
             fast: Boolean,
             startAfter: Uint<64>,
+            invite: Bytes<32>,
             ) {
   assert(seats >= 2, "a table needs at least 2 seats");
   assert(seats <= maxSeats(), "a table holds at most 6 seats");
@@ -1222,6 +1236,8 @@ constructor(id: Bytes<32>,
   // Zero disables early starts. Any positive wait is allowed: the clock is a kernel predicate
   // on the LAST join's pinned time, so there is no declared value for a caller to shade.
   startAfterSecs = disclose(startAfter);
+  // Zero = public. The hash is public knowledge by construction; only the preimage is secret.
+  inviteHash = disclose(invite);
 
   phase = Phase.filling;
   roundDigest = genesisDigest(disclose(id));
@@ -1336,6 +1352,13 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   // binds `tableId`, so the same secret at two tables produces two unrelated commitments.
   const commit = disclose(entropyKeyCommitment(tableId, playerEntropySecret()));
   assert(!joinedKeys.member(commit), "join: this entropy key already holds a seat");
+
+  // A private table admits only a joiner who knows the invite code. The comparison result is
+  // the only thing disclosed -- a boolean -- so a wrong guess reveals nothing about the code.
+  const code = inviteCode();
+  assert(disclose(inviteHash == default<Bytes<32>> || inviteCommitment(code) == inviteHash),
+         "join: this table is private -- the invite code does not match"
+         );
 
   const seat = seatCount;
   // The seat's own three entries, written here rather than pre-inserted by the constructor

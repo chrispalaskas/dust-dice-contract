@@ -41,6 +41,8 @@ export type TablePrivateState = {
   readonly rollSeed: Uint8Array;
   /** The acting player's entropy secret `sk_s`. 32 bytes. Player only. */
   readonly playerSecret: Uint8Array;
+  /** A private table's invite code. 32 bytes. Joiner only; zeros on a public table. */
+  readonly inviteCode: Uint8Array;
 };
 
 const THIRTY_TWO_ZEROS = (): Uint8Array => new Uint8Array(32);
@@ -51,11 +53,12 @@ function requireBytes32(name: string, value: Uint8Array): Uint8Array {
 }
 
 export function createTablePrivateState(
-  parts: { rollSeed?: Uint8Array; playerSecret?: Uint8Array } = {},
+  parts: { rollSeed?: Uint8Array; playerSecret?: Uint8Array; inviteCode?: Uint8Array } = {},
 ): TablePrivateState {
   return {
     rollSeed: requireBytes32('rollSeed', parts.rollSeed ?? THIRTY_TWO_ZEROS()),
     playerSecret: requireBytes32('playerSecret', parts.playerSecret ?? THIRTY_TWO_ZEROS()),
+    inviteCode: requireBytes32('inviteCode', parts.inviteCode ?? THIRTY_TWO_ZEROS()),
   };
 }
 
@@ -68,6 +71,13 @@ export function createTablePrivateState(
  * the `C_s` recorded at join.
  */
 export const tableWitnesses = {
+  inviteCode: <L>({
+    privateState,
+  }: WitnessContext<L, TablePrivateState>): [TablePrivateState, Uint8Array] => [
+    privateState,
+    privateState.inviteCode,
+  ],
+
   playerEntropySecret: <L>({
     privateState,
   }: WitnessContext<L, TablePrivateState>): [TablePrivateState, Uint8Array] => [

@@ -81,6 +81,11 @@ Take the next seat and stake `tier`. Returns the seat index.
 - `payoutTo` **must not be the zero address**; it is where this seat is paid, forever.
 - **Declares a time.** See §5. It is also recorded as `fillOpenedAt`, the early-start clock's
   origin (see `abortTable`).
+- **Private tables.** If the sealed `inviteHash` is non-zero, the caller's private state must
+  hold the invite code: `inviteCommitment(code) == inviteHash`, proven in zero knowledge (only
+  the boolean is disclosed; a wrong guess reveals nothing). The creator's browser makes the code,
+  the operator seals only its hash at deploy, and the code travels in the table link's URL
+  fragment. A zero `inviteHash` skips the check.
 - The join that brings `activeSeats` to `seatLimit` flips the table to `playing` and opens round 0. **Slots and players differ**: a seat that left while filling keeps its slot (indices are
   positional), so `seatCount` counts slots taken and `activeSeats` counts players present. A
   table is "full" when `activeSeats == seatLimit`; the hard ceiling on slots is six.
@@ -384,7 +389,8 @@ Read with a one-shot `queryContractState`, never `contractStateObservable`, for 
 ### Sealed configuration
 
 `tableId`, `tier`, `seatLimit`, `rakeAddress`, `seedCommitment`, `turnTimeoutSecs`,
-`tableTimeoutSecs`, `fastMode`, `startAfterSecs` (0 = no early start).
+`tableTimeoutSecs`, `fastMode`, `startAfterSecs` (0 = no early start), `inviteHash` (zero =
+public; otherwise `inviteCommitment(code)` and `join` needs the code).
 
 ### Table state
 
