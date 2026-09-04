@@ -55,7 +55,8 @@ Constraints discovered that the design absorbs:
 Design consequences either way:
 
 - **Staked NIGHT stops generating DUST** (DUST accrues to _designated_ NIGHT proportional to
-  balance). The UI keeps a fee reserve back when staking and says so.
+  balance), but DUST moves on a scale of days both ways, so one game's stake barely changes it.
+  The UI says so and shows the wallet's current DUST beside its NIGHT; it keeps no reserve.
 - **Payouts arrive undesignated.** First designation is free; re-designation costs DUST. The
   winner's UI must surface "designate your winnings" and warn about the empty-tank +
   needed-redesignation deadlock.

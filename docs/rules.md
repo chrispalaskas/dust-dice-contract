@@ -26,10 +26,11 @@ your six upper categories total 63+. Extra Yahtzees: +100 each while your Yahtze
 
 ## Fees, and two warnings your wallet will thank you for
 
-- Every move you make is a transaction paid in DUST. DUST regenerates from NIGHT you hold
-  **and have designated** — NIGHT locked in a pot generates nothing. **The lobby will stop
-  you from staking your entire balance**: keep a fee reserve or you cannot afford your own
-  turns.
+- Every move you make is a transaction paid in DUST. DUST is a slow quantity: it builds up from
+  NIGHT you hold **and have designated**, and runs down once that NIGHT moves, both over days.
+  One game is far too short for either to matter, so the size of your stake does not decide
+  whether your turns can be paid for — the DUST your wallet holds _now_ does. The join panel
+  shows it beside your NIGHT.
 - **Winnings arrive undesignated.** They generate no DUST until you designate them. Your
   first designation is free; re-designating costs DUST — do not empty your DUST tank before
   designating a payout.
