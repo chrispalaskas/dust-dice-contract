@@ -1115,3 +1115,18 @@ feature work in a git worktree (`git worktree add ../yahtzee-<feature>`) with it
 `node_modules`, and only recompile in the live tree as part of a deliberate redeploy. A stronger
 fix — the daemon loading artifacts once at startup and pinning them in memory — is worth doing;
 not done yet.
+
+## 27. Operational: the build fingerprint covers verifier keys only — constructor-only changes do not retire tables — **worked around**
+
+**Observed 2026-09-04.** A build that changed only `timeoutSlackFactor()` (a constructor floor)
+and added a per-tier fast round length produced the SAME fingerprint as the build before it, so
+the daemon kept the existing lobby and tables and a rollout script that waited for a "new lobby"
+line waited forever. Correct, in fact: the nine circuits' verifier keys — the only thing a
+deployed table pins — were unchanged, and those tables remained playable. But the tables carried
+the OLD sealed parameters (a 600 s fast round), which a redeploy would have replaced.
+
+**Rule.** For a change to SEALED parameters (round lengths, early-start wait) without a circuit
+change, rolling it onto the board is a manual step: stop the daemon, clear the affected tiers'
+lobby slots (`lobbyTableFilled` with the operator wallet), mark those table records `retired` in
+`service/.state/operator-state.json`, restart — the daemon re-opens them with the new values.
+Only empty tables should be retired this way; a table with stakes is left to finish.
