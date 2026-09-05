@@ -235,6 +235,12 @@ share.
 **Declares a time** (`now`, pinned like `join`'s): the early start stamps round 0's deadline
 `now + turnTimeoutSecs`.
 
+**Who calls it.** The START branch is permissionless, and since 2026-09-04 the operator daemon
+deliberately never calls `abortTable` while it holds: the players decide when to begin (the UI's
+"Start now" button, any seated player). A "never-filled" refund is attempted only when the START
+branch cannot apply — fewer than two players, or the wait disabled — because with 2+ players
+past the clock the same call would start the game instead of refunding it.
+
 _Executed 2026-09-03 on the probe devnet against the real operator daemon
 (`cli/src/fast/filling-e2e.ts`, table `b9bdc777…`, 3 seats, `startAfterSecs` 180): two joins;
 player 1 left (`eliminate(voluntary)`, refund 100 NIGHT) and the daemon paid it 25 s later

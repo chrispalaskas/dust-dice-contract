@@ -1116,7 +1116,7 @@ feature work in a git worktree (`git worktree add ../yahtzee-<feature>`) with it
 fix — the daemon loading artifacts once at startup and pinning them in memory — is worth doing;
 not done yet.
 
-## 27. Operational: the build fingerprint covers verifier keys only — constructor-only changes do not retire tables — **worked around**
+## 27. Operational: the build fingerprint covers verifier keys only — constructor-only changes do not retire tables — **fixed for empty tables**
 
 **Observed 2026-09-04.** A build that changed only `timeoutSlackFactor()` (a constructor floor)
 and added a per-tier fast round length produced the SAME fingerprint as the build before it, so
@@ -1130,3 +1130,11 @@ change, rolling it onto the board is a manual step: stop the daemon, clear the a
 lobby slots (`lobbyTableFilled` with the operator wallet), mark those table records `retired` in
 `service/.state/operator-state.json`, restart — the daemon re-opens them with the new values.
 Only empty tables should be retired this way; a table with stakes is left to finish.
+
+**Fixed 2026-09-04 (daemon).** `#ensureOpenTable` now compares every listed filling table's
+recorded sealed parameters (seats, stake, both timeouts, early-start wait) with what its tier
+would deploy today (`sealedDifference`). An EMPTY table that differs is retired, its lobby slot
+cleared, and a fresh one opened with the current values — automatically, every tick. A table
+holding a stake is left alone whatever changed. First exercised live by the move to six-seat
+tiers: all eight operator tables were swapped on restart. The manual recipe above remains for a
+table with stakes in it.
