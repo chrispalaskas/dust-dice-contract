@@ -1,0 +1,27 @@
+{
+  "name": "@dust-dice/verifier",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Independent verifier for Dust Dice: replays every roll of a finished table from the chain's own record — no operator, no trust — and the shared read-side helpers (compiled-contract handles, indexer queries).",
+  "exports": {
+    "./src/*": "./src/*"
+  },
+  "scripts": {
+    "verify": "node src/verify.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@dust-dice/api": "0.0.1",
+    "@dust-dice/contract": "0.0.1",
+    "@midnight-ntwrk/compact-runtime": "0.19.0",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-network-id": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-protocol": "5.0.0-beta.7",
+    "@midnight-ntwrk/midnight-js-types": "5.0.0-beta.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "typescript": "^6.0.3"
+  }
+}

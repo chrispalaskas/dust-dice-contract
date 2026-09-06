@@ -1,0 +1,14 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    // Runs as sources under Node's type stripping (`node src/verify.ts`), so siblings are
+    // imported as "./x.ts"; see cli/tsconfig.json for the full note.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": true,
+    "types": ["node"],
+    "noEmit": true,
+    "declaration": false
+  },
+  "include": ["src"]
+}
