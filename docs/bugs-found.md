@@ -1168,3 +1168,31 @@ writes (see #15, eighth data point).
 stale reads. **Mitigation:** run the node with `restart: unless-stopped` in the compose file so
 a crash is a one-block hiccup, and have the daemon's health report the node's tip age so a
 stalled chain is visible. **Not yet reproduced;** the cause is in the node, not this project.
+
+## 29. Operational: the daemon's RSS grows by tens of MB per fast roll while its JS heap stays flat — WASM memory freed only by finalizers — **fixed**
+
+**Observed 2026-09-04, main devnet.** After ~85 minutes of fast play the daemon sat at 2.7 GB
+RSS with four V8 worker threads at full CPU, its event loop starved (the health endpoint stopped
+answering; a player's roll hung on "Operator is rolling"). A restart cured it — and cost that
+game: the stall ate the whole five-minute round, so the fresh daemon eliminated both players
+(#15's cousin; see the boot-grace note in docs/table-interface.md).
+
+**Measured 2026-09-06, probe devnet, before the fix.** One channel round (two fast turns: six
+resolves, two settlements, one closeRound) moved the process from 320 MB RSS / 93 MB heap to
+385 MB / 97 MB: +65 MB RSS against +4 MB heap. The growth is outside V8's heap.
+
+**Diagnosis.** Every ledger object (`ContractState`, `ChargedState`, `Transaction`, the proven
+and merged transactions, the states a call returns) is a wasm-bindgen wrapper around Rust memory
+in the WASM linear memory, released through a `FinalizationRegistry` — that is, only after a
+garbage collection notices the JS wrapper is dead. The daemon's JS heap is small and steady, so
+V8 has no reason to collect; the WASM side, which V8 does not account for, grows by megabytes
+per roll until something gives. Compounding it, `LiveChain.#providersFor` built a fresh provider
+set (Apollo HTTP link + graphql-ws client) for EVERY fast call.
+
+**Fix (service/src/wire.ts, chain.ts, daemon.ts; cli/src/fast/assemble.ts).** (1) `freeWasm()`
+releases every WASM object a fast call creates as soon as it is serialised or submitted —
+decoded and encoded states, the settlement base, the unproven and proven transactions, the
+deserialised parts, every merge intermediate and the bound transaction. (2) Providers are built
+once per lane. (3) The service starts with `--expose-gc` and the daemon forces a collection every
+60 s, so the SDK's own WASM garbage (not ours to free) is finalised on a clock rather than never.
+(4) `/health` reports `memoryMb` (rss, heapUsed, external, arrayBuffers) and `uptimeSecs`.
