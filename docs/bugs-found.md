@@ -1196,3 +1196,16 @@ deserialised parts, every merge intermediate and the bound transaction. (2) Prov
 once per lane. (3) The service starts with `--expose-gc` and the daemon forces a collection every
 60 s, so the SDK's own WASM garbage (not ours to free) is finalised on a clock rather than never.
 (4) `/health` reports `memoryMb` (rss, heapUsed, external, arrayBuffers) and `uptimeSecs`.
+
+## 30. Policy: after its own six-minute stall the daemon eliminated both players of a fast table — **fixed (outage grace)**
+
+**Observed 2026-09-04 (the #29 incident).** The daemon's event loop starved for six minutes,
+the whole window of a five-minute fast round. The replacement daemon's first tick applied the
+plain rule — any fast seat still owing the open round past its deadline is eliminated — to both
+seats, the table went to abandoned and was aborted, and the players lost the rake on a game they
+could not have continued: a fast seat has no move without the operator's channel.
+
+**Fix.** The daemon detects a gap in its own tick stamps and, for fast tables only, holds
+eliminations for one round length after it returns (docs/table-interface.md, "Outage grace").
+Tests: lifecycle (hold, then eliminate; on-chain unaffected), store (stamp cadence and
+round-trip), daemon (an old stamp holds, a fresh one does not). The contract is untouched.

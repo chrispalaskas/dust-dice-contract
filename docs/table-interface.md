@@ -235,6 +235,27 @@ share.
 **Declares a time** (`now`, pinned like `join`'s): the early start stamps round 0's deadline
 `now + turnTimeoutSecs`.
 
+### Outage grace on fast tables (2026-09-06)
+
+A fast seat cannot move without the operator's channel, so a round deadline that ran out while
+the operator was not serving is the operator's fault, not the player's. The daemon therefore
+holds its OWN eliminations after an outage (`service/src/daemon.ts` `#noteOutage`,
+`lifecycle.ts` `DecideOptions.fastEliminationHoldUntil`):
+
+- Every completed tick stamps `lastTickAt` in the state file (at most every 30 s). A tick that
+  finds the previous stamp more than 60 s old has just returned from an outage — a crash, a host
+  reboot, or a starved event loop (the 2026-09-04 case, #29) — and records the chain time of its
+  return.
+- For each FAST table, no seat is eliminated for a missed deadline until one full round length
+  (that table's sealed `turnTimeoutSecs`) has passed since the return. The roster explains the
+  hold ("outage grace: seat N is past its deadline but keeps its turn until T").
+- On-chain tables are untouched: their players move by their own transactions, and the
+  stage-parity rule already protects a seat waiting on the operator.
+- Every fresh gap restarts the hold; a daemon that keeps failing never eliminates anyone.
+
+The contract is unchanged: `eliminate` stays permissionless, so a third party could still act
+during the grace. This is the daemon's policy toward its own players.
+
 ### Creator-paid private tables (2026-09-06)
 
 A player who starts a private table pays for its deploy; the operator pays only for the tiers'
