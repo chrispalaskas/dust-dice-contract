@@ -20,7 +20,7 @@
  * differential test that fails one run in twenty gets ignored, and a failure has to be
  * reproducible on the machine that has to fix it.
  *
- * Run: npm test -w @yahtzee/contract
+ * Run: npm test -w @dust-dice/contract
  */
 
 import { describe, it } from 'node:test';
@@ -42,7 +42,7 @@ import {
   UPPER_BONUS,
   winnerSeat as refWinnerSeat,
   YAHTZEE_BONUS,
-  // Relative, not '@yahtzee/api/src/rules.ts'. That specifier does not resolve: api's
+  // Relative, not '@dust-dice/api/src/rules.ts'. That specifier does not resolve: api's
   // package.json declares an `exports` map with only '.' and './node', so Node rejects the
   // subpath outright (ERR_PACKAGE_PATH_NOT_EXPORTED) and this whole file fails to load --
   // taking its tests with it, silently, because a load failure counts as one failing file

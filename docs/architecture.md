@@ -1,6 +1,6 @@
 # Architecture
 
-Design record for Midnight Yahtzee. Sections marked **GATE 0** hold the answers to the two
+Design record for Dust Dice (named Midnight Yahtzee until 2026-09-06; the internal identifiers — hash domain strings `yahtzee:v1:*` sealed into the circuits, the wallet app-secret label `yahtzee-seat:<table>`, the browser storage keys — keep the old prefix on purpose: changing them would change every seat secret and every commitment). Sections marked **GATE 0** hold the answers to the two
 blocking questions; nothing downstream of them was built before they were answered with
 executed probes on a local devnet.
 

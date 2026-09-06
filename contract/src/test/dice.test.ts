@@ -10,7 +10,7 @@
  * mirror is written independently of the circuit and checked against it on random inputs
  * rather than being derived from it.
  *
- * Run: node --test src/test/dice.test.ts   (or npm test -w @yahtzee/contract)
+ * Run: node --test src/test/dice.test.ts   (or npm test -w @dust-dice/contract)
  */
 
 import { describe, it } from 'node:test';

@@ -9,7 +9,7 @@ together, which is the shape `Table.takeTurn` will actually have.
   `contract/src/takeTurn.compact` (dice **and** scoring in one circuit)
 - Reference: `api/src/rules.ts` — contract-canonical, and the circuit is checked against it
 - Tests: `contract/src/test/scoring.test.ts`
-- Reproduce: `npm run measure -w @yahtzee/contract`, `npm test -w @yahtzee/contract`
+- Reproduce: `npm run measure -w @dust-dice/contract`, `npm test -w @dust-dice/contract`
 
 Toolchain: Compact CLI 0.5.1, compactc 0.34.0, language 0.26.0,
 `@midnight-ntwrk/compact-runtime` 0.19.0. Machine: x86_64 linux, single-threaded compile —
@@ -349,7 +349,7 @@ filled at once — so it has a targeted test instead, ported from `rules.test.ts
 ### The reference is imported, not re-implemented
 
 `scoring.test.ts` imports `api/src/rules.ts` directly, as
-`@yahtzee/api/src/rules.ts` through the workspace symlink. There is deliberately no
+`@dust-dice/api/src/rules.ts` through the workspace symlink. There is deliberately no
 `scoring-mirror.ts`: unlike the dice, where `dice-mirror.ts` is the settlement verifier and has
 to exist independently, the scoring reference already exists and is canonical. A second copy in
 `contract/` would make the cross-check vacuous.
@@ -359,7 +359,7 @@ That import forced one tooling change: **Node's default strip-only type removal 
 (including the `Category[value]` reverse mapping that `rules.ts` uses in its error messages)
 that cannot be erased. Same family as dice-circuit.md §6.6's parameter properties, but this one
 is in a file the contract package does not own and must not rewrite. So
-`npm test -w @yahtzee/contract` now runs with `--experimental-transform-types`, which does the
+`npm test -w @dust-dice/contract` now runs with `--experimental-transform-types`, which does the
 full transform. All 27 pre-existing tests pass unchanged under it.
 
 ---

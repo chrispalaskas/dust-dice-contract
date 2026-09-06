@@ -360,8 +360,8 @@ different reason.
 
 ```sh
 docker compose -f probes/concurrency/docker-compose.yml up -d
-npm run compile -w @yahtzee/probe-concurrency
-npm run k       -w @yahtzee/probe-concurrency   # every circuit must be k=9..15
-npm run probe   -w @yahtzee/probe-concurrency   # ~2 h, almost all of it wallet startup
+npm run compile -w @dust-dice/probe-concurrency
+npm run k       -w @dust-dice/probe-concurrency   # every circuit must be k=9..15
+npm run probe   -w @dust-dice/probe-concurrency   # ~2 h, almost all of it wallet startup
 node probes/concurrency/tools/summarize.mjs     # regenerates the tables above from .run/
 ```

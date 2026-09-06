@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Public surface of @yahtzee/contract.
+ * Public surface of @dust-dice/contract.
  *
  * TWO CONTRACTS ARE MEANT TO BE DEPLOYED and four are not.
  *

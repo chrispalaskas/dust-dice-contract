@@ -269,7 +269,7 @@ timeout-coverage matrix (M1), and the client rules in [client-rules.md](client-r
 
 Measured after the fact, so the claims are checkable rather than asserted:
 
-- contract tests **130 green** (119 before, 11 added), `npm test -w @yahtzee/contract`
+- contract tests **130 green** (119 before, 11 added), `npm test -w @dust-dice/contract`
 - `npm run k -w cli`: **every exported circuit unchanged** — `join` 14, `takeTurn` 14,
   `resolveRoll1/2/3` 15, `settle` 13, `claimTimeout` 11, `abortTable` 12, lobby 13/13. The three
   resolve circuits were already at the k=15 ceiling with no headroom, and widening two

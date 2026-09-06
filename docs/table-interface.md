@@ -321,7 +321,7 @@ working as designed._
 | rake `q`, `r`        | **caller**      | `pot` divided by 100 at settle; `tier` by 100 at abortTable          |
 | seed commitment      | operator        | `seedCommitmentTs(tableId, seed)` **before the table opens**         |
 
-Mirrors live in `@yahtzee/contract`: `forcedEntropyTs`, `entropyKeyCommitmentTs`,
+Mirrors live in `@dust-dice/contract`: `forcedEntropyTs`, `entropyKeyCommitmentTs`,
 `seedCommitmentTs`, `mixEntropyTs`, `firstRollTs`, `rerollUnderMaskTs`, `mergeStreamTs`,
 `replayTurnTs`, `genesisDigestTs`, `joinDigestTs`, `roundDigestTs`, `eliminateDigestTs`,
 `redeemDigestTs`, `finalDigestTs`.

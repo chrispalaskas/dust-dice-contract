@@ -250,7 +250,7 @@ quote as circuit size; only key generation needs the full compile.
 | **table** | **1.03 s**  | **114.5 s** |
 | **lobby** | **0.43 s**  | **26.4 s**  |
 
-Reproduce with `npm run measure -w @yahtzee/contract` (writes `contract/build/measure/`).
+Reproduce with `npm run measure -w @dust-dice/contract` (writes `contract/build/measure/`).
 
 **The headline is `table`'s 1.03 s.** `takeTurn.compact` — a single seat, no pot, no turn order —
 takes 24.3 s, and its own header records that adding a whole-hand hold mask to it never finished
@@ -270,7 +270,7 @@ only one that compiles.
 ## 3. Circuit size and artifacts
 
 `<build>/zkir/<circuit>.zkir` instruction counts, and the keys from the full build.
-Reproduce with `npm run zkir-stats -w @yahtzee/contract`.
+Reproduce with `npm run zkir-stats -w @dust-dice/contract`.
 
 | contract | circuit        | instructions | inputs |     prover key | verifier key |
 | -------- | -------------- | -----------: | -----: | -------------: | -----------: |
@@ -564,7 +564,7 @@ parameters"` before suspecting anything else. If it is unprovable, the fallback 
 
 ## 7. Test coverage
 
-`npm test -w @yahtzee/contract` — **114 tests, all green** (62 pre-existing, 45 new for the table,
+`npm test -w @dust-dice/contract` — **114 tests, all green** (62 pre-existing, 45 new for the table,
 7 for the lobby). ~42 s.
 
 The happy-path tests are **differential**: `src/test/table-harness.ts` plays a whole game through
@@ -574,7 +574,7 @@ is compared as it is produced. That replay is not test scaffolding — it **is**
 verifier, the thing the browser "verify this game" panel and the CLI verifier will run, and the
 tests assert it reproduces a full six-seat game move for move.
 
-Three mirrors, one per include file, all flat-exported from `@yahtzee/contract`:
+Three mirrors, one per include file, all flat-exported from `@dust-dice/contract`:
 `dice-mirror.ts` (the ladder, pre-existing), `policy-mirror.ts` (hold policies, entropy scheme)
 and `table-mirror.ts` (the event digest chain).
 
@@ -638,7 +638,7 @@ Not applied — reported for the owner of those documents.
   clock cannot be read; and the policy-grinding residual (§8).
 - **`README.md`** should state that `Table` and `Lobby` are the deployable contracts and that
   `dice`/`turn`/`scoring`/`takeTurn` are measurement scaffolds that stay in the tree.
-- **`api/package.json`** blocks `@yahtzee/api/src/rules.ts` — its `exports` map publishes only
+- **`api/package.json`** blocks `@dust-dice/api/src/rules.ts` — its `exports` map publishes only
   `.` and `./node`, so Node rejects the subpath and `contract/src/test/scoring.test.ts` failed to
   load, silently taking its 35 tests with it (one failing _file_, not 35 failing tests). Worked
   around with a relative import on the contract side; the proper fix is a `./rules` subpath

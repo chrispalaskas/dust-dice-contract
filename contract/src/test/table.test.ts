@@ -47,7 +47,7 @@
  * (docs/gate0-report.md, Q1) and must be re-proven per circuit on devnet.
  * `describe('token custody')` at the bottom states exactly where the line falls.
  *
- * Run: npm test -w @yahtzee/contract
+ * Run: npm test -w @dust-dice/contract
  */
 
 import { describe, it } from 'node:test';
@@ -1097,7 +1097,11 @@ describe('the three-transaction resolve', () => {
     const wrong = bytes32(0x99);
 
     const withWrongSeed = async (fn: () => Promise<unknown>): Promise<void> => {
-      g.sim.privateState = { rollSeed: wrong, playerSecret: new Uint8Array(32) };
+      g.sim.privateState = {
+        rollSeed: wrong,
+        playerSecret: new Uint8Array(32),
+        inviteCode: new Uint8Array(32),
+      };
       await assert.rejects(fn, /does not open the table's seed/);
       g.sim.asOperator();
     };

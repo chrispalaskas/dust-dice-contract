@@ -49,7 +49,7 @@ import {
   isYahtzee as refIsYahtzee,
   RuleViolation,
   type Scorecard as RefScorecard,
-  // Relative rather than '@yahtzee/api/src/rules.ts': api's package.json `exports` map
+  // Relative rather than '@dust-dice/api/src/rules.ts': api's package.json `exports` map
   // publishes only '.' and './node', so the package specifier does not resolve and the file
   // fails to load. Same reason and same note as src/test/scoring.test.ts.
 } from '../../../api/src/rules.ts';

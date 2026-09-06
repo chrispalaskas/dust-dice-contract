@@ -1,6 +1,6 @@
 # Bugs found building on Midnight
 
-Running log of defects discovered in upstream components while building Midnight Yahtzee,
+Running log of defects discovered in upstream components while building Dust Dice,
 kept from commit one so each becomes an upstream issue/PR instead of tribal knowledge.
 
 Format per entry: **symptom**, **root cause**, **workaround/fix**, **intended upstream action**.

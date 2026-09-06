@@ -10,7 +10,7 @@ circuit cost in the project.
   (one roll + cost probes), `contract/src/turn.compact` (three rolls + hold policy)
 - Verifier mirror: `contract/src/dice-mirror.ts`
 - Tests: `contract/src/test/dice.test.ts`, `contract/src/test/fairness.test.ts`
-- Reproduce: `npm run measure -w @yahtzee/contract`, `npm test -w @yahtzee/contract`
+- Reproduce: `npm run measure -w @dust-dice/contract`, `npm test -w @dust-dice/contract`
 - **Companion page: docs/scoring-circuit.md** — the scoring half, the combined `takeTurn`
   circuit, and two corrections to this page (§3's constant verifier key, §6's account of
   bugs-found.md #1)

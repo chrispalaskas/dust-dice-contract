@@ -15,7 +15,7 @@
  * table's tier, seed commitment and timeouts off the TABLE before staking -- see the trust
  * note at the top of lobby.compact.
  *
- * Run: npm test -w @yahtzee/contract
+ * Run: npm test -w @dust-dice/contract
  */
 
 import { describe, it } from 'node:test';

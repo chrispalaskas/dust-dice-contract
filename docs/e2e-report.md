@@ -1,6 +1,6 @@
 # E2E report — a whole game of Yahtzee on a real chain
 
-A two-player, thirteen-round game of Midnight Yahtzee, played through the real circuits against
+A two-player, thirteen-round game of Dust Dice, played through the real circuits against
 the real proof server on the local devnet, settled with the winner and the rake paid out of the
 contract's own custody, and then re-verified from the chain log by a program that was given
 nothing but the table's address.
@@ -805,7 +805,7 @@ discoverable from documentation.
   exercised there, including mid-game forfeits, but no six-seat table has been played on a real
   node — the wall clock made it impractical here.
 - **Batching**, and therefore whether a turn can be brought back under two inclusion waits.
-- **The browser path.** Everything here ran through Node with `@yahtzee/api/node`'s plumbing; the
+- **The browser path.** Everything here ran through Node with `@dust-dice/api/node`'s plumbing; the
   dapp connector, wallet prompts and the in-page verifier panel are untested.
 - **Sustained multi-table load.** One table at a time, ~130 transactions total. The fee-state
   drift documented in bugs-found.md §0 #22 never appeared, but this run is not evidence that it
