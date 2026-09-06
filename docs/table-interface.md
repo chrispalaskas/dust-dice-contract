@@ -235,6 +235,32 @@ share.
 **Declares a time** (`now`, pinned like `join`'s): the early start stamps round 0's deadline
 `now + turnTimeoutSecs`.
 
+### Creator-paid private tables (2026-09-06)
+
+A player who starts a private table pays for its deploy; the operator pays only for the tiers'
+storefront tables. Three steps, two of them the operator's ops endpoint (`service/src/http.ts`):
+
+1. **Reserve** — `POST /tables/reserve {fast, inviteHash, seats, stake, turnTimeoutSecs,
+startAfterSecs}`. The operator validates the options against the contract's limits, generates
+   and persists the dice seed, and answers with every constructor argument: `tableId`,
+   `seedCommitment`, its `rakeAddress`, and the validated stake/seats/clocks/mode/invite. Nothing
+   is deployed. The reservation expires in 15 minutes (`RESERVATION_TTL_MS`), seed dropped.
+2. **Deploy** — the creator's wallet deploys `table.compact` with exactly those arguments
+   (`signerGateway.deployTable`, the same balance-and-submit path as every call; Moth balances a
+   deploy without special handling — measured 23 s, block 11454 on the main devnet). The deploy
+   carries nine verifier keys: ~43 KB against ~10 KB for a call, fee ≈ 9.9 × 10^15 DUST units.
+3. **Register** — `POST /tables/register {tableId, address}`. The operator reads the SEALED ledger
+   fields of the deployed contract (`Chain.seal`: tableId, seedCommitment, rakeAddress, tier,
+   seatLimit, turnTimeoutSecs, tableTimeoutSecs, fastMode, startAfterSecs, inviteHash) and
+   compares each with its reservation. One mismatch — a creator who substituted their own rake
+   address, say — and the table is refused with the field named; the reservation survives so an
+   honest creator whose deploy failed can retry. A match attaches the address: the table becomes
+   live and unlisted, driven like any other.
+
+The creator can put anything into the deploy; what they cannot do is make the operator drive it.
+A table is dead without the seed behind its commitment, so a table the operator refuses is a
+contract nobody can play. Registration trusts the chain, never the request body.
+
 **Who calls it.** The START branch is permissionless, and since 2026-09-04 the operator daemon
 deliberately never calls `abortTable` while it holds: the players decide when to begin (the UI's
 "Start now" button, any seated player). A "never-filled" refund is attempted only when the START
