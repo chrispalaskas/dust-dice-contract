@@ -257,6 +257,13 @@ startAfterSecs}`. The operator validates the options against the contract's limi
    honest creator whose deploy failed can retry. A match attaches the address: the table becomes
    live and unlisted, driven like any other.
 
+_Executed 2026-09-06 03:57 on a fresh probe devnet against the real daemon
+(`cli/src/fast/invite-e2e.ts`): reserve `f7cc0bef…`; a ROGUE deploy from the same reservation with
+the creator's address as `rakeAddress` (`20f117aa…`, 18 s) was refused at register with
+"rakeAddress is not what was reserved"; the honest deploy from the creator's wallet (`406deb52…`,
+17 s) registered, appeared unlisted in the roster, refused joins without and with a wrong code,
+and seated the code holder._
+
 The creator can put anything into the deploy; what they cannot do is make the operator drive it.
 A table is dead without the seed behind its commitment, so a table the operator refuses is a
 contract nobody can play. Registration trusts the chain, never the request body.
