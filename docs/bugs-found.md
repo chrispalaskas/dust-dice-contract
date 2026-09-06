@@ -892,6 +892,20 @@ longer covers — the window between "chain restarted" and "chain is dead to fee
 retention window, not the restart. Operational rule stands: after a reboot, write to the chain
 promptly; if it has sat idle for over an hour, treat it as wedged and start fresh.
 
+**Eighth data point (2026-09-06 01:30, both chains — the retention-window reading survives,
+with a twist).** Both devnets' nodes had been down about 24 hours (the main one crashed on its
+own, #28; the host then rebooted). Brought back on persisted state: the MAIN chain accepted a
+write from the operator's genesis wallet seven minutes after the restart (an `abortTable` at
+block 10150) — a wallet registered long before the outage, whose DUST view the node still
+covered. On the PROBE chain, genesis likewise funded a fresh wallet fine, but that wallet's own
+first spend — registered and accruing DUST only AFTER the restart — was rejected with the same
+`InvalidDustSpendProof`, six attempts, six rejections (`v_fee 9925428540320396`, a table deploy).
+So the wedge is not "the chain" but "a wallet whose declared dust time the node cannot place":
+a registration made against a node whose history has a day-long hole yields DUST the node will
+not honour, while a wallet from before the hole keeps working. Operational consequence for the
+recipe: after a long outage, do not register NEW wallets on that chain; either keep using
+pre-outage wallets or start fresh.
+
 **The rc.4 pin, attempted 2026-09-03 — BLOCKED upstream.** The pairing that exists: node
 `2.1.0-beta.1` (release notes: ledger 9.1.0.0-rc.4), `@midnightntwrk/ledger-v9@1.0.0-rc.4` on npm
 (forced through the SDK's twelve exact rc.3 pins with a root `overrides` entry and a clean
@@ -1138,3 +1152,19 @@ cleared, and a fresh one opened with the current values — automatically, every
 holding a stake is left alone whatever changed. First exercised live by the move to six-seat
 tiers: all eight operator tables were swapped on restart. The manual recipe above remains for a
 table with stakes in it.
+
+## 28. node 2.0.0-rc.4: the node shut itself down — `Essential task \`txpool-background\` failed` — after 20 minutes of ordinary play — **open**
+
+**Observed 2026-09-05 00:57 UTC, main devnet, block 10083.** Idle single-authority devnet, no
+peers, tables being deployed and joined normally (last transaction applied 00:45). At 00:57:10
+the node logged `Essential task \`txpool-background\` failed. Shutting down service.`then`Dropped HF storage after rollback (separate)`and exited with code 0 — a clean-looking exit for
+what is a crash of the transaction-pool task. Nothing preceded it but two`Failed to trigger
+bootstrap: No known peers` lines (routine on a one-node chain). The container has no restart
+policy, so the chain stayed down until the host rebooted a day later; the indexer and proof
+server are unaffected. On restart from persisted state the chain resumed at 10084 and accepted
+writes (see #15, eighth data point).
+
+**Impact.** Every player and the operator lose the chain silently; the UI shows nothing but
+stale reads. **Mitigation:** run the node with `restart: unless-stopped` in the compose file so
+a crash is a one-block hiccup, and have the daemon's health report the node's tip age so a
+stalled chain is visible. **Not yet reproduced;** the cause is in the node, not this project.
