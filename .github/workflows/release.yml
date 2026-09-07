@@ -1,0 +1,42 @@
+# Publishes the three packages to npm on a version tag, through npm's trusted publishing
+# (OIDC from this workflow — no token stored anywhere). Each package is published only when
+# its package.json version is not on the registry yet, so re-running a tag is harmless.
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Install Compact CLI + compiler
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/midnightntwrk/compact/releases/latest/download/compact-installer.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/compact" update 0.34.0
+      - run: npm ci
+      - name: Compile contracts WITH proving keys (the published tarball ships them)
+        run: npm run compact -w contract
+      - run: npm run build
+      - run: npm test
+      - name: Publish what is not on the registry yet
+        run: |
+          set -e
+          for ws in contract api verifier; do
+            name=$(node -p "require('./$ws/package.json').name")
+            version=$(node -p "require('./$ws/package.json').version")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version already published — skipping"
+            else
+              npm publish -w "$ws" --provenance
+            fi
+          done

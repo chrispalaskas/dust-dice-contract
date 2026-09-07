@@ -48,12 +48,17 @@ same version as the git tag:
 ```sh
 npm publish -w contract   # no internal deps; ships dist/ with keys+ZKIR for table and lobby (~57 MB)
 npm publish -w api        # ships dist/ and src/
-npm publish -w verifier   # ships src/ (runs as TypeScript under Node's type stripping)
+npm publish -w verifier   # ships dist/ (with the `dust-dice-verify` bin) and src/
 ```
 
 `publishConfig.access: public` is set on each, so no flag is needed. Versions cannot be reused
-once published, so check `npm pack -w <ws> --dry-run` first. CI should publish through npm's
-trusted publishing (OIDC from GitHub Actions) rather than a long-lived token.
+once published, so check `npm pack -w <ws> --dry-run` first.
+
+**Releases publish from CI.** Pushing a `v*` tag runs `.github/workflows/release.yml`, which
+compiles with proving keys, builds, tests, and publishes every package whose version is not on
+the registry yet — through npm's trusted publishing (OIDC), so no token lives anywhere. Each
+package on npmjs.com needs a trusted publisher configured once: this repository, workflow
+`release.yml`.
 
 ## Built on Midnight
 

@@ -1,12 +1,29 @@
 {
   "name": "@dust-dice/verifier",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "module",
   "description": "Independent verifier for Dust Dice: replays every roll of a finished table from the chain's own record \u2014 no operator, no trust \u2014 and the shared read-side helpers (compiled-contract handles, indexer queries).",
   "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts.d.ts",
+      "default": "./dist/contracts.js"
+    },
+    "./indexer": {
+      "types": "./dist/indexer.d.ts",
+      "default": "./dist/indexer.js"
+    },
     "./src/*": "./src/*"
   },
   "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && chmod +x dist/verify.js",
     "verify": "node src/verify.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
@@ -27,6 +44,7 @@
     "access": "public"
   },
   "files": [
+    "dist",
     "src"
   ],
   "repository": {
@@ -36,7 +54,11 @@
   },
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=22.6"
+    "node": ">=22"
   },
-  "//engines": "src/verify.ts runs as TypeScript under Node's type stripping (default from Node 23; --experimental-strip-types on 22.6+)."
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "dust-dice-verify": "dist/verify.js"
+  }
 }

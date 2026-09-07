@@ -18,7 +18,7 @@
   },
   "scripts": {
     "compact": "npm run compact -w contract",
-    "build": "npm run build -w contract && npm run build -w api",
+    "build": "npm run build -w contract && npm run build -w api && npm run build -w verifier",
     "lint": "eslint .",
     "format": "prettier --check .",
     "typecheck": "npm run typecheck --workspaces --if-present",

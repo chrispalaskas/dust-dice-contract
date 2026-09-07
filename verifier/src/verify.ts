@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Copyright (C) Shielded Technologies
 // SPDX-License-Identifier: Apache-2.0
 
