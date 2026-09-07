@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Contract interaction layer + pure game rules. No React imports — framework-swap seam. The './node' entry carries wallet/provider plumbing and must never be imported from browser code.",
+  "description": "Contract interaction layer + pure game rules. No React imports \u2014 framework-swap seam. The './node' entry carries wallet/provider plumbing and must never be imported from browser code.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -32,6 +32,7 @@
     "@midnight-ntwrk/midnight-js-types": "5.0.0-beta.7",
     "@midnight-ntwrk/midnight-js-utils": "5.0.0-beta.7",
     "@midnight-ntwrk/wallet-sdk": "2.0.0-beta.2",
+    "@midnight-ntwrk/wallet-sdk-dust-wallet": "5.0.0-beta.2",
     "rxjs": "^7.8.1"
   },
   "devDependencies": {

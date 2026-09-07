@@ -1209,3 +1209,29 @@ could not have continued: a fast seat has no move without the operator's channel
 eliminations for one round length after it returns (docs/table-interface.md, "Outage grace").
 Tests: lifecycle (hold, then eliminate; on-chain unaffected), store (stamp cadence and
 round-trip), daemon (an old stamp holds, a fresh one does not). The contract is untouched.
+
+## 31. wallet-sdk 2.0.0-beta.2: DUST balancing loops forever when smallest-first coin selection cannot cover the fee — the operator daemon at 3 GB in nine minutes — **worked around**
+
+**Observed 2026-09-07 00:08 UTC, main devnet.** Every fee-paying transaction from the operator's
+genesis wallet stopped landing: the daemon's event loop blocked, RSS climbed ~16 MB/s to 3 GB,
+health stopped answering, players sat on "Operator is rolling". A restart reproduced it before the
+first move — on the lobby re-advertise. Not the chain (blocks advanced; the lane wallets
+transacted normally), not the JS heap (164 MB), but `external` memory: 2.75 GB of WASM objects.
+
+**Diagnosis, by instrumenting `TransactingCapabilityImplementation.dryRunFee`.** The genesis
+wallet held 16 DUST coins: three of 2.5 × 10^23, one of 1.7 × 10^22, and a dozen tiny change
+coins (3–4 × 10^13) left behind by hundreds of past fee payments. The SDK's default
+`chooseCoin` is SMALLEST-FIRST. Iteration 1 selected eight tiny coins (coverage 1.41 × 10^15)
+against a fee of 1.43 × 10^15 for a transaction with that many spends — not covered. Iteration 2,
+asked to cover the larger fee, returned ZERO inputs (the counter-offer's output/input decision
+flips), coverage 0, fee 6.7 × 10^14; and `computeBalancingRecipe`'s `Effect.iterate` runs
+`while (!converged)` with `converged = newFee <= coverage` — false forever. Each iteration
+deserialises and `eraseProofs()` a fresh WASM transaction that nothing frees while the loop holds
+the thread. A wallet with one large DUST coin (each lane wallet) converges in one iteration, 8 ms.
+
+**Workaround (api/src/node/wallet.ts).** The dust wallet is built with `CustomDustWallet` and a
+LARGEST-FIRST `CoinSelection`: one coin covers any fee, one iteration. Verified: the genesis
+transfer that spun for minutes now balances in 8 ms and lands. **Upstream:** the loop needs a
+progress check (no inputs, or fee unchanged → fail with InsufficientFunds), and smallest-first is
+the wrong default for a fee token whose change coins are dust-sized. **Any wallet built on this
+SDK line has the same default** — a browser wallet that has paid many fees will hit it too.

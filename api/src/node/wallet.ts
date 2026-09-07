@@ -25,8 +25,12 @@ import * as ledger from '@midnight-ntwrk/midnight-js-protocol/ledger';
 import { unshieldedToken } from '@midnight-ntwrk/midnight-js-protocol/ledger';
 import { setNetworkId, getNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 import {
+  CoinsAndBalances as DustCoins,
+  CustomDustWallet,
+  V1Builder,
+} from '@midnight-ntwrk/wallet-sdk-dust-wallet/v1';
+import {
   WalletFacade,
-  DustWallet,
   HDWallet,
   Roles,
   ShieldedWallet,
@@ -77,6 +81,20 @@ export async function waitForUsableSync(ctx: WalletContext): Promise<FacadeState
   return Rx.firstValueFrom(ctx.wallet.state().pipe(Rx.filter(isUsableSync)));
 }
 
+/**
+ * DUST coin selection: the LARGEST coin first.
+ *
+ * The SDK's default picks the smallest coin first. A wallet that has paid many fees holds a
+ * dozen tiny DUST change coins beside a few large ones, and smallest-first then selects only the
+ * tiny ones; the fee of a transaction with that many spends exceeds what they cover, the next
+ * round of the SDK's balancing loop selects NOTHING, and the loop — which only stops when the
+ * fee is covered — spins forever, allocating WASM transactions with the event loop blocked
+ * (observed live: the operator daemon at 3 GB in nine minutes; docs/bugs-found.md #31). One
+ * large coin covers any fee in a single iteration.
+ */
+const largestDustCoinFirst: DustCoins.CoinSelection = (coins) =>
+  [...coins].sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : 0)).at(0);
+
 export async function createWallet(network: NetworkConfig, seed: string): Promise<WalletContext> {
   setNetworkId(network.networkId);
   const networkId = getNetworkId();
@@ -109,10 +127,10 @@ export async function createWallet(network: NetworkConfig, seed: string): Promis
     unshielded: async (config) =>
       UnshieldedWallet(config).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
     dust: async (config) =>
-      DustWallet(config).startWithSecretKey(
-        dustSecretKey,
-        ledger.LedgerParameters.initialParameters().dust,
-      ),
+      CustomDustWallet(
+        config,
+        new V1Builder().withDefaults().withCoinSelection(() => largestDustCoinFirst),
+      ).startWithSecretKey(dustSecretKey, ledger.LedgerParameters.initialParameters().dust),
   });
 
   await wallet.start(shieldedSecretKeys, dustSecretKey);
