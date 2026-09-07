@@ -1,9 +1,8 @@
 {
   "name": "@dust-dice/verifier",
-  "version": "0.0.1",
-  "private": true,
+  "version": "0.4.0",
   "type": "module",
-  "description": "Independent verifier for Dust Dice: replays every roll of a finished table from the chain's own record — no operator, no trust — and the shared read-side helpers (compiled-contract handles, indexer queries).",
+  "description": "Independent verifier for Dust Dice: replays every roll of a finished table from the chain's own record \u2014 no operator, no trust \u2014 and the shared read-side helpers (compiled-contract handles, indexer queries).",
   "exports": {
     "./src/*": "./src/*"
   },
@@ -12,8 +11,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@dust-dice/api": "0.0.1",
-    "@dust-dice/contract": "0.0.1",
+    "@dust-dice/api": "0.4.0",
+    "@dust-dice/contract": "0.4.0",
     "@midnight-ntwrk/compact-runtime": "0.19.0",
     "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "5.0.0-beta.7",
     "@midnight-ntwrk/midnight-js-network-id": "5.0.0-beta.7",
@@ -23,5 +22,21 @@
   "devDependencies": {
     "@types/node": "^26.4.0",
     "typescript": "^6.0.3"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chrispalaskas/dust-dice-contract.git",
+    "directory": "verifier"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "//engines": "src/verify.ts runs as TypeScript under Node's type stripping (default from Node 23; --experimental-strip-types on 22.6+)."
 }

@@ -40,6 +40,21 @@ the players' own entropy — the operator cannot choose the dice, and after sett
 replay the whole game with `verifier`. On a **fast** table the ORDER of a player's rolls rests on
 the operator's word, and the docs say so wherever it matters. See `docs/security-review.md`.
 
+## Publishing (maintainers)
+
+The three workspaces publish to npm under the `@dust-dice` scope, in dependency order, each at the
+same version as the git tag:
+
+```sh
+npm publish -w contract   # no internal deps; ships dist/ with keys+ZKIR for table and lobby (~57 MB)
+npm publish -w api        # ships dist/ and src/
+npm publish -w verifier   # ships src/ (runs as TypeScript under Node's type stripping)
+```
+
+`publishConfig.access: public` is set on each, so no flag is needed. Versions cannot be reused
+once published, so check `npm pack -w <ws> --dry-run` first. CI should publish through npm's
+trusted publishing (OIDC from GitHub Actions) rather than a long-lived token.
+
 ## Built on Midnight
 
 This project is built on the [Midnight Network](https://midnight.network), using the

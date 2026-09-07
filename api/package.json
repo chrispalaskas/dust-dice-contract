@@ -1,7 +1,6 @@
 {
   "name": "@dust-dice/api",
-  "version": "0.0.1",
-  "private": true,
+  "version": "0.4.0",
   "type": "module",
   "description": "Contract interaction layer + pure game rules. No React imports \u2014 framework-swap seam. The './node' entry carries wallet/provider plumbing and must never be imported from browser code.",
   "main": "dist/index.js",
@@ -38,5 +37,18 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "vitest": "^3.0.0"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chrispalaskas/dust-dice-contract.git",
+    "directory": "api"
+  },
+  "license": "Apache-2.0"
 }
