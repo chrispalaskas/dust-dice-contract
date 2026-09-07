@@ -40,7 +40,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/chrispalaskas/dust-dice-contract.git",
+    "url": "git+https://github.com/chrispalaskas/dust-dice-contract.git",
     "directory": "contract"
   },
   "license": "Apache-2.0",
