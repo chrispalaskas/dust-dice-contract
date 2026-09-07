@@ -40,6 +40,12 @@ the players' own entropy — the operator cannot choose the dice, and after sett
 replay the whole game with `verifier`. On a **fast** table the ORDER of a player's rolls rests on
 the operator's word, and the docs say so wherever it matters. See `docs/security-review.md`.
 
+## Built on Midnight
+
+This project is built on the [Midnight Network](https://midnight.network), using the
+[Compact](https://docs.midnight.network/develop/reference/compact/) smart contract language and the
+Midnight.js SDK.
+
 ## Licence
 
 Apache-2.0. Build on it as you like.
