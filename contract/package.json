@@ -1,6 +1,6 @@
 {
   "name": "@dust-dice/contract",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -19,12 +19,12 @@
     "typecheck": "tsc --noEmit",
     "//test": "--experimental-transform-types, not the default strip-only mode: the scoring cross-check imports api/src/rules.ts, whose `export enum Category` strip-only refuses (ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX -- an enum has runtime behaviour that cannot be erased). See docs/scoring-circuit.md.",
     "test": "node --experimental-transform-types --disable-warning=ExperimentalWarning --test \"src/test/*.test.ts\"",
-    "build": "rm -rf dist && tsc -p tsconfig.build.json && for m in dice turn scoring takeTurn table lobby; do mkdir -p dist/managed/$m && cp -R src/managed/$m/contract dist/managed/$m/contract; done && for m in table lobby; do for d in keys zkir; do [ -d src/managed/$m/$d ] && cp -R src/managed/$m/$d dist/managed/$m/$d; done; done; true",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && for m in dice turn scoring takeTurn table lobby; do mkdir -p dist/managed/$m && cp -R src/managed/$m/contract dist/managed/$m/contract; done && for m in table lobby; do for d in keys zkir compiler; do [ -d src/managed/$m/$d ] && cp -R src/managed/$m/$d dist/managed/$m/$d; done; done; true",
     "ci": "npm run compact && npm run typecheck && npm run build && npm run test",
     "//compact": "table.compact and lobby.compact `include \"policy-core\"`, so COMPACT_PATH must point at src/. The four measurement contracts do not need it (their includes resolve relative to the source), but setting it uniformly keeps the two halves of this list from diverging.",
     "compact:table": "COMPACT_PATH=$PWD/src compact compile src/table.compact src/managed/table",
     "compact:lobby": "COMPACT_PATH=$PWD/src compact compile src/lobby.compact src/managed/lobby",
-    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 9 && test -d dist/managed/lobby/keys || { echo 'refusing to publish: dist/managed lacks the proving keys \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
+    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 9 && test -d dist/managed/lobby/keys && test -f dist/managed/table/compiler/contract-manifest.json && test -f dist/managed/lobby/compiler/contract-manifest.json || { echo 'refusing to publish: dist/managed lacks the proving keys or the compiler manifest \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-runtime": "0.19.0"
@@ -44,6 +44,6 @@
     "directory": "contract"
   },
   "license": "Apache-2.0",
-  "//build": "dist/managed carries compiled JS for all six modules but keys+zkir only for the two deployables (table, lobby): the four sub-modules' keys are measurement builds nobody deploys, and they would triple the tarball.",
+  "//build": "dist/managed carries compiled JS for all six modules but keys, ZKIR and the compiler manifest only for the two deployables (table, lobby): the four sub-modules' keys are measurement builds nobody deploys, and they would triple the tarball. The compiler/ manifest is REQUIRED: midnight-js's ZK config providers verify every key and ZKIR against it and refuse to read them without it (0.4.0 shipped without it and could not prove).",
   "//prepublishOnly": "A skip-ZK compile (CI) builds a dist without keys; a tarball made from it would install but could never prove. The guard makes that a loud failure instead of a silently broken package."
 }

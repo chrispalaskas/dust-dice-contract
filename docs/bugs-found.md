@@ -1235,3 +1235,9 @@ transfer that spun for minutes now balances in 8 ms and lands. **Upstream:** the
 progress check (no inputs, or fee unchanged → fail with InsufficientFunds), and smallest-first is
 the wrong default for a fee token whose change coins are dust-sized. **Any wallet built on this
 SDK line has the same default** — a browser wallet that has paid many fees will hit it too.
+
+## 32. Operational: `@dust-dice/contract` 0.4.0 shipped without `compiler/contract-manifest.json` — every ZK config read failed — **fixed in 0.4.1**
+
+**Observed 2026-09-07.** The first published tarball carried `dist/managed/{table,lobby}/{contract,keys,zkir}` but not `compiler/`, the directory where compactc 0.34 writes `contract-manifest.json`. midnight-js's `NodeZkConfigProvider` (and the fetch provider in `require` mode) verifies every key and ZKIR it reads against that manifest and, finding none, fails with `ZKConfigurationReadError: Failed to read verifier key for Table#join` — a message that points at the key, which was present, rather than at the manifest, which was not. The operator daemon could read the package's keys for its build fingerprint (a plain hash) yet could not prove a single circuit.
+
+**Fix.** The build copies `compiler/` for the two deployables and `prepublishOnly` refuses a dist without the manifests. 0.4.1 ships them. A source checkout never hit this because `src/managed` always had the directory.
