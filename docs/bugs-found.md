@@ -1241,3 +1241,50 @@ SDK line has the same default** — a browser wallet that has paid many fees wil
 **Observed 2026-09-07.** The first published tarball carried `dist/managed/{table,lobby}/{contract,keys,zkir}` but not `compiler/`, the directory where compactc 0.34 writes `contract-manifest.json`. midnight-js's `NodeZkConfigProvider` (and the fetch provider in `require` mode) verifies every key and ZKIR it reads against that manifest and, finding none, fails with `ZKConfigurationReadError: Failed to read verifier key for Table#join` — a message that points at the key, which was present, rather than at the manifest, which was not. The operator daemon could read the package's keys for its build fingerprint (a plain hash) yet could not prove a single circuit.
 
 **Fix.** The build copies `compiler/` for the two deployables and `prepublishOnly` refuses a dist without the manifests. 0.4.1 ships them. A source checkout never hit this because `src/managed` always had the directory.
+
+## 34. The verifier could not check any real multiplayer game: per-block replay, a dead switch arm, and calls that landed without effect — **fixed**
+
+**Reported 2026-09-10**, from the verify page on a settled FAST table: `VERIFICATION FAILED — 2
+checks passed, 1 failed`, the failure being "at most one call per block ... this table cannot be
+verified by this method". An honest game, a red banner. Three separate defects behind it.
+
+**1. Per-block replay cannot see inside a transaction.** The replay read contract state at each
+call's block height and diffed consecutive states to learn what a call was told. A FAST turn is
+ONE transaction carrying the whole turn — open, resolve, hold, resolve, hold, resolve, score, up
+to seven calls — so no state between them was ever written and the whole method collapsed. Fast
+is the default mode, so the flagship trust feature reported FAILED on the flagship game mode.
+It bit on-chain tables too: the daemon runs three signing wallets specifically so seat-scoped
+work lands in one block, and an aborted table eliminates several seats in one block.
+
+**Fix.** The replay groups the log by TRANSACTION and verifies a merged turn against the state it
+produced, needing no "before" state at all. Everything the turn consumed is still on the ledger
+afterwards (`SeatTurn`: entropy, the mixed entropy latched at roll 1, both hold masks, the last
+roll) and the number of rolls is the transaction's own call count. The rolls are a hash chain, so
+checking the last one checks all of them; two seats settling in one block are told apart by
+trying the derivation, since a wrong pairing cannot reproduce the stored roll. `join`,
+`closeRound`, `eliminate` and `redeem` likewise identify their seat from the after state and the
+replay's own counters instead of a diff. A single turn call that shares its block is now
+_reported_ as unseparable rather than checked against the wrong state.
+
+**2. The browser verifier had a dead switch arm.** It matched `resolveRoll1`, `resolveRoll2`,
+`resolveRoll3` — but the contract has had `resolveRoll1` + `resolveReroll` since the two-circuit
+split, so every reroll fell through to `default: unrecognised entry point`. Rolls 2 and 3 were
+never checked in the browser at all, silently, while the page advertised "all three rolls, not
+just the final hand". The CLI verifier had the right arms; only the port was wrong.
+
+**3. A transaction whose fallible section fails still lands in the public log.** This table's log
+held three `join` calls for two seats and three `eliminate` calls for one elimination: the extras
+landed on chain and changed nothing. The replay folded the digest for each, corrupting the chain
+from the first extra onwards — which is what produced 24 downstream failures once the block
+collision no longer masked them. Every handler is now a no-op check first: a join that did not
+raise the seat count, a close that did not advance the round, an eliminate that marked no new
+seat, a redeem that paid nobody, are all reported and skipped.
+
+**Also.** An unsettled or aborted table said `VERIFICATION FAILED` where it means "no seed was
+ever revealed, so there is nothing to replay" — now a distinct not-verifiable outcome, as is a
+log with unseparable calls (amber `unverifiable`, never red).
+
+**Verified 2026-09-10** on the settled fast table `bb0ca09f…` (2 seats, 3 rounds, a walkover,
+43 calls in 17 transactions of which 6 are merged turns): CLI `VERIFIED: 150 checks passed, 0
+failed`, exit 0; the browser panel `VERIFIED: 126 checks passed, 0 failed`. Before the change the
+same table reported 2 passed / 1 failed.

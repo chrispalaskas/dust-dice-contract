@@ -144,48 +144,85 @@ class Checks {
   }
 }
 
-/** One entry of the public log, with the contract state it produced. */
-interface Step {
-  action: ContractAction;
+/**
+ * One TRANSACTION of the public log: the calls it carried, and the state it produced.
+ *
+ * Grouped by transaction rather than by call because a FAST turn is ONE transaction carrying the
+ * whole turn -- open, resolve, hold, resolve, hold, resolve, score, up to seven calls -- and the
+ * chain never held a state between them for anyone to read. Such a turn is verified against the
+ * state the transaction produced instead (`verifyMergedTurn` below), which needs no "before"
+ * state at all and is therefore sound however many seats settle in the same block.
+ */
+interface LogGroup {
+  blockHeight: number;
+  txHash: string;
+  /** Entry points this one transaction carried, in whatever order the indexer returned them. */
+  entryPoints: string[];
+  /** Contract state after the block this transaction landed in. */
   led: TableLedger;
+  /** Another transaction touched this table in the same block. */
+  sharesBlock: boolean;
 }
 
-/**
- * Read the table's whole history: every action, and the state it left behind.
- *
- * One `queryContractState` per action, pinned to that action's block. `contractStateObservable`
- * is not usable for this -- it misses rapid successive updates and its first emission may
- * predate the write being read (bugs-found.md §0 #10).
- */
-async function readHistory(address: string): Promise<Step[]> {
-  const actions = await contractActions(address);
-  const steps: Step[] = [];
-  for (const action of actions) {
-    if (action.kind === 'ContractDeploy') continue;
-    steps.push({ action, led: await readTableLedger(address, action.blockHeight) });
-  }
+/** The calls a turn is made of, merged into one transaction or spread over several. */
+const TURN_CALLS = new Set([
+  'playerMove',
+  'resolveRoll1',
+  'resolveRoll2',
+  'resolveRoll3',
+  'resolveReroll',
+]);
 
-  // The replay reads each step's PREVIOUS state to learn what the call was told (which seat was
-  // at which stage, which boxes were filled, which mask was pending). That is only sound while
-  // at most one call to this table lands per block: two in one block would both resolve to the
-  // state after both, and the second step's "before" would be wrong.
-  //
-  // A table CAN take several calls in one block -- that is the whole point of the concurrency
-  // work, measured at six in docs/concurrency-probe.md -- so this is a real limitation of
-  // per-block state replay and not a property of the contract. The demo driver is strictly
-  // sequential precisely so that its games stay verifiable by this method; a table played by six
-  // independent clients may not be. Saying so is much better than silently producing wrong
-  // answers.
-  const heights = steps.map((s) => s.action.blockHeight);
-  const collisions = heights.filter((h, i) => heights.indexOf(h) !== i);
-  if (collisions.length > 0) {
-    throw new Error(
-      `two or more calls to this table share block ${[...new Set(collisions)].join(', ')}. ` +
-        'The per-block state replay cannot separate them, so this table cannot be verified by ' +
-        'this method. (This is a limitation of the verifier, not a fault in the game.)',
-    );
+/**
+ * Causal order for two transactions that landed in the same block. Not a guess: the contract's
+ * own preconditions force it -- a seat joins before it can move, every live seat must have
+ * scored before `closeRound` is accepted, and `settle` precedes the `redeem`s it funds.
+ */
+const GROUP_RANK: Record<string, number> = {
+  join: 0,
+  playerMove: 1,
+  resolveRoll1: 1,
+  resolveRoll2: 1,
+  resolveRoll3: 1,
+  resolveReroll: 1,
+  eliminate: 2,
+  closeRound: 3,
+  settle: 4,
+  redeem: 5,
+  abortTable: 6,
+};
+
+/**
+ * Read the table's whole history: every transaction, and the state it left behind.
+ *
+ * One `queryContractState` per transaction, pinned to its block. `contractStateObservable` is
+ * not usable for this -- it misses rapid successive updates and its first emission may predate
+ * the write being read (bugs-found.md §0 #10).
+ */
+async function readHistory(address: string): Promise<LogGroup[]> {
+  const actions = (await contractActions(address)).filter((a) => a.kind !== 'ContractDeploy');
+  const byTx = new Map<string, ContractAction[]>();
+  for (const a of actions) byTx.set(a.txHash, [...(byTx.get(a.txHash) ?? []), a]);
+
+  const groups: LogGroup[] = [];
+  for (const [txHash, calls] of byTx) {
+    groups.push({
+      blockHeight: calls[0]!.blockHeight,
+      txHash,
+      entryPoints: calls.map((x) => x.entryPoint ?? '?'),
+      led: await readTableLedger(address, calls[0]!.blockHeight),
+      sharesBlock: false,
+    });
   }
-  return steps;
+  groups.sort((a, b) =>
+    a.blockHeight !== b.blockHeight
+      ? a.blockHeight - b.blockHeight
+      : (GROUP_RANK[a.entryPoints[0] ?? '?'] ?? 9) - (GROUP_RANK[b.entryPoints[0] ?? '?'] ?? 9),
+  );
+  for (const g of groups) {
+    g.sharesBlock = groups.some((o) => o !== g && o.blockHeight === g.blockHeight);
+  }
+  return groups;
 }
 
 /** The seat whose `seatTurn` entry changed between two states, or -1. */
@@ -258,14 +295,16 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     `  mode           ${final.fastMode ? 'FAST (turn ordering operator-attested)' : 'on-chain (ordering chain-proven)'}`,
   );
 
-  c.ok(
-    'the table reached settlement',
-    final.phase === Table.Phase.settled,
-    `phase is ${Table.Phase[final.phase]}; only a settled table reveals its seed`,
-  );
+  // A table that never settled is NOT a failed verification: an aborted or still-playing table
+  // has not revealed its seed, so there is nothing to replay yet. Saying "FAILED" here would
+  // read as an accusation about a game that simply is not over.
   if (final.phase !== Table.Phase.settled) {
-    c.summary();
-    return 1;
+    console.log(
+      `\nNOT VERIFIABLE YET: this table is ${Table.Phase[final.phase]}. Only a settled table ` +
+        'reveals the seed,\nand without the seed no roll can be re-derived. Nothing here says ' +
+        'the game was dishonest.',
+    );
+    return 3;
   }
 
   // ---------------------------------------------------------------- 1. the seed opens the commit
@@ -297,8 +336,9 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   );
 
   // ------------------------------------------------------------------------- walk the public log
-  const steps = await readHistory(address);
-  console.log(`\n── the public log: ${steps.length} calls ──`);
+  const groups = await readHistory(address);
+  const callCount = groups.reduce((n, g) => n + g.entryPoints.length, 0);
+  console.log(`\n── the public log: ${callCount} calls in ${groups.length} transaction(s) ──`);
 
   let digest = genesisDigestTs(tableId);
   const seats: SeatReplay[] = Array.from({ length: seatCount }, () => ({
@@ -316,15 +356,182 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   let closes = 0;
   let eliminations = 0;
 
-  /** State immediately before the step being examined -- the previous step's, or the deploy's. */
-  const before = (i: number): TableLedger | undefined => (i === 0 ? undefined : steps[i - 1]!.led);
+  /** State immediately before the group being examined -- the previous group's, or the deploy's. */
+  const before = (i: number): TableLedger | undefined => (i === 0 ? undefined : groups[i - 1]!.led);
+  /** Turn calls this replay could not separate. Non-empty means the verdict is not a clean one. */
+  const unseparable: string[] = [];
+  /** Seats whose redemption has already been accounted for, so a second one is not double-read. */
+  const redeemed = new Set<number>();
 
-  for (let i = 0; i < steps.length; i++) {
-    const { action, led } = steps[i]!;
+  /**
+   * A whole turn in ONE transaction -- the fast path, and the shape every fast table has.
+   *
+   * The chain never stored a state between the calls, so there is no "before" to diff. It does
+   * not need one: everything the turn consumed is still on the ledger afterwards -- the seat's
+   * entropy, the mixed entropy latched at roll 1, both hold masks, the last roll (`SeatTurn`) --
+   * and how many rolls the turn took is the transaction's own call count (one `resolveRoll1`
+   * plus N `resolveReroll` is N+1 rolls, against N+2 `playerMove`s: open, N holds, score).
+   *
+   * The roll chain is a hash chain: roll 2 is derived from roll 1 under the player's mask, roll 3
+   * from roll 2. So if roll 1 or roll 2 were not what the operator claimed, the LAST roll could
+   * not match the one the chain stored. Checking the end of the chain checks all of it.
+   *
+   * Reading only this seat's fields is what makes it sound when two seats settle in the same
+   * block: their turns touch disjoint cells, and the digest this replay folds is its own.
+   */
+  const verifyMergedTurn = (g: LogGroup): void => {
+    const led = g.led;
+    const moves = g.entryPoints.filter((k) => k === 'playerMove').length;
+    const firsts = g.entryPoints.filter((k) => k === 'resolveRoll1').length;
+    const rerolls = g.entryPoints.filter(
+      (k) => k === 'resolveReroll' || k === 'resolveRoll2' || k === 'resolveRoll3',
+    ).length;
+    const rolls = firsts + rerolls;
+    const where = `tx ${g.txHash.slice(0, 10)}… (block ${g.blockHeight})`;
+    if (firsts !== 1 || moves !== rolls + 1) {
+      c.ok(
+        `${where}: reads as one turn`,
+        false,
+        `${moves} playerMove + ${firsts} resolveRoll1 + ${rerolls} reroll is not ` +
+          'open/(hold,resolve)*/score',
+      );
+      return;
+    }
+
+    // WHICH SEAT. The candidates are the seats whose chain card holds a box this replay has not
+    // applied yet. With one candidate there is nothing to choose; with two (two seats settling
+    // in the same block) the roll derivation itself decides, since a wrong pairing cannot
+    // reproduce the stored roll.
+    const filled = (card: Scorecard): number => card.scores.filter((x) => x !== null).length;
+    const candidates: number[] = [];
+    for (let s = 0; s < seatCount; s++) {
+      if (filled(seatCard(led, s)) > filled(seats[s]!.card)) candidates.push(s);
+    }
+    if (candidates.length === 0) {
+      c.ok(`${where}: a seat's card gained a box`, false, 'no seat advanced');
+      return;
+    }
+
+    /** Re-derive the whole roll chain for one candidate; returns the final dice, or null. */
+    const deriveFor = (
+      seat: number,
+    ): { round: number; mixed: Uint8Array; dice: number[] } | null => {
+      const turn = led.seatTurn.lookup(BigInt(seat));
+      const round = Number(turn.round);
+      const mixed = mixEntropyTs(turn.entropy, digest);
+      let dice = firstRollTs(tableId, seed, mixed, round);
+      for (let step = 1; step <= rerolls; step++) {
+        const mask = [...(step === 1 ? turn.hold1 : turn.hold2).bits];
+        dice = rerollUnderMaskTs(tableId, seed, mixed, round, step, mask, dice);
+      }
+      return arrayEq(diceToArray(turn.roll), dice) ? { round, mixed, dice } : null;
+    };
+
+    let seat = candidates[0]!;
+    let derived = deriveFor(seat);
+    if (derived === null && candidates.length > 1) {
+      for (const alt of candidates.slice(1)) {
+        const d = deriveFor(alt);
+        if (d !== null) {
+          seat = alt;
+          derived = d;
+          break;
+        }
+      }
+    }
+    const turn = led.seatTurn.lookup(BigInt(seat));
+    const round = Number(turn.round);
+    const r = seats[seat]!;
+    opens += 1;
+    holds += rolls - 1;
+    rollChecks += rolls;
+
+    c.ok(
+      `seat ${seat} r${round}: mixed entropy folds the frozen round digest`,
+      same(turn.mixed, mixEntropyTs(turn.entropy, digest)),
+      `chain ${hex(turn.mixed)}`,
+    );
+    c.ok(
+      `seat ${seat} r${round}: all ${rolls} roll(s) re-derive, chained under the player's masks`,
+      derived !== null,
+      derived === null
+        ? `chain stored ${diceToArray(turn.roll)} after ${rolls} roll(s); no derivation matches`
+        : '',
+    );
+    if (derived === null) return;
+    r.roll = derived.dice;
+    r.rolls = rolls;
+    r.mixed = derived.mixed;
+
+    // SCORE. The category is whichever box the chain filled that this replay had not, and the
+    // placement is recomputed with the contract-canonical rules engine from the DERIVED dice.
+    const chainAfter = seatCard(led, seat);
+    const category = chainAfter.scores.findIndex((x, k) => x !== null && r.card.scores[k] === null);
+    c.ok(
+      `seat ${seat} r${round}: score filled exactly one new category`,
+      category >= 0 && filled(chainAfter) === filled(r.card) + 1,
+      `category index ${category}`,
+    );
+    if (category >= 0) {
+      scores += 1;
+      r.card = applyScore(r.card, category as Category, derived.dice as unknown as RefDice);
+      for (let k = 0; k < CATEGORY_COUNT; k++) {
+        c.ok(
+          `seat ${seat} r${round}: box ${k}`,
+          r.card.scores[k] === chainAfter.scores[k],
+          `replay ${r.card.scores[k]} vs chain ${chainAfter.scores[k]}`,
+        );
+      }
+      c.ok(
+        `seat ${seat} r${round}: running total`,
+        BigInt(grandTotal(r.card)) === led.seatProgress.lookup(BigInt(seat)).total,
+        `replay ${grandTotal(r.card)} vs chain ${led.seatProgress.lookup(BigInt(seat)).total}`,
+      );
+      c.ok(
+        `seat ${seat} r${round}: the dice the chain stored are the ones replayed`,
+        arrayEq(diceToArray(led.seatProgress.lookup(BigInt(seat)).dice), derived.dice),
+        `chain ${diceToArray(led.seatProgress.lookup(BigInt(seat)).dice)} vs replay ${derived.dice}`,
+      );
+      c.ok(
+        `seat ${seat} r${round}: score advances the seat past the round`,
+        Number(led.seatProgress.lookup(BigInt(seat)).round) === round + 1,
+      );
+      if (round === FINAL_ROUND) r.finishedAtRound = round;
+    }
+  };
+
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i]!;
+    const led = g.led;
     const prev = before(i);
+    const isTurn = g.entryPoints.every((k) => TURN_CALLS.has(k));
 
-    switch (action.entryPoint) {
+    // A turn merged into one transaction: checked against the state it produced.
+    if (isTurn && g.entryPoints.length > 1) {
+      verifyMergedTurn(g);
+      continue;
+    }
+    // A SINGLE turn call sharing its block with another transaction. The per-call replay below
+    // needs the state before the call, and in a shared block the previous group's state is the
+    // state after both. Recording that is honest; checking against the wrong state is not.
+    if (isTurn && g.sharesBlock) {
+      unseparable.push(`${g.entryPoints[0]} in block ${g.blockHeight}`);
+      continue;
+    }
+
+    switch (g.entryPoints[0]) {
       case 'join': {
+        // A CALL THAT LANDED AND DID NOTHING. A transaction whose fallible section fails is
+        // still recorded in the public log, so a rejected join appears here with the seat count
+        // unmoved. Folding the digest for it would corrupt the chain from that point on (this
+        // replay counts joins itself rather than trusting one action to be one seat).
+        if (Number(led.seatCount) <= joins) {
+          console.log(
+            `  (a join in block ${g.blockHeight} left the seat count at ${joins} -- it landed ` +
+              'on chain but its fallible section failed; nothing to replay)',
+          );
+          break;
+        }
         // Seat order is join order, so the seat this call took is the one that did not exist
         // before it. The digest binds the seat's payout address and its entropy commitment.
         const seat = Number(led.seatCount) - 1;
@@ -450,7 +657,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         const turn = led.seatTurn.lookup(BigInt(seat));
         const chainDice = diceToArray(turn.roll);
 
-        if (action.entryPoint === 'resolveRoll1') {
+        if (g.entryPoints[0] === 'resolveRoll1') {
           // Roll 1 hashes the seat's declared entropy against the digest FROZEN AT ROUND OPEN --
           // which is the digest the replay is holding right now, because it only advances at a
           // closeRound. Getting that ordering wrong is the easiest way to make an unverifiable
@@ -524,8 +731,18 @@ async function verify(address: string, verbose: boolean): Promise<number> {
       }
 
       case 'closeRound': {
-        if (!prev) break;
-        const round = Number(prev.openRound);
+        // The round is the replay's own count of closes, so a close that landed without effect
+        // cannot shift the chain. `roundResults` is read AFTER the close, which is equivalent:
+        // `closeRound` only reads `seatProgress` (it writes the digest, the round and the
+        // deadline), so the per-seat cells it folded are unchanged by it.
+        const round = closes;
+        if (Number(led.openRound) !== round + 1) {
+          console.log(
+            `  (a closeRound in block ${g.blockHeight} left openRound at ${led.openRound} -- ` +
+              'it landed on chain without effect; nothing to replay)',
+          );
+          break;
+        }
         // The ONE place the digest advances. All six slots, in SEAT ORDER, read at this block --
         // which is what makes the replay independent of the order the chain saw the moves in.
         digest = roundDigestTs(digest, round, seatCount, roundResults(led));
@@ -544,21 +761,29 @@ async function verify(address: string, verbose: boolean): Promise<number> {
       }
 
       case 'eliminate': {
-        if (!prev) break;
-        const round = Number(prev.openRound);
+        // From the AFTER state, per seat: the seat this call took out is one the chain marks
+        // eliminated that the replay has not marked yet. The alternative — diffing against the
+        // previous group — is wrong the moment two seats are eliminated in one block, which is
+        // exactly what a table nobody is playing does.
         let seat = -1;
         for (let s = 0; s < seatCount; s++) {
-          if (
-            !prev.seatProgress.lookup(BigInt(s)).eliminated &&
-            led.seatProgress.lookup(BigInt(s)).eliminated
-          ) {
+          if (!seats[s]!.eliminated && led.seatProgress.lookup(BigInt(s)).eliminated) {
             seat = s;
+            break;
           }
         }
         if (seat < 0) {
-          c.ok('eliminate marked exactly one seat', false);
+          console.log(
+            `  (an eliminate in block ${g.blockHeight} marked no new seat -- it landed on ` +
+              'chain without effect, or the replay had already accounted for it)',
+          );
           break;
         }
+        // The round the seat owed when it was taken out. NOT `seatProgress.round`, which an
+        // elimination sets to `roundCount()` to mean "finished", and not the chain's `openRound`,
+        // which a closeRound in the same block would already have advanced. The replay's own
+        // count of closed rounds is the open round by construction.
+        const round = closes;
         eliminations += 1;
         seats[seat]!.eliminated = true;
         seats[seat]!.finishedAtRound = Number.POSITIVE_INFINITY;
@@ -570,8 +795,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         // tells us how the seat left).
         const timeoutPenalty = (final.tier * BigInt(round + 1)) / 13n;
         const resignPenalty = (final.tier * BigInt(round)) / 13n;
-        const delta =
-          led.seatRedeemable.lookup(BigInt(seat)) - prev.seatRedeemable.lookup(BigInt(seat));
+        const delta = led.seatRedeemable.lookup(BigInt(seat));
         const penalty = delta === final.tier - resignPenalty ? resignPenalty : timeoutPenalty;
         const how =
           penalty === resignPenalty && resignPenalty !== timeoutPenalty ? 'resigned' : 'timed out';
@@ -581,11 +805,17 @@ async function verify(address: string, verbose: boolean): Promise<number> {
           delta === refund,
           `expected +${refund} (penalty ${penalty}, ${how})`,
         );
-        c.ok(
-          `seat ${seat}: the penalty stayed in the pot`,
-          led.pot === prev.pot - refund,
-          `pot ${prev.pot} -> ${led.pot}, expected -${refund}`,
-        );
+        // The pot delta needs the state before this one call, so it is only checked where that
+        // state is readable — one transaction in the block. Where it is not, nothing is lost:
+        // the custody invariant below runs after every transaction and already pins the pot to
+        // `tier x seats` minus everything owed and paid, which is the claim that matters.
+        if (prev !== undefined && !g.sharesBlock) {
+          c.ok(
+            `seat ${seat}: the penalty stayed in the pot`,
+            led.pot === prev.pot - refund,
+            `pot ${prev.pot} -> ${led.pot}, expected -${refund}`,
+          );
+        }
         c.ok(
           `seat ${seat}: carries the never-finished sentinel`,
           led.seatProgress.lookup(BigInt(seat)).finishedAtRound === 65535n,
@@ -601,7 +831,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         break;
 
       default:
-        console.log(`  (unrecognised entry point '${action.entryPoint ?? '?'}' -- ignored)`);
+        console.log(`  (unrecognised entry point '${g.entryPoints[0] ?? '?'}' -- ignored)`);
     }
 
     // The custody invariant, at every single step: while the table holds the money, every atom
@@ -615,7 +845,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         paid += led.seatPaid.lookup(BigInt(s));
       }
       c.ok(
-        `step ${i} (${action.entryPoint}): custody invariant`,
+        `tx ${i} (${g.entryPoints.join('+')}): custody invariant`,
         led.pot + owed + paid === final.tier * led.seatCount,
         `pot ${led.pot} + owed ${owed} + paid ${paid} != tier x ${led.seatCount}`,
       );
@@ -692,18 +922,18 @@ async function verify(address: string, verbose: boolean): Promise<number> {
 
   // -------------------------------------------------------------------------------- the payout
   console.log('\n── the payout ──');
-  const settleAction = steps.find((st) => st.action.entryPoint === 'settle')?.action;
-  if (!settleAction) {
+  const settleGroup = groups.find((gr) => gr.entryPoints.includes('settle'));
+  if (!settleGroup) {
     c.ok('the settle transaction is in the log', false);
   } else {
-    const tx = await transactionByHash(settleAction.txHash);
+    const tx = await transactionByHash(settleGroup.txHash);
     const winnerAddr = final.seatIdentity.lookup(final.winnerSeatIndex).addr.bytes;
     const rakeAddr = final.rakeAddress.bytes;
     // `settle` pays out exactly the POT, which is the stakes minus whatever left it as an
     // eliminated seat's refund. Read from the state just before the settle rather than assumed
     // to be tier x seatCount, because an elimination moves money out of the pot.
-    const settleStep = steps.findIndex((st) => st.action.entryPoint === 'settle');
-    const potBefore = steps[settleStep - 1]!.led.pot;
+    const settleAt = groups.indexOf(settleGroup);
+    const potBefore = groups[settleAt - 1]!.led.pot;
     const q = potBefore / 100n;
 
     const spentByUsers = sumNative(tx.unshieldedSpentOutputs);
@@ -736,27 +966,32 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   }
 
   // ------------------------------------------------------------------------------- redemptions
-  const redeems = steps.filter((st) => st.action.entryPoint === 'redeem');
+  const redeems = groups.filter((gr) => gr.entryPoints.includes('redeem'));
   if (redeems.length > 0) {
     console.log(`\n── ${redeems.length} redemption(s) ──`);
-    for (const st of redeems) {
-      const i = steps.indexOf(st);
-      const prev = steps[i - 1]!.led;
+    for (const gr of redeems) {
+      // The seat and the amount both come from the state AFTER the redeem: `seatPaid` is what
+      // the contract recorded paying, and it is per seat. Reading "what it was owed" from the
+      // previous group instead would be wrong the moment two seats redeem in one block, which
+      // is exactly what an aborted table does.
       let seat = -1;
       for (let s = 0; s < seatCount; s++) {
         if (
-          prev.seatRedeemable.lookup(BigInt(s)) > 0n &&
-          st.led.seatRedeemable.lookup(BigInt(s)) === 0n
+          !redeemed.has(s) &&
+          gr.led.seatPaid.lookup(BigInt(s)) > 0n &&
+          gr.led.seatRedeemable.lookup(BigInt(s)) === 0n
         ) {
           seat = s;
+          break;
         }
       }
       if (seat < 0) {
         c.ok('a redeem zeroed exactly one seat', false);
         continue;
       }
-      const owed = prev.seatRedeemable.lookup(BigInt(seat));
-      const tx = await transactionByHash(st.action.txHash);
+      redeemed.add(seat);
+      const owed = gr.led.seatPaid.lookup(BigInt(seat));
+      const tx = await transactionByHash(gr.txHash);
       const addr = final.seatIdentity.lookup(BigInt(seat)).addr.bytes;
       console.log(`  seat ${seat} redeemed ${owed}`);
       c.ok(
@@ -774,9 +1009,22 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     }
   }
 
+  // Steps this method genuinely could not separate. Not a failure of the game and not a pass
+  // either: an on-chain table whose seats moved in the same block leaves those individual calls
+  // unattributable, and saying so beats both a false alarm and a false clean bill.
+  if (unseparable.length > 0) {
+    console.log(
+      `\n── ${unseparable.length} call(s) this replay could not separate ──\n` +
+        unseparable.map((u) => `  ${u}`).join('\n') +
+        '\n  Each shared its block with another transaction, so the state before it is not\n' +
+        '  readable. Everything else above was checked. A FAST table never lands here: its\n' +
+        '  whole turn is one transaction and is verified as a unit.',
+    );
+  }
   c.summary();
   console.log(`\n(${c.count} checks in total)`);
-  return c.failed.length === 0 ? 0 : 1;
+  if (c.failed.length > 0) return 1;
+  return unseparable.length > 0 ? 2 : 0;
 }
 
 /**
@@ -804,7 +1052,7 @@ const address = process.argv[2];
 if (!address) {
   console.error(
     'usage: npm run verify -w cli -- <table-address> [--verbose]\n\n' +
-      'Replays a settled Yahtzee table from the chain alone: every roll re-derived under the\n' +
+      'Replays a settled Dust Dice table from the chain alone: every roll re-derived under the\n' +
       'hold masks the players sent, every score recomputed, the winner and the payout\n' +
       're-confirmed.',
   );
