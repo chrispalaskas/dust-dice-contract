@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // ===========================================================================================
-// Midnight Yahtzee -- the Table contract. One deployment per table.
+// Dust Dice -- the Table contract. One deployment per table.
 // SIMULTANEOUS ROUNDS, INTERACTIVE HOLDS.
 // ===========================================================================================
 //
@@ -88,7 +88,7 @@
 // So: every seat in round `r` derives its rolls from `roundDigest` as it stood when round `r`
 // OPENED, and `closeRound` computes
 //
-//     roundDigest' = H("yahtzee:v1:round", roundDigest, r, seatCount, results in SEAT ORDER)
+//     roundDigest' = H("dust-dice:v1:round", roundDigest, r, seatCount, results in SEAT ORDER)
 //
 // once, at the boundary, from data that is complete and ordered by seat index rather than by
 // landing time. No participant's dice depend on who submitted first.
@@ -692,7 +692,7 @@ export struct SeatProgress {
    * complete, and `closeRound` needs to read nothing else.
    */
   round: Uint<8>,
-  /** Grand total including the upper bonus and Yahtzee bonuses, maintained incrementally. */
+  /** Grand total including the upper bonus and five-of-a-kind bonuses, maintained incrementally. */
   total: Uint<16>,
   /**
    * The round at which the 13th category was taken; `noFinish()` if never.
@@ -709,7 +709,7 @@ export struct SeatProgress {
   /**
    * The dice this seat scored in its most recent completed turn. What the round digest folds.
    *
-   * Initialised to all-ones, NOT all-zeros. `applyScore` reads `d[0]` as the Yahtzee face and
+   * Initialised to all-ones, NOT all-zeros. `applyScore` reads `d[0]` as the Five of a Kind face and
    * computes `face - 1`, which underflows and aborts the circuit on a zero die. A circuit has
    * no branches, so the expression is evaluated even on a move that is not scoring -- the
    * placeholder has to be in range.
@@ -872,7 +872,7 @@ export sealed ledger inviteHash: Bytes<32>;
  * because the transcript bytes are free and cannot hurt, not because it works.
  */
 pure circuit paddingConstant(): Bytes<4096> {
-  return pad(4096, "yahtzee:v1:pad");
+  return pad(4096, "dust-dice:v1:pad");
 }
 
 // ===========================================================================================
@@ -913,7 +913,7 @@ witness rollSeed(): Bytes<32>;
 
 /** The digest a fresh table starts from. Binds the chain of events to this table. */
 pure circuit genesisDigest(id: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "yahtzee:v1:genesis"), id]);
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dust-dice:v1:genesis"), id]);
 }
 
 /** One `join`, as hashed into `roundDigest`. Fixed-width fields, one hash, no concatenation. */
@@ -932,7 +932,7 @@ pure circuit joinDigest(
                keyCommit: Bytes<32>,
                ): Bytes<32> {
   return persistentHash<JoinEvent>(
-           JoinEvent { domain: pad(32, "yahtzee:v1:join"),
+           JoinEvent { domain: pad(32, "dust-dice:v1:join"),
                        prev: prev,
                        seat: seat,
                        addr: addr,
@@ -973,7 +973,7 @@ pure circuit roundDigestOf(
                results: Vector<6, RoundResult>,
                ): Bytes<32> {
   return persistentHash<RoundEvent>(
-           RoundEvent { domain: pad(32, "yahtzee:v1:round"),
+           RoundEvent { domain: pad(32, "dust-dice:v1:round"),
                         prev: prev,
                         round: r,
                         seatCount: seats,
@@ -1009,7 +1009,7 @@ pure circuit eliminateDigest(
                refund: Uint<64>,
                ): Bytes<32> {
   return persistentHash<EliminateEvent>(
-           EliminateEvent { domain: pad(32, "yahtzee:v1:eliminated"),
+           EliminateEvent { domain: pad(32, "dust-dice:v1:eliminated"),
                             prev: prev,
                             tableId: id,
                             seat: seat,
@@ -1049,7 +1049,7 @@ pure circuit redeemDigest(
                card: Scorecard,
                ): Bytes<32> {
   return persistentHash<RedeemEvent>(
-           RedeemEvent { domain: pad(32, "yahtzee:v1:redeemed"),
+           RedeemEvent { domain: pad(32, "dust-dice:v1:redeemed"),
                          prev: prev,
                          tableId: id,
                          seat: seat,
@@ -1092,7 +1092,7 @@ pure circuit finalDigestOf(
                verifiable: Boolean,
                ): Bytes<32> {
   return persistentHash<FinalEvent>(
-           FinalEvent { domain: pad(32, "yahtzee:v1:final"),
+           FinalEvent { domain: pad(32, "dust-dice:v1:final"),
                         prev: prev,
                         tableId: id,
                         ending: ending,

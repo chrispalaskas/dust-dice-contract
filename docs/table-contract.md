@@ -102,7 +102,7 @@ opened**, and `closeRound` advances it once, at the boundary, folding the round'
 seat order**:
 
 ```
-roundDigest' = H("yahtzee:v1:round", roundDigest, r, seatCount, [ {dice, out} × 6 ])
+roundDigest' = H("dust-dice:v1:round", roundDigest, r, seatCount, [ {dice, out} × 6 ])
 ```
 
 All six slots are folded, seated or not. No participant's dice depend on who submitted first, and

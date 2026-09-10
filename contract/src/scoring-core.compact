@@ -1,7 +1,7 @@
 // Copyright (C) Shielded Technologies
 // SPDX-License-Identifier: Apache-2.0
 //
-// Yahtzee scoring core: rawScore, joker-rule placement, totals, winner tie-break, rake.
+// Dust Dice scoring core: rawScore, joker-rule placement, totals, winner tie-break, rake.
 //
 // `include`d verbatim by scoring.compact and takeTurn.compact, so this file carries NO
 // pragma and NO import of its own -- the including file supplies both. Same convention as
@@ -20,7 +20,7 @@
 //
 //   0 Ones  1 Twos  2 Threes  3 Fours  4 Fives  5 Sixes
 //   6 ThreeOfAKind  7 FourOfAKind  8 FullHouse  9 SmallStraight
-//   10 LargeStraight  11 Yahtzee  12 Chance
+//   10 LargeStraight  11 FiveOfAKind  12 Chance
 //
 // They are a `Uint<8>`, not a Compact `enum`, on purpose: the joker rules compute a category
 // arithmetically (`upperCat = face - 1`) and compare it against the requested one. An enum
@@ -67,8 +67,8 @@ pure circuit upperBonusValue(): Uint<8> {
   return 35;
 }
 
-/** Bonus per extra Yahtzee, when the Yahtzee box holds 50. */
-pure circuit yahtzeeBonusValue(): Uint<8> {
+/** Bonus per extra five of a kind, when the Five of a Kind box holds 50. */
+pure circuit fiveOfAKindBonusValue(): Uint<8> {
   return 100;
 }
 
@@ -158,7 +158,7 @@ pure circuit anyCountExactly(k: Counts, n: Uint<8>): Boolean {
  * implementations read alike, and the four-comparison form is not cheaper once the
  * histogram exists anyway.
  */
-export pure circuit isYahtzee(d: Vector<5, Uint<8>>): Boolean {
+export pure circuit isFiveOfAKind(d: Vector<5, Uint<8>>): Boolean {
   return anyCountExactly(countsOf(d), 5);
 }
 
@@ -231,13 +231,13 @@ export pure circuit rawScore(category: Uint<8>, d: Vector<5, Uint<8>>): Uint<8> 
  * legitimately-zero score (a scratched category) is therefore `filled = true, score = 0`,
  * which is exactly what `null` versus `0` distinguishes in the reference.
  *
- * `yahtzeeBonuses` counts earned +100 bonuses, matching the reference field of the same name.
+ * `fiveOfAKindBonuses` counts earned +100 bonuses, matching the reference field of the same name.
  * Fixed width, so the ledger-write cost is constant.
  */
 export struct Scorecard {
   scores: Vector<13, Uint<8>>,
   filled: Vector<13, Boolean>,
-  yahtzeeBonuses: Uint<8>,
+  fiveOfAKindBonuses: Uint<8>,
 }
 
 /** An all-open scorecard. Used by constructors and by the tests' starting state. */
@@ -256,7 +256,7 @@ export pure circuit emptyScorecard(): Scorecard {
                               false,
                               false,
                               false],
-                     yahtzeeBonuses: 0, };
+                     fiveOfAKindBonuses: 0, };
 }
 
 /**
@@ -339,7 +339,7 @@ export struct ScoreOutcome {
   score: Uint<8>,
   /** False where `rules.ts` raises `RuleViolation` -- box taken, or joker forcing violated. */
   validPlacement: Boolean,
-  /** True when an extra Yahtzee earns the +100 (Yahtzee box holds 50). */
+  /** True when an extra five of a kind earns the +100 (Five of a Kind box holds 50). */
   bonusEarned: Boolean,
 }
 
@@ -351,7 +351,7 @@ export struct ScoreOutcome {
  * for the reason in the header comment. The rules it encodes, unchanged:
  *
  *  * Normal case -- the category must be open; score is `rawScore`.
- *  * Joker case (the dice are a Yahtzee AND the Yahtzee box is already taken):
+ *  * Joker case (the dice are a five of a kind AND the Five of a Kind box is already taken):
  *      - the matching upper box (`face - 1`) is OPEN => that box is FORCED, nothing else is
  *        legal, and it scores `rawScore` (which is `5 * face`);
  *      - it is filled and some lower box is open => any OPEN lower box is legal, at full
@@ -359,11 +359,11 @@ export struct ScoreOutcome {
  *        `rawScore`;
  *      - it is filled and every lower box is filled => any open box is legal at face value,
  *        which for a non-matching upper box is 0.
- *  * The +100 bonus is earned in every joker case, but only if the Yahtzee box holds 50 --
- *    a scratched (0) Yahtzee box still forces placement and still pays nothing.
+ *  * The +100 bonus is earned in every joker case, but only if the Five of a Kind box holds 50 --
+ *    a scratched (0) Five of a Kind box still forces placement and still pays nothing.
  *
- * `yahtzeeBoxScore` is `scores[11]`; it is only consulted when `filled[11]` is set, so an
- * open Yahtzee box may pass 0.
+ * `fiveOfAKindBoxScore` is `scores[11]`; it is only consulted when `filled[11]` is set, so an
+ * open Five of a Kind box may pass 0.
  *
  * Note the ordering that matters: the "already filled" test wins over the joker tests, so a
  * joker whose forced upper box happens to be the requested-but-taken category is invalid for
@@ -374,10 +374,10 @@ export pure circuit applyScore(
                       category: Uint<8>,
                       d: Vector<5, Uint<8>>,
                       filled: Vector<13, Boolean>,
-                      yahtzeeBoxScore: Uint<8>,
+                      fiveOfAKindBoxScore: Uint<8>,
                       ): ScoreOutcome {
   const raw = rawScore(category, d);
-  const joker = isYahtzee(d) && filled[11];
+  const joker = isFiveOfAKind(d) && filled[11];
 
   // All five dice are equal in a joker situation, so `d[0]` is the face -- `rules.ts` reads
   // `dice[0]` for exactly this reason.
@@ -385,7 +385,7 @@ export pure circuit applyScore(
   const upperCat = (face - 1) as Uint<8>;
   const upperOpen = joker && !upperFilledForFace(filled, face);
 
-  // The six categories `rules.ts` lists as "lower" for joker purposes. Yahtzee (11) is not
+  // The six categories `rules.ts` lists as "lower" for joker purposes. Five of a Kind (11) is not
   // among them: in a joker situation it is filled by definition.
   const lowerOpen =
           !filled[6] || !filled[7] || !filled[8] || !filled[9] || !filled[10] || !filled[12];
@@ -422,7 +422,7 @@ export pure circuit applyScore(
   return ScoreOutcome { score: (flag(useJokerValue) * jokerValue + flag(!useJokerValue) * raw)
                                as Uint<8>,
                         validPlacement: open && jokerOk,
-                        bonusEarned: joker && yahtzeeBoxScore == 50, };
+                        bonusEarned: joker && fiveOfAKindBoxScore == 50, };
 }
 
 /**
@@ -439,7 +439,7 @@ export pure circuit placeScore(
   const outcome = applyScore(category, d, card.filled, card.scores[11]);
   return Scorecard { scores: setScoreAt(card.scores, category, outcome.score),
                      filled: setFilledAt(card.filled, category),
-                     yahtzeeBonuses: (card.yahtzeeBonuses + flag(outcome.bonusEarned)) as Uint<8>, };
+                     fiveOfAKindBonuses: (card.fiveOfAKindBonuses + flag(outcome.bonusEarned)) as Uint<8>, };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -462,11 +462,11 @@ export pure circuit upperBonus(scores: Vector<13, Uint<8>>): Uint<8> {
 }
 
 /**
- * Grand total: every filled score, plus the upper bonus, plus 100 per Yahtzee bonus.
+ * Grand total: every filled score, plus the upper bonus, plus 100 per five-of-a-kind bonus.
  *
  * Ceiling is 340 (all categories at max) + 35 + 12 x 100 = 1 575, so `Uint<16>`.
  */
-export pure circuit grandTotal(scores: Vector<13, Uint<8>>, yahtzeeBonuses: Uint<8>,): Uint<16> {
+export pure circuit grandTotal(scores: Vector<13, Uint<8>>, fiveOfAKindBonuses: Uint<8>,): Uint<16> {
   const boxes = (scores[0] +
                  scores[1] +
                  scores[2] +
@@ -481,12 +481,12 @@ export pure circuit grandTotal(scores: Vector<13, Uint<8>>, yahtzeeBonuses: Uint
                  scores[11] +
                  scores[12])
                 as Uint<16>;
-  return (boxes + upperBonus(scores) + yahtzeeBonuses * yahtzeeBonusValue()) as Uint<16>;
+  return (boxes + upperBonus(scores) + fiveOfAKindBonuses * fiveOfAKindBonusValue()) as Uint<16>;
 }
 
 /** Grand total of a whole card. */
 export pure circuit cardTotal(card: Scorecard): Uint<16> {
-  return grandTotal(card.scores, card.yahtzeeBonuses);
+  return grandTotal(card.scores, card.fiveOfAKindBonuses);
 }
 
 /**
@@ -527,10 +527,10 @@ export pure circuit totalAfterPlacing(
                  score)
                 as Uint<16>;
   const upper = (upperTotal(card.scores) + flag(category < 6) * score) as Uint<16>;
-  const bonuses = (card.yahtzeeBonuses + flag(bonusEarned)) as Uint<8>;
+  const bonuses = (card.fiveOfAKindBonuses + flag(bonusEarned)) as Uint<8>;
   return (boxes +
           flag(upper >= upperBonusThreshold() as Uint<16>) * upperBonusValue() +
-          bonuses * yahtzeeBonusValue())
+          bonuses * fiveOfAKindBonusValue())
          as Uint<16>;
 }
 

@@ -335,8 +335,8 @@ rules. Use either to show "what would these dice score in each box" without a tr
 ### The dice, exactly
 
 ```
-mixed  = H("yahtzee:v1:mix",  entropy_s(r), roundDigest_r)
-roll k = deriveDice(H("yahtzee:v1:roll", tableId, seed, mixed, r, k))     k = 0, 1, 2
+mixed  = H("dust-dice:v1:mix",  entropy_s(r), roundDigest_r)
+roll k = deriveDice(H("dust-dice:v1:roll", tableId, seed, mixed, r, k))     k = 0, 1, 2
 ```
 
 Roll 1 is `roll 0` in full. Rolls 2 and 3 **merge left to right**: the positions the mask does
@@ -356,7 +356,7 @@ already registered, which is what makes that sound.
 opened.** `closeRound` advances it exactly once, folding round `r`'s results **in seat order**:
 
 ```
-roundDigest' = H("yahtzee:v1:round", roundDigest, r, seatCount, [ {dice, out} x 6 ])
+roundDigest' = H("dust-dice:v1:round", roundDigest, r, seatCount, [ {dice, out} x 6 ])
 ```
 
 All six slots are folded, including ones no player took — they carry `dice = [1,1,1,1,1]`,
@@ -435,7 +435,7 @@ valid seed, and the rolls cannot be re-derived. A verifier must report such a ga
 _unverified_ rather than as _verification failed_.
 
 `finalDigest` is a closing certificate written by both `settle` and `abortTable`:
-`H("yahtzee:v1:final", roundDigest, tableId, ending, winner, seatCount, paid, rake, perSeat,
+`H("dust-dice:v1:final", roundDigest, tableId, ending, winner, seatCount, paid, rake, perSeat,
 verifiable)`. `winner == 6` means nobody won (an abort). Mirror: `finalDigestTs`.
 
 `seatReceipt[s]` is a per-seat hash chain: `eliminate` folds in the penalty arithmetic, `redeem`
@@ -476,7 +476,7 @@ public; otherwise `inviteCommitment(code)` and `join` needs the code).
 | map              | fields                                                         |
 | ---------------- | -------------------------------------------------------------- |
 | `seatIdentity`   | `addr`, `keyCommit`                                            |
-| `seatCard`       | `scores[13]`, `filled[13]`, `yahtzeeBonuses`                   |
+| `seatCard`       | `scores[13]`, `filled[13]`, `fiveOfAKindBonuses`               |
 | `seatProgress`   | `round`, `total`, `finishedAtRound`, `eliminated`, `dice`      |
 | `seatTurn`       | `stage`, `round`, `entropy`, `mixed`, `hold1`, `hold2`, `roll` |
 | `seatRedeemable` | `bigint`                                                       |

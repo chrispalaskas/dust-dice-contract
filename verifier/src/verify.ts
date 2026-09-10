@@ -26,7 +26,7 @@
  *      having replayed every earlier round in order;
  *   4. every score, recomputed from the dice with api/src/rules.ts -- the contract-canonical
  *      rules engine, not the circuit -- matches the scorecard the chain holds, box by box,
- *      including the upper bonus and the Yahtzee bonuses;
+ *      including the upper bonus and the five-of-a-kind bonuses;
  *   5. the winner the tie-break selects, among SURVIVORS, is the seat the chain paid;
  *   6. the settle transaction spent ZERO user inputs and created exactly the two expected
  *      outputs, to the addresses recorded at join and at construction.
@@ -241,7 +241,7 @@ function seatCard(led: TableLedger, seat: number): Scorecard {
   const c = led.seatCard.lookup(BigInt(seat));
   return {
     scores: c.filled.map((f, i) => (f ? Number(c.scores[i]) : null)),
-    yahtzeeBonuses: Number(c.yahtzeeBonuses),
+    fiveOfAKindBonuses: Number(c.fiveOfAKindBonuses),
   };
 }
 

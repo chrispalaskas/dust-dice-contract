@@ -23,6 +23,7 @@ import {
   DICE_PER_ROLL,
   HoldPolicy,
   ROLL_DOMAIN,
+  ROLL_DOMAIN_TAG,
   byteCandidate,
   deriveDiceBitLadderTs,
   deriveDiceTs,
@@ -101,11 +102,9 @@ describe('mirror agrees with circuit', () => {
     // so this is really asserted by the cross-check below -- but a direct failure here is
     // far easier to read than 50 mismatched dice.
     assert.equal(ROLL_DOMAIN.length, 32);
-    assert.deepEqual(
-      Array.from(ROLL_DOMAIN.subarray(0, 15)),
-      Array.from(new TextEncoder().encode('yahtzee:v1:roll')),
-    );
-    assert.ok(ROLL_DOMAIN.subarray(15).every((b) => b === 0));
+    const tag = new TextEncoder().encode(ROLL_DOMAIN_TAG);
+    assert.deepEqual(Array.from(ROLL_DOMAIN.subarray(0, tag.length)), Array.from(tag));
+    assert.ok(ROLL_DOMAIN.subarray(tag.length).every((b) => b === 0));
   });
 
   it('deriveDice matches on 50 random inputs', () => {

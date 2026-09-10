@@ -306,7 +306,7 @@ would always collide there, whatever else they touched.
 This probe answers the question that was asked, and the answer is favourable — but it is worth
 being clear about what it does _not_ buy, because the win is smaller than "six times faster".
 
-Yahtzee's turn is two-sided: the player submits `takeTurn`, and the **operator** then submits
+Dust Dice's turn is two-sided: the player submits `takeTurn`, and the **operator** then submits
 `resolveRoll1/2/3` (three transactions, not one, because the one-transaction version needs k=17
 and the proof server tops out at k=15 — `table.compact` decision 9). Only the player's half is
 what six seats do concurrently. The operator's half is serialized twice over:

@@ -1,7 +1,7 @@
 // Copyright (C) Shielded Technologies
 // SPDX-License-Identifier: Apache-2.0
 //
-// Yahtzee scoring, standalone, for measurement.
+// Dust Dice scoring, standalone, for measurement.
 //
 // This contract is never deployed. It exists so the scoring half of `Table.takeTurn` is
 // measured before it is built on -- the dice half was measured first in dice.compact and
@@ -53,12 +53,12 @@ export ledger lastTotal: Uint<16>;
  *
  * The dice are range-checked. In the live game they come from `deriveDice` and are 1..6 by
  * construction, but here they are a circuit argument, and `applyScore` reads `d[0]` as "the
- * face of a Yahtzee" -- a caller passing 0 or 7 would be scoring against a histogram that
+ * face of a five of a kind" -- a caller passing 0 or 7 would be scoring against a histogram that
  * cannot occur. Six comparisons is a cheap way to make the argument version behave like the
  * derived one.
  *
  * `disclose` publishes the updated card and the total. Both are public game state: a
- * scorecard is the public record of a game of Yahtzee and a spectator has to see it. What is
+ * scorecard is the public record of a game of Dust Dice and a spectator has to see it. What is
  * NOT disclosed is anything else -- there is no witness in this contract at all, and the
  * `disclose` is required only because Compact treats an exported circuit's PARAMETERS as
  * private inputs to the proof, exactly like witness results (docs/dice-circuit.md §6.3).

@@ -595,7 +595,7 @@ Two techniques worth reusing:
   arranged by hand and neither can a joker. Both were located by sweeping `replayGame` offline
   (milliseconds per game) and the discovered table ids are hard-coded, so the tests are
   deterministic and any change to the dice ladder, the masks or the digest chain breaks them
-  loudly. Table id 30 under a KeepModal schedule produces a repeat Yahtzee — a real forced-joker
+  loudly. Table id 30 under a KeepModal schedule produces a repeat five of a kind — a real forced-joker
   placement plus the +100 bonus, on chain.
 
 The tie-break needed three separate scenarios because two of its legs coincide in ordinary play:

@@ -11,9 +11,9 @@
  * selects, and a wrong selector is invisible by inspection. Only differential testing over a
  * corpus finds it.
  *
- * The corpus is deliberately shaped, not merely large. Uniform random dice are a Yahtzee
+ * The corpus is deliberately shaped, not merely large. Uniform random dice are a five of a kind
  * 6/7776 of the time, so a plain random corpus would exercise the joker branches roughly
- * never; two fifths of the cases here are five-of-a-kind with the Yahtzee box already taken,
+ * never; two fifths of the cases here are five-of-a-kind with the Five of a Kind box already taken,
  * which is the only way into them.
  *
  * Inputs derive from a fixed seed rather than the system RNG, matching fairness.test.ts: a
@@ -33,7 +33,7 @@ import {
   type Dice as RefDice,
   emptyScorecard as refEmptyScorecard,
   grandTotal as refGrandTotal,
-  isYahtzee as refIsYahtzee,
+  isFiveOfAKind as refIsFiveOfAKind,
   rawScore as refRawScore,
   RuleViolation,
   type Scorecard as RefScorecard,
@@ -41,7 +41,7 @@ import {
   upperTotal as refUpperTotal,
   UPPER_BONUS,
   winnerSeat as refWinnerSeat,
-  YAHTZEE_BONUS,
+  FIVE_OF_A_KIND_BONUS,
   // Relative, not '@dust-dice/api/src/rules.ts'. That specifier does not resolve: api's
   // package.json declares an `exports` map with only '.' and './node', so Node rejects the
   // subpath outright (ERR_PACKAGE_PATH_NOT_EXPORTED) and this whole file fails to load --
@@ -109,7 +109,7 @@ function toCircuitCard(card: RefScorecard): Scorecard {
   return {
     scores: card.scores.map((s) => BigInt(s ?? 0)),
     filled: card.scores.map((s) => s !== null),
-    yahtzeeBonuses: BigInt(card.yahtzeeBonuses),
+    fiveOfAKindBonuses: BigInt(card.fiveOfAKindBonuses),
   };
 }
 
@@ -117,12 +117,12 @@ function toCircuitCard(card: RefScorecard): Scorecard {
 function toRefCard(card: Scorecard): RefScorecard {
   return {
     scores: card.scores.map((s, i) => (card.filled[i] ? Number(s) : null)),
-    yahtzeeBonuses: Number(card.yahtzeeBonuses),
+    fiveOfAKindBonuses: Number(card.fiveOfAKindBonuses),
   };
 }
 
 const cardsEqual = (a: Scorecard, b: Scorecard): boolean =>
-  a.yahtzeeBonuses === b.yahtzeeBonuses &&
+  a.fiveOfAKindBonuses === b.fiveOfAKindBonuses &&
   a.scores.every((s, i) => s === b.scores[i]) &&
   a.filled.every((f, i) => f === b.filled[i]);
 
@@ -147,7 +147,7 @@ type Case = { dice: number[]; card: RefScorecard };
  *
  * A filled category is given the reference's own score for some random hand rather than an
  * arbitrary number, so upper totals land near the 63 bonus threshold as often as a real game
- * puts them there. The Yahtzee box is special-cased to 0 or 50 -- those are its only real
+ * puts them there. The Five of a Kind box is special-cased to 0 or 50 -- those are its only real
  * values, and which one it holds decides whether the +100 is paid.
  */
 function makeCase(rng: () => number, joker: boolean): Case {
@@ -157,9 +157,9 @@ function makeCase(rng: () => number, joker: boolean): Case {
 
   const scores: (number | null)[] = Array(CATEGORY_COUNT).fill(null);
   for (let cat = 0; cat < CATEGORY_COUNT; cat++) {
-    const fillProbability = cat === Category.Yahtzee && joker ? 256 : 110; // /256
+    const fillProbability = cat === Category.FiveOfAKind && joker ? 256 : 110; // /256
     if (rng() >= fillProbability) continue;
-    if (cat === Category.Yahtzee) {
+    if (cat === Category.FiveOfAKind) {
       scores[cat] = below(rng, 2) === 0 ? 0 : 50;
     } else {
       const hand = Array.from({ length: 5 }, () => 1 + below(rng, 6));
@@ -167,14 +167,14 @@ function makeCase(rng: () => number, joker: boolean): Case {
     }
   }
 
-  // A joker case needs the Yahtzee box taken, or it is not a joker case at all.
-  if (joker && scores[Category.Yahtzee] === null) scores[Category.Yahtzee] = 50;
+  // A joker case needs the Five of a Kind box taken, or it is not a joker case at all.
+  if (joker && scores[Category.FiveOfAKind] === null) scores[Category.FiveOfAKind] = 50;
 
-  return { dice, card: { scores, yahtzeeBonuses: below(rng, 3) } };
+  return { dice, card: { scores, fiveOfAKindBonuses: below(rng, 3) } };
 }
 
 function makeCorpus(): Case[] {
-  const rng = makeRng('yahtzee-scoring-corpus');
+  const rng = makeRng('five of a kind-scoring-corpus');
   return Array.from({ length: CASES }, (_, i) => makeCase(rng, i < CASES * JOKER_SHARE));
 }
 
@@ -226,12 +226,12 @@ describe('rawScore matches api/src/rules.ts', () => {
     );
   });
 
-  it('isYahtzee agrees on every hand', () => {
+  it('isFiveOfAKind agrees on every hand', () => {
     for (const hand of allHands()) {
       assert.equal(
-        scoringPure.isYahtzee(toCircuitDice(hand)),
-        refIsYahtzee(toRefDice(hand)),
-        `isYahtzee([${hand.join(',')}])`,
+        scoringPure.isFiveOfAKind(toCircuitDice(hand)),
+        refIsFiveOfAKind(toRefDice(hand)),
+        `isFiveOfAKind([${hand.join(',')}])`,
       );
     }
   });
@@ -255,7 +255,7 @@ describe('applyScore matches api/src/rules.ts', () => {
           BigInt(cat),
           toCircuitDice(dice),
           circuitCard.filled,
-          circuitCard.scores[Category.Yahtzee]!,
+          circuitCard.scores[Category.FiveOfAKind]!,
         );
 
         let reference: RefScorecard | null = null;
@@ -278,7 +278,7 @@ describe('applyScore matches api/src/rules.ts', () => {
         if (reference !== null) {
           legal++;
           assert.equal(Number(outcome.score), reference.scores[cat], `score disagrees at ${where}`);
-          const refBonus = reference.yahtzeeBonuses > card.yahtzeeBonuses;
+          const refBonus = reference.fiveOfAKindBonuses > card.fiveOfAKindBonuses;
           assert.equal(outcome.bonusEarned, refBonus, `bonusEarned disagrees at ${where}`);
           if (refBonus) jokerBonuses++;
 
@@ -334,13 +334,13 @@ describe('applyScore matches api/src/rules.ts', () => {
     ];
 
     for (const { dice, card } of corpus) {
-      if (!refIsYahtzee(toRefDice(dice))) continue;
-      if (card.scores[Category.Yahtzee] === null) continue;
+      if (!refIsFiveOfAKind(toRefDice(dice))) continue;
+      if (card.scores[Category.FiveOfAKind] === null) continue;
       const upperCat = (dice[0]! - 1) as Category;
       if (card.scores[upperCat] === null) seen.forcedUpper++;
       else if (lower.some((c) => card.scores[c] === null)) seen.lowerJoker++;
       else seen.upperFallback++;
-      if (card.scores[Category.Yahtzee] === 0) seen.scratched++;
+      if (card.scores[Category.FiveOfAKind] === 0) seen.scratched++;
     }
 
     assert.ok(seen.forcedUpper > 50, `forced-upper branch hit ${seen.forcedUpper} times`);
@@ -356,11 +356,11 @@ describe('applyScore matches api/src/rules.ts', () => {
 // ---------------------------------------------------------------------------------------
 
 describe('joker rules: the scenarios from api/src/rules.test.ts, run through the circuit', () => {
-  const yahtzeeOf = (face: number) => [face, face, face, face, face];
+  const fiveOfAKindOf = (face: number) => [face, face, face, face, face];
 
-  /** A card with the Yahtzee box scored 50 by a yahtzee of 3s. */
-  const withYahtzeeScored = (): RefScorecard =>
-    refApplyScore(refEmptyScorecard(), Category.Yahtzee, toRefDice(yahtzeeOf(3)));
+  /** A card with the Five of a Kind box scored 50 by a five of a kind of 3s. */
+  const withFiveOfAKindScored = (): RefScorecard =>
+    refApplyScore(refEmptyScorecard(), Category.FiveOfAKind, toRefDice(fiveOfAKindOf(3)));
 
   const outcomeOf = (card: RefScorecard, cat: Category, dice: number[]) => {
     const c = toCircuitCard(card);
@@ -368,17 +368,17 @@ describe('joker rules: the scenarios from api/src/rules.test.ts, run through the
       BigInt(cat),
       toCircuitDice(dice),
       c.filled,
-      c.scores[Category.Yahtzee]!,
+      c.scores[Category.FiveOfAKind]!,
     );
   };
 
-  it('extra yahtzee forces the open matching upper box and pays the bonus', () => {
-    const card = withYahtzeeScored();
+  it('extra five of a kind forces the open matching upper box and pays the bonus', () => {
+    const card = withFiveOfAKindScored();
     // Chance is open, but the joker rules forbid it while Fours is open.
-    const illegal = outcomeOf(card, Category.Chance, yahtzeeOf(4));
+    const illegal = outcomeOf(card, Category.Chance, fiveOfAKindOf(4));
     assert.equal(illegal.validPlacement, false);
 
-    const legal = outcomeOf(card, Category.Fours, yahtzeeOf(4));
+    const legal = outcomeOf(card, Category.Fours, fiveOfAKindOf(4));
     assert.equal(legal.validPlacement, true);
     assert.equal(Number(legal.score), 20);
     assert.equal(legal.bonusEarned, true);
@@ -386,39 +386,39 @@ describe('joker rules: the scenarios from api/src/rules.test.ts, run through the
     const placed = scoringPure.placeScore(
       toCircuitCard(card),
       BigInt(Category.Fours),
-      toCircuitDice(yahtzeeOf(4)),
+      toCircuitDice(fiveOfAKindOf(4)),
     );
-    assert.equal(Number(scoringPure.cardTotal(placed)), 50 + 20 + YAHTZEE_BONUS);
+    assert.equal(Number(scoringPure.cardTotal(placed)), 50 + 20 + FIVE_OF_A_KIND_BONUS);
   });
 
   it('joker full house and straights count in full when the upper box is filled', () => {
-    let card = withYahtzeeScored();
+    let card = withFiveOfAKindScored();
     card = refApplyScore(card, Category.Fours, toRefDice([4, 4, 1, 2, 3])); // Fours = 8
 
-    const fh = outcomeOf(card, Category.FullHouse, yahtzeeOf(4));
+    const fh = outcomeOf(card, Category.FullHouse, fiveOfAKindOf(4));
     assert.equal(fh.validPlacement, true);
     assert.equal(Number(fh.score), 25);
     assert.equal(fh.bonusEarned, true);
 
-    const ls = outcomeOf(card, Category.LargeStraight, yahtzeeOf(4));
+    const ls = outcomeOf(card, Category.LargeStraight, fiveOfAKindOf(4));
     assert.equal(ls.validPlacement, true);
     assert.equal(Number(ls.score), 40);
 
-    const ss = outcomeOf(card, Category.SmallStraight, yahtzeeOf(4));
+    const ss = outcomeOf(card, Category.SmallStraight, fiveOfAKindOf(4));
     assert.equal(Number(ss.score), 30);
   });
 
-  it('scratched yahtzee box: joker placement rules apply but no bonus', () => {
-    let card = refApplyScore(refEmptyScorecard(), Category.Yahtzee, toRefDice([1, 2, 3, 4, 5]));
+  it('scratched five of a kind box: joker placement rules apply but no bonus', () => {
+    let card = refApplyScore(refEmptyScorecard(), Category.FiveOfAKind, toRefDice([1, 2, 3, 4, 5]));
     card = refApplyScore(card, Category.Fours, toRefDice([4, 4, 1, 2, 3]));
-    const next = outcomeOf(card, Category.FullHouse, yahtzeeOf(4));
+    const next = outcomeOf(card, Category.FullHouse, fiveOfAKindOf(4));
     assert.equal(next.validPlacement, true);
     assert.equal(Number(next.score), 25);
     assert.equal(next.bonusEarned, false);
   });
 
   it('upper fallback scores face value when every lower box is filled', () => {
-    let card = withYahtzeeScored();
+    let card = withFiveOfAKindScored();
     card = refApplyScore(card, Category.Fives, toRefDice([5, 5, 1, 2, 3]));
     for (const cat of [
       Category.ThreeOfAKind,
@@ -430,26 +430,26 @@ describe('joker rules: the scenarios from api/src/rules.test.ts, run through the
     ]) {
       card = refApplyScore(card, cat, toRefDice([1, 2, 3, 5, 6]));
     }
-    const next = outcomeOf(card, Category.Twos, yahtzeeOf(5));
+    const next = outcomeOf(card, Category.Twos, fiveOfAKindOf(5));
     assert.equal(next.validPlacement, true);
-    assert.equal(Number(next.score), 0, 'no 2s in a yahtzee of 5s');
+    assert.equal(Number(next.score), 0, 'no 2s in a five of a kind of 5s');
     assert.equal(next.bonusEarned, true, 'the bonus is still earned');
   });
 
   it('a filled category is rejected even when the joker rules would allow it', () => {
     // Fours is the forced box, and it is already taken: the ordinary "already filled" rule
     // wins, exactly as rules.ts throws before it looks at jokers.
-    let card = withYahtzeeScored();
+    let card = withFiveOfAKindScored();
     card = refApplyScore(card, Category.Fours, toRefDice([4, 4, 1, 2, 3]));
-    assert.equal(outcomeOf(card, Category.Fours, yahtzeeOf(4)).validPlacement, false);
+    assert.equal(outcomeOf(card, Category.Fours, fiveOfAKindOf(4)).validPlacement, false);
   });
 
-  it('a yahtzee with the yahtzee box OPEN is not a joker: it may go anywhere open', () => {
+  it('a five of a kind with the five of a kind box OPEN is not a joker: it may go anywhere open', () => {
     const card = refEmptyScorecard();
-    const chance = outcomeOf(card, Category.Chance, yahtzeeOf(4));
+    const chance = outcomeOf(card, Category.Chance, fiveOfAKindOf(4));
     assert.equal(chance.validPlacement, true);
     assert.equal(Number(chance.score), 20);
-    assert.equal(chance.bonusEarned, false, 'no bonus until the Yahtzee box holds 50');
+    assert.equal(chance.bonusEarned, false, 'no bonus until the Five of a Kind box holds 50');
   });
 });
 
@@ -462,7 +462,10 @@ describe('totals match api/src/rules.ts', () => {
     for (const { card } of makeCorpus()) {
       const c = toCircuitCard(card);
       assert.equal(Number(scoringPure.upperTotal(c.scores)), refUpperTotal(card));
-      assert.equal(Number(scoringPure.grandTotal(c.scores, c.yahtzeeBonuses)), refGrandTotal(card));
+      assert.equal(
+        Number(scoringPure.grandTotal(c.scores, c.fiveOfAKindBonuses)),
+        refGrandTotal(card),
+      );
     }
   });
 
@@ -495,14 +498,14 @@ describe('totals match api/src/rules.ts', () => {
     const full: Scorecard = {
       scores: empty.scores,
       filled: empty.filled.map(() => true),
-      yahtzeeBonuses: 0n,
+      fiveOfAKindBonuses: 0n,
     };
     assert.equal(scoringPure.isComplete(full), true);
     for (let i = 0; i < CATEGORY_COUNT; i++) {
       const oneOpen: Scorecard = {
         scores: full.scores,
         filled: full.filled.map((_, j) => j !== i),
-        yahtzeeBonuses: 0n,
+        fiveOfAKindBonuses: 0n,
       };
       assert.equal(scoringPure.isComplete(oneOpen), false, `box ${i} open but isComplete true`);
     }
@@ -536,7 +539,7 @@ describe('winner tie-break matches api/src/rules.ts', () => {
   });
 
   it('agrees with the reference on 4 000 random tables, seat counts 2..6', () => {
-    const rng = makeRng('yahtzee-winner');
+    const rng = makeRng('five of a kind-winner');
     let ties = 0;
     let doubleTies = 0;
     for (let i = 0; i < 4_000; i++) {
@@ -630,7 +633,7 @@ describe('rake split matches api/src/rules.ts splitPot', () => {
   });
 
   it('agrees with the reference on 2 000 random pots', () => {
-    const rng = makeRng('yahtzee-rake');
+    const rng = makeRng('five of a kind-rake');
     for (let i = 0; i < 2_000; i++) {
       let pot = 0n;
       for (let b = 0; b < 5; b++) pot = pot * 256n + BigInt(rng());
@@ -652,7 +655,7 @@ describe('scoreTurn executes against a ledger', () => {
   it('plays a full 13-turn game and tracks the reference engine box for box', () => {
     return (async () => {
       const sim = await ScoringSimulator.create(createDicePrivateState(new Uint8Array(32)));
-      const rng = makeRng('yahtzee-game');
+      const rng = makeRng('five of a kind-game');
       let card = refEmptyScorecard();
       const order = [
         Category.Ones,
@@ -661,7 +664,7 @@ describe('scoreTurn executes against a ledger', () => {
         Category.Fours,
         Category.Fives,
         Category.Sixes,
-        Category.Yahtzee,
+        Category.FiveOfAKind,
         Category.ThreeOfAKind,
         Category.FourOfAKind,
         Category.FullHouse,
@@ -708,7 +711,11 @@ describe('scoreTurn executes against a ledger', () => {
 
   it('enforces the joker forcing rule on-chain', async () => {
     const sim = await ScoringSimulator.create(createDicePrivateState(new Uint8Array(32)));
-    const card = refApplyScore(refEmptyScorecard(), Category.Yahtzee, toRefDice([3, 3, 3, 3, 3]));
+    const card = refApplyScore(
+      refEmptyScorecard(),
+      Category.FiveOfAKind,
+      toRefDice([3, 3, 3, 3, 3]),
+    );
     await sim.loadCard(toCircuitCard(card));
     await assert.rejects(
       () => sim.scoreTurn(BigInt(Category.Chance), toCircuitDice([4, 4, 4, 4, 4])),
@@ -717,8 +724,8 @@ describe('scoreTurn executes against a ledger', () => {
     const ok = await sim.scoreTurn(BigInt(Category.Fours), toCircuitDice([4, 4, 4, 4, 4]));
     assert.equal(Number(ok.score), 20);
     assert.equal(ok.bonusEarned, true);
-    assert.equal(Number(sim.getLedger().card.yahtzeeBonuses), 1);
-    assert.equal(Number(sim.getLedger().lastTotal), 50 + 20 + YAHTZEE_BONUS);
+    assert.equal(Number(sim.getLedger().card.fiveOfAKindBonuses), 1);
+    assert.equal(Number(sim.getLedger().lastTotal), 50 + 20 + FIVE_OF_A_KIND_BONUS);
   });
 
   it('settleTable returns the winner and the split, and rejects a bad rake', async () => {
@@ -784,7 +791,7 @@ describe('takeTurn combines the dice and the scoring', () => {
       Category.FullHouse,
       Category.SmallStraight,
       Category.LargeStraight,
-      Category.Yahtzee,
+      Category.FiveOfAKind,
     ];
 
     for (let round = 0; round < order.length; round++) {

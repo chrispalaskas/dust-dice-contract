@@ -73,7 +73,7 @@
  */
 export pure circuit forcedEntropy(sk: Bytes<32>, tableId: Bytes<32>, round: Uint<8>): Bytes<32> {
   return persistentHash<EntropyContext>(
-           EntropyContext { domain: pad(32, "yahtzee:v1:entropy"),
+           EntropyContext { domain: pad(32, "dust-dice:v1:entropy"),
                             sk: sk,
                             tableId: tableId,
                             round: round, }
@@ -96,7 +96,7 @@ export struct EntropyContext {
  * dice were never at risk -- this closes the identifier, not the randomness.
  */
 export pure circuit entropyKeyCommitment(tableId: Bytes<32>, sk: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:entkey"), tableId, sk]);
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dust-dice:v1:entkey"), tableId, sk]);
 }
 
 /**
@@ -108,7 +108,7 @@ export pure circuit entropyKeyCommitment(tableId: Bytes<32>, sk: Bytes<32>): Byt
  * observer the second, still-live table's entire future randomness.
  */
 export pure circuit seedCommitmentOf(tableId: Bytes<32>, seed: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:seed"), tableId, seed]);
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dust-dice:v1:seed"), tableId, seed]);
 }
 
 /**
@@ -120,7 +120,7 @@ export pure circuit seedCommitmentOf(tableId: Bytes<32>, seed: Bytes<32>): Bytes
  * three-input commitments above.
  */
 export pure circuit inviteCommitment(code: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "yahtzee:v1:invite"), code]);
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dust-dice:v1:invite"), code]);
 }
 
 /**
@@ -141,7 +141,7 @@ export pure circuit inviteCommitment(code: Bytes<32>): Bytes<32> {
  * 2 of table.compact's header.
  */
 export pure circuit mixEntropy(entropy: Bytes<32>, roundDigest: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "yahtzee:v1:mix"), entropy, roundDigest]);
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dust-dice:v1:mix"), entropy, roundDigest]);
 }
 
 // ---------------------------------------------------------------------------------------

@@ -55,7 +55,7 @@ import assert from 'node:assert/strict';
 import {
   CATEGORY_COUNT,
   type Dice as RefDice,
-  isYahtzee as refIsYahtzee,
+  isFiveOfAKind as refIsFiveOfAKind,
 } from '../../../api/src/rules.ts';
 import {
   entropyKeyCommitmentTs,
@@ -1151,12 +1151,12 @@ describe('the three-transaction resolve', () => {
 describe('joker rules at table level', () => {
   // =======================================================================================
 
-  it('awards the Yahtzee bonus and enforces forced placement', async () => {
+  it('awards the five-of-a-kind bonus and enforces forced placement', async () => {
     // Chasing the modal face rolls five of a kind often enough that a four-seat game reaches the
     // joker rules; `probeIllegal` then attacks every scoring move with a category the reference
     // refuses, which in a joker situation is exactly what forced placement forbids.
     const g = await seated(
-      { seats: 4, tableId: bytes32(16) },
+      { seats: 4, tableId: bytes32(14) },
       { strategy: 'bestScore', probeIllegal: true, holds: keepModal },
     );
     await g.playToEnd();
@@ -1170,12 +1170,17 @@ describe('joker rules at table level', () => {
 
   it('rolls five of a kind under a modal-chasing player', async () => {
     const g = await seated(
-      { seats: 4, tableId: bytes32(16) },
+      { seats: 4, tableId: bytes32(14) },
       { strategy: 'bestScore', holds: keepModal },
     );
     await g.playToEnd();
-    const yahtzees = g.turns.filter((t) => refIsYahtzee(t.dice as unknown as RefDice)).length;
-    assert.ok(yahtzees > 0, 'the joker tests depend on this schedule producing a Yahtzee');
+    const fiveOfAKinds = g.turns.filter((t) =>
+      refIsFiveOfAKind(t.dice as unknown as RefDice),
+    ).length;
+    assert.ok(
+      fiveOfAKinds > 0,
+      'the joker tests depend on this schedule producing a five of a kind',
+    );
   });
 
   it('agrees with the mirror on the modal face over every hand shape', () => {
@@ -1421,11 +1426,11 @@ describe('elimination', () => {
   });
 
   it('stops an eliminated seat playing, and stops it winning', async () => {
-    // Table 12 with seat 0 eliminated at round 10 was found by sweeping `replayGame` for a game
+    // Table 11 with seat 0 eliminated at round 10 was found by sweeping `replayGame` for a game
     // in which the ELIMINATED seat ends with the strictly highest total. Under the cursor model
     // it would have won; under simultaneous rounds elimination is permanent and economic, and it
     // has already been handed back `tier - penalty`, so paying it the pot would pay it twice.
-    const opts: TableOptions = { seats: 3, tableId: bytes32(12) };
+    const opts: TableOptions = { seats: 3, tableId: bytes32(11) };
     const plan: GamePlan = { strategy: 'bestScore', eliminations: [{ seat: 0, round: 10 }] };
     const preview = replayGame(tableConfig(opts), makePlayers(3), plan);
     assert.ok(preview.totals[0]! > preview.totals[1]!, 'this scenario was chosen for it');
@@ -2484,7 +2489,7 @@ describe('tie-break at table level', () => {
   // is the inputs that no longer reach its second leg.
 
   it('breaks a tie between two finishers by seat order', async () => {
-    const opts: TableOptions = { seats: 2, tableId: bytes32(23) };
+    const opts: TableOptions = { seats: 2, tableId: bytes32(84) };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(2), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');
@@ -2504,7 +2509,7 @@ describe('tie-break at table level', () => {
   });
 
   it('falls back to the lowest seat at a four-seat table', async () => {
-    const opts: TableOptions = { seats: 4, tableId: bytes32(16) };
+    const opts: TableOptions = { seats: 4, tableId: bytes32(107) };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(4), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');

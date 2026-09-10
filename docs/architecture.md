@@ -1,6 +1,14 @@
 # Architecture
 
-Design record for Dust Dice (named Midnight Yahtzee until 2026-09-06; the internal identifiers — hash domain strings `yahtzee:v1:*` sealed into the circuits, the wallet app-secret label `yahtzee-seat:<table>`, the browser storage keys — keep the old prefix on purpose: changing them would change every seat secret and every commitment). Sections marked **GATE 0** hold the answers to the two
+Design record for Dust Dice. Named "Midnight Yahtzee" until 2026-09-06 and renamed in
+two steps: the product name first, then on 2026-09-10 every internal identifier too —
+the hash domain strings sealed into the circuits (`dust-dice:v1:*`), the wallet
+app-secret label, the browser storage keys, the operator's lane-seed string and the
+`DUST_DICE_*` environment variables. That second step changed every commitment the
+contracts compute, so it produced new verifier keys, a new build fingerprint and a
+wholly new board; the previous devnet deployment was discarded rather than migrated.
+The scoring identifiers took the chance to say what they mean: the category is
+`FiveOfAKind` and its bonus `fiveOfAKindBonuses`, not the trademark. Sections marked **GATE 0** hold the answers to the two
 blocking questions; nothing downstream of them was built before they were answered with
 executed probes on a local devnet.
 
@@ -83,7 +91,7 @@ helps. Deploy 18.6 s.
 
 Per-roll play was already dead on the numbers and the resolve split (below) doubles it. The
 measured shapes are now: **2 seats × 13 rounds = 111 tx ≈ 35 min** (executed), **6 seats × 13
-rounds = 343 tx ≈ 109 min** (extrapolated). A six-seat table is no longer "within a real Yahtzee
+rounds = 343 tx ≈ 109 min** (extrapolated). A six-seat table is no longer "within a real Dust Dice
 evening" and needs a product decision — fewer rounds, smaller tables, concurrent tables, or
 batching. Batching several calls per transaction remains unprobed and inherits the gas
 under-declaration defect (~15%/60% failure at 2/3 calls upstream) — not a lever we lean on

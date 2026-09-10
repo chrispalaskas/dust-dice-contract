@@ -46,12 +46,12 @@ const VEC13_UINT8 = new CompactTypeVector(13, UINT8);
 const VEC13_BOOL = new CompactTypeVector(13, BOOL);
 
 /** Domain tags. Must equal the `pad(32, ...)` literals in table.compact. */
-export const TAG_GENESIS = 'yahtzee:v1:genesis';
-export const TAG_JOIN = 'yahtzee:v1:join';
-export const TAG_ROUND = 'yahtzee:v1:round';
-export const TAG_ELIMINATED = 'yahtzee:v1:eliminated';
-export const TAG_REDEEMED = 'yahtzee:v1:redeemed';
-export const TAG_FINAL = 'yahtzee:v1:final';
+export const TAG_GENESIS = 'dust-dice:v1:genesis';
+export const TAG_JOIN = 'dust-dice:v1:join';
+export const TAG_ROUND = 'dust-dice:v1:round';
+export const TAG_ELIMINATED = 'dust-dice:v1:eliminated';
+export const TAG_REDEEMED = 'dust-dice:v1:redeemed';
+export const TAG_FINAL = 'dust-dice:v1:final';
 
 /**
  * `Phase` as the contract numbers it. The `ending` field of a final certificate is one of
@@ -300,12 +300,12 @@ export function eliminateDigestTs(
 
 /**
  * A scorecard in the shape the circuit hashes it: thirteen scores, thirteen filled bits, and
- * the Yahtzee-bonus count. The reference's `number | null` per category splits into the two.
+ * the Five of a Kind-bonus count. The reference's `number | null` per category splits into the two.
  */
 export type ScorecardTs = {
   scores: readonly (number | bigint)[];
   filled: readonly boolean[];
-  yahtzeeBonuses: number | bigint;
+  fiveOfAKindBonuses: number | bigint;
 };
 
 const SCORECARD_TYPE: CompactType<ScorecardTs> = {
@@ -313,11 +313,11 @@ const SCORECARD_TYPE: CompactType<ScorecardTs> = {
   toValue: (v) =>
     VEC13_UINT8.toValue(v.scores.map((s) => BigInt(s)))
       .concat(VEC13_BOOL.toValue([...v.filled]))
-      .concat(UINT8.toValue(BigInt(v.yahtzeeBonuses))),
+      .concat(UINT8.toValue(BigInt(v.fiveOfAKindBonuses))),
   fromValue: (value) => ({
     scores: VEC13_UINT8.fromValue(value),
     filled: VEC13_BOOL.fromValue(value),
-    yahtzeeBonuses: UINT8.fromValue(value),
+    fiveOfAKindBonuses: UINT8.fromValue(value),
   }),
 };
 

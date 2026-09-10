@@ -49,7 +49,7 @@ const ROLLS = 20_000;
 const CHI2_P050 = 11.07;
 const CHI2_P001 = 20.515;
 
-/** Deterministic 32-byte stream: sha256("yahtzee-fairness" || i). */
+/** Deterministic 32-byte stream: sha256("five of a kind-fairness" || i). */
 function derivedBytes(label: string, i: number): Uint8Array {
   return new Uint8Array(createHash('sha256').update(`${label}:${i}`).digest());
 }

@@ -35,7 +35,7 @@
 //   die >= 4 (per-die)                 3                   ~40 (full applyScore)     10.2 s
 //   die == d[0] (fan-in 2)             4                   ~40 (full applyScore)      8.9 s
 //   die == modalFace(roll1)            15                  1  (diceSum)               5.0 s
-//   die == modalFace(roll1)            15                  6  (isYahtzee)             45.5 s
+//   die == modalFace(roll1)            15                  6  (isFiveOfAKind)             45.5 s
 //   die == modalFace(roll1)            15                  7  (rawScore)             >150 s
 //   die == modalFace(roll1)            15                  ~40 (full applyScore)     >200 s
 //

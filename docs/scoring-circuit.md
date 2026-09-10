@@ -24,7 +24,7 @@ the same machine as docs/dice-circuit.md, so the numbers are comparable.
    **9.5 MB** prover key. Scoring costs **1/36th of the dice** in key size — because scoring
    never hashes, and `persistentHash` is what the prover key is mostly made of (§4).
 2. **Full joker rules survived, complete and unsimplified.** Forced matching-upper placement,
-   full-value lower jokers, the upper-fallback branch, and +100 only when the Yahtzee box
+   full-value lower jokers, the upper-fallback branch, and +100 only when the Five of a Kind box
    holds 50. No simplification was needed. `api/src/rules.ts` and the site rules need no
    change.
 3. **The two halves add up, exactly.** Combined `takeTurn` is 1 804 instructions;
@@ -206,7 +206,7 @@ circuit is **222 instructions cheaper** — one ledger write instead of two, one
 instead of one, and no `modalFace`.
 
 And the prover key barely moves: **+5 485 bytes, 0.03%.** Adding the entire official rules of
-Yahtzee to a turn that already derives fifteen dice is free at the key level, because the key is
+a five-of-a-kind check to a turn that already derives fifteen dice is free at the key level, because the key is
 sized by the three SHA-256 hashes. **Scoring is not a cost problem for this project.**
 
 ### Why `keepModalFace` is not available in the combined circuit
@@ -219,7 +219,7 @@ forced. Measured, `--skip-zk`, three rolls with scoring on the final merged dice
 | `die >= 4` (per-die)      |                 3 |    ~40 (full applyScore) | 10.2 s     |
 | `die == d[0]` (fan-in 2)  |                 4 |    ~40 (full applyScore) | 8.9 s      |
 | `die == modalFace(roll1)` |                15 |              1 (diceSum) | 5.0 s      |
-| `die == modalFace(roll1)` |                15 |            6 (isYahtzee) | 45.5 s     |
+| `die == modalFace(roll1)` |                15 |        6 (isFiveOfAKind) | 45.5 s     |
 | `die == modalFace(roll1)` |                15 |             7 (rawScore) | **>150 s** |
 | `die == modalFace(roll1)` |                15 |    ~40 (full applyScore) | **>200 s** |
 
@@ -241,7 +241,7 @@ turn.compact's variant order so the two contracts stay wire-compatible and one m
 **Three routes remain open for the real `Table.takeTurn`:**
 
 1. **Per-die hold policies only.** One transaction per turn, 1 804 instructions, 19.5 MB key.
-   Costs the game `keepModalFace`, which is the "chase a Yahtzee" policy — a real gameplay
+   Costs the game `keepModalFace`, which is the "chase a five of a kind" policy — a real gameplay
    loss, and the one to weigh.
 2. **Two transactions per turn.** `resolveTurn` writes the dice to the ledger, `scoreTurn` reads
    them back. A ledger read is a fresh leaf, so the DAG is cut and nothing blows up. All hold
@@ -314,7 +314,7 @@ engine, never against a second copy of itself.
 | Check                               | Corpus                                                 | Result      |
 | ----------------------------------- | ------------------------------------------------------ | ----------- |
 | `rawScore`                          | **exhaustive**: 13 categories × all 6⁵ hands = 101 088 | exact match |
-| `isYahtzee`                         | exhaustive: all 7 776 hands                            | exact match |
+| `isFiveOfAKind`                     | exhaustive: all 7 776 hands                            | exact match |
 | `applyScore` placement/score/bonus  | 2 500 scorecards × 13 categories = **32 500**          | exact match |
 | `placeScore` whole updated card     | every legal case of the 32 500                         | exact match |
 | `cardTotal` and `totalAfterPlacing` | every legal case of the 32 500                         | exact match |
@@ -330,17 +330,17 @@ engine, never against a second copy of itself.
 
 Two things about the corpus that matter more than its size:
 
-**It is shaped, not just large.** Uniform random dice are a Yahtzee 6/7776 of the time, so a
+**It is shaped, not just large.** Uniform random dice a five of a kind 6/7776 of the time, so a
 plain random corpus would exercise the joker branches essentially never — and the joker branches
 are the only part of `applyScore` with non-obvious behaviour. Two fifths of the cases are
-five-of-a-kind with the Yahtzee box already taken. The test then _asserts on its own coverage_:
+five-of-a-kind with the Five of a Kind box already taken. The test then _asserts on its own coverage_:
 it counts how many cases reached the forced-upper branch, the lower-joker branch and the
 scratched-box path, and fails if any is under 50. A corpus generator that drifts cannot make
 this suite pass vacuously.
 
 **Filled boxes get the reference's own scores.** A filled category is given
 `refRawScore(cat, randomHand)` rather than an arbitrary number, so upper-section totals land
-near the 63 bonus threshold about as often as a real game puts them there. The Yahtzee box is
+near the 63 bonus threshold about as often as a real game puts them there. The Five of a Kind box is
 special-cased to 0 or 50, its only real values, because which one it holds decides the +100.
 
 The one branch a random corpus cannot reach is the upper fallback — it needs all six lower boxes

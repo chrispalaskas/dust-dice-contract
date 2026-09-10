@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * A driver for playing whole games of Yahtzee through `TableSimulator`, and an INDEPENDENT
+ * A driver for playing whole games of Dust Dice through `TableSimulator`, and an INDEPENDENT
  * replay of every game it plays.
  *
  * The point of the replay is that the assertions in src/test/table.test.ts are differential,
@@ -46,7 +46,7 @@ import {
   type Dice as RefDice,
   emptyScorecard as refEmptyScorecard,
   grandTotal as refGrandTotal,
-  isYahtzee as refIsYahtzee,
+  isFiveOfAKind as refIsFiveOfAKind,
   RuleViolation,
   type Scorecard as RefScorecard,
   // Relative rather than '@dust-dice/api/src/rules.ts': api's package.json `exports` map
@@ -261,7 +261,7 @@ export const alwaysStopEarly: HoldChooser = () => 'score';
  *
  * The interactive equivalent of the old `KeepModal` policy, and the schedule the joker tests
  * need: chasing the modal face is what actually rolls five of a kind often enough for the
- * Yahtzee bonus and forced placement to be reached in a game of ordinary length.
+ * five-of-a-kind bonus and forced placement to be reached in a game of ordinary length.
  */
 export const keepModal: HoldChooser = ({ dice }) => {
   if (new Set(dice).size === 1) return 'score';
@@ -607,7 +607,10 @@ export class GameDriver {
         `(seat ${seat}, round ${round}, dice ${dice.join(',')})`,
     );
     this.illegalProbes += 1;
-    if (refIsYahtzee(dice as unknown as RefDice) && this.seats[seat]!.card.scores[11] !== null) {
+    if (
+      refIsFiveOfAKind(dice as unknown as RefDice) &&
+      this.seats[seat]!.card.scores[11] !== null
+    ) {
       this.jokerProbes += 1;
     }
   }
@@ -938,7 +941,7 @@ export class GameDriver {
  *
  * `firstLegal` takes the lowest-indexed category the reference rules accept. `bestScore` takes
  * the legal category that maximises the resulting grand total, which produces realistic
- * scorecards -- upper bonuses, Yahtzee bonuses, the occasional scratch -- and so exercises
+ * scorecards -- upper bonuses, five-of-a-kind bonuses, the occasional scratch -- and so exercises
  * `totalAfterPlacing`'s bonus arithmetic far harder.
  */
 export function chooseCategoryFor(card: RefScorecard, dice: number[], strategy: Strategy): number {

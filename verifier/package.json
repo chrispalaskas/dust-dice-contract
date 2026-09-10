@@ -1,6 +1,6 @@
 {
   "name": "@dust-dice/verifier",
-  "version": "0.4.2",
+  "version": "0.4.4",
   "type": "module",
   "description": "Independent verifier for Dust Dice: replays every roll of a finished table from the chain's own record \u2014 no operator, no trust \u2014 and the shared read-side helpers (compiled-contract handles, indexer queries).",
   "exports": {

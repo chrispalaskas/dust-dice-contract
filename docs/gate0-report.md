@@ -1,6 +1,6 @@
 # Gate 0 report
 
-Answers to the two blocking questions for the staked-NIGHT Yahtzee design, from **executed**
+Answers to the two blocking questions for the staked-NIGHT Dust Dice design, from **executed**
 probes on the local devnet. Every number below was produced by a transaction that landed in a
 block; nothing here rests on compilation alone.
 
@@ -59,7 +59,7 @@ ledger's `pub const NIGHT: UnshieldedTokenType = UnshieldedTokenType(HashOutput(
 rises by `amount`". The ledger then enforces a transaction-wide per-token-type balance
 (`ledger/src/verify.rs:820-888`), which forces the surrounding transaction to supply a matching
 real unshielded input. So a contract cannot pull funds from an arbitrary caller — the caller's
-wallet consents by balancing the transaction. For Yahtzee this is exactly right: a player's
+wallet consents by balancing the transaction. For Dust Dice this is exactly right: a player's
 `stakeIn` is authorised by that player's own signature over their own UTXO.
 
 **A circuit cannot learn its caller's address.** The only self/identity accessor is
@@ -144,7 +144,7 @@ only if `state.generation.address_delegation.get(&output.owner)` already holds a
 dust-address delegation; otherwise the UTXO is created and fully spendable but generates no
 DUST. Both recipients in the run above had registered, hence `true` in both rows.
 
-**This is a real trap for Yahtzee.** A winner who has never registered receives their winnings
+**This is a real trap for Dust Dice.** A winner who has never registered receives their winnings
 and _cannot pay a transaction fee with them_, because fees are DUST — and registering itself
 costs DUST. We hit exactly this bootstrap on the throwaway second wallet: a freshly funded
 wallet's `registerNightUtxosForDustGeneration` failed with `Insufficient generated dust to cover

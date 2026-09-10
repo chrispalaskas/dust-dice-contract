@@ -70,7 +70,7 @@ export struct RollContext {
 
 /** Roll-hash domain tag. Any other use of these hashes must pick a different tag. */
 pure circuit rollDomain(): Bytes<32> {
-  return pad(32, "yahtzee:v1:roll");
+  return pad(32, "dust-dice:v1:roll");
 }
 
 pure circuit rollContext(

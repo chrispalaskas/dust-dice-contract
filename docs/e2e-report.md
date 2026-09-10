@@ -1,4 +1,4 @@
-# E2E report — a whole game of Yahtzee on a real chain
+# E2E report — a whole game of Dust Dice on a real chain
 
 A two-player, thirteen-round game of Dust Dice, played through the real circuits against
 the real proof server on the local devnet, settled with the winner and the rake paid out of the
@@ -418,7 +418,7 @@ expected failure mode is a **six-minute hang** ending in a generic `BadInput`, w
 terrible signal to design against. Instead:
 
 1. The proof-server image's bundled SRS degrees were enumerated directly. The image is
-   distroless, so there is no shell to ask — `docker export yahtzee-proof-server | tar -t` lists
+   distroless, so there is no shell to ask — `docker export dust-dice-proof-server | tar -t` lists
    `.cache/midnight/zk-params/bls_midnight_2p{9,10,11,12,13,14,15}`. **k=9 through k=15, and
    nothing else.**
 2. Each circuit's own PLONK domain was read straight out of its compiled ZKIR with
@@ -504,7 +504,7 @@ consequence: an exported circuit's parameters are **public inputs to the proof**
 domain must cover the public-input region, so on a small circuit a 128-input argument sets the
 domain by itself.
 
-A compile-time constant costs neither. `pad(2048, "yahtzee:v1:pad")` written to a `Bytes<2048>`
+A compile-time constant costs neither. `pad(2048, "dust-dice:v1:pad")` written to a `Bytes<2048>`
 ledger cell after `kernel.checkpoint()` is emitted by the compiler as a literal `StateValue` push
 inside the ledger op — so the 2,048 bytes still land in the transcript, still count toward
 `est_size()`, and still earn the dismiss-time allowance, while contributing essentially nothing
@@ -728,7 +728,7 @@ round, rollIndex)` through the same byte-threshold ladder the circuit uses. All 
    dropped or reordered.
 4. **Every score recomputes**, from the dice, with `api/src/rules.ts` — the contract-canonical
    rules engine, deliberately not the circuit's own `pureCircuits`, so the check is differential
-   rather than self-referential. Box by box, including the upper bonus and the Yahtzee bonuses.
+   rather than self-referential. Box by box, including the upper bonus and the five-of-a-kind bonuses.
    The category a player chose is not stored in the ledger at all (it is a circuit argument), so
    the verifier recovers it by finding the box that changed across the `takeTurn` — and then
    recomputes what belongs in it, which is a stronger check than being told.
@@ -776,7 +776,7 @@ Confirmed end to end, by transactions that landed in blocks:
    exist.** Both now carry amendments; `table.compact`'s decisions 8 and 9 are the primary
    record.
 2. **The 6-seat table is no longer viable as designed** — 343 transactions, ~109 minutes. The
-   architecture doc's "long but within a real Yahtzee evening" no longer holds at six seats. A
+   architecture doc's "long but within a real Dust Dice evening" no longer holds at six seats. A
    decision is needed: cap tables at 2–3 seats, shorten the game, run tables concurrently, or
    probe batching the three resolve steps into one transaction.
 3. **`npm run k -w cli` belongs in CI**, before any deploy. Three circuits sit at k=15 with zero

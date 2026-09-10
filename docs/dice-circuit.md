@@ -83,7 +83,7 @@ be slid into another:
 
 ```compact
 struct RollContext {
-  domain: Bytes<32>,         // pad(32, "yahtzee:v1:roll")
+  domain: Bytes<32>,         // pad(32, "dust-dice:v1:roll")
   tableId: Bytes<32>,
   seed: Bytes<32>,           // operator's commit-reveal seed
   playerEntropy: Bytes<32>,  // player's contribution
@@ -176,7 +176,7 @@ Two things to take from this table:
    designs**; use the zkir instruction count.
 
    > **EXTENDED — see docs/scoring-circuit.md §4.** The steps continue much further down for
-   > circuits that do not hash: 39 KB, ≈148 KB, ≈282 KB, ≈548 KB. The full official Yahtzee
+   > circuits that do not hash: 39 KB, ≈148 KB, ≈282 KB, ≈548 KB. The full official five-dice
    > scoring path has a **548 KB** prover key against `rollDice`'s 9.5 MB. The "do not compare
    > designs by key size" rule survives intact — a 246-instruction circuit there lands on
    > 547 KB while a 524-instruction one lands on 283 KB.
@@ -288,7 +288,7 @@ same machine, same source otherwise:
 | Mask re-evaluated each roll | **never completes** (>200 s, RSS climbing) |
 
 This is a defensible design — it is what "pre-declared hold policy" already meant in
-architecture.md, and a Yahtzee player may keep their holds across both re-rolls — but it was
+architecture.md, and a Dust Dice player may keep their holds across both re-rolls — but it was
 **not chosen freely**, and that matters for the record. Its one behavioural cost:
 `keepModalFace` chases whatever the first roll's modal face was, even if a later roll offers
 a better one. If the defect is fixed, per-roll re-evaluation becomes available again.

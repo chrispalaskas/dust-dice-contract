@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // ===========================================================================================
-// Midnight Yahtzee -- the Lobby. A registry, and nothing else.
+// Dust Dice -- the Lobby. A registry, and nothing else.
 // ===========================================================================================
 //
 // One deployment for the whole site. Per stake tier it records which Table contract is
@@ -80,7 +80,7 @@ export ledger padStore: Bytes<4096>;
  * here and in `padStore`'s type; keep them in step by hand.
  */
 pure circuit paddingConstant(): Bytes<4096> {
-  return pad(4096, "yahtzee:v1:pad");
+  return pad(4096, "dust-dice:v1:pad");
 }
 
 /** The operator's key. Never disclosed; only the equality against the commitment is. */
@@ -92,7 +92,7 @@ witness operatorSecret(): Bytes<32>;
  * calling this pure circuit is one fewer hand-written hash to get wrong.
  */
 export pure circuit operatorCommitmentOf(sk: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "yahtzee:v1:lobbyop"), sk]);
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "dust-dice:v1:lobbyop"), sk]);
 }
 
 /** Prove the caller holds the operator key. The whole of this contract's access control. */

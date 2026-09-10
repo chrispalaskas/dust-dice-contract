@@ -53,8 +53,8 @@ export const BUCKET = 42;
 /** The die returned when every candidate rejects. Biases this face by ~5.96e-8. */
 export const EXHAUSTION_FALLBACK = 1;
 
-/** Domain tag; must equal `pad(32, "yahtzee:v1:roll")` in dice-core.compact. */
-export const ROLL_DOMAIN_TAG = 'yahtzee:v1:roll';
+/** Domain tag; must equal `pad(32, "dust-dice:v1:roll")` in dice-core.compact. */
+export const ROLL_DOMAIN_TAG = 'dust-dice:v1:roll';
 
 // ---------------------------------------------------------------------------------------
 // Roll context and its runtime type

@@ -122,7 +122,7 @@ rolls with scoring on the final merged dice:
 | `die >= 4` (per-die)      |                 3 |    ~40 (full applyScore) | 10.2 s     |
 | `die == d[0]`             |                 4 |    ~40 (full applyScore) | 8.9 s      |
 | `die == modalFace(roll1)` |                15 |              1 (diceSum) | 5.0 s      |
-| `die == modalFace(roll1)` |                15 |            6 (isYahtzee) | 45.5 s     |
+| `die == modalFace(roll1)` |                15 |        6 (isFiveOfAKind) | 45.5 s     |
 | `die == modalFace(roll1)` |                15 |             7 (rawScore) | **>150 s** |
 | `die == modalFace(roll1)` |                15 |    ~40 (full applyScore) | **>200 s** |
 
@@ -283,7 +283,7 @@ enlarge them changes the circuit's k and lands on a missing degree.
 **Workaround — worked-around.** Keep circuit size inside the bundled degrees, and grow
 transactions by a post-checkpoint ledger _write_ rather than by hashing (§3). When proving
 appears to hang, check
-`docker compose -p yahtzee-devnet logs proof-server | grep "Missing public parameters"` — the
+`docker compose -p dust-dice-devnet logs proof-server | grep "Missing public parameters"` — the
 symptom is otherwise indistinguishable from a slow proof.
 
 **Intended upstream action.** Issue against the proof-server image: (1) bundle the full range of
@@ -730,7 +730,7 @@ With the argument, the only padding width that kept the resolve circuits provabl
 configuration. With the constant, both bounds are satisfied with room to spare.
 
 **Fix — fixed-here.** `table.compact` and `lobby.compact` take no padding argument at all;
-`padTransaction()` writes `pad(2048, "yahtzee:v1:pad")` to a `Bytes<2048>` ledger cell after
+`padTransaction()` writes `pad(2048, "dust-dice:v1:pad")` to a `Bytes<2048>` ledger cell after
 `kernel.checkpoint()`. Documented as decision 8 in `table.compact`, with the measurements above.
 
 **Intended upstream action.** Documentation issue against `midnightntwrk/compact`: state
@@ -1125,7 +1125,7 @@ recompiling HEAD (compactc is deterministic: the fingerprint came back identical
 `a325f2ac3b21`).
 
 **Rule.** Never compile contracts in a checkout whose `service/` is driving live tables. Do
-feature work in a git worktree (`git worktree add ../yahtzee-<feature>`) with its own
+feature work in a git worktree (`git worktree add ../dust-dice-<feature>`) with its own
 `node_modules`, and only recompile in the live tree as part of a deliberate redeploy. A stronger
 fix — the daemon loading artifacts once at startup and pinning them in memory — is worth doing;
 not done yet.

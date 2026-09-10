@@ -107,10 +107,10 @@ const ENTROPY_CONTEXT_TYPE: CompactType<EntropyContextTs> = {
 };
 
 /** Domain tags. Must equal the `pad(32, ...)` literals in policy-core.compact / table.compact. */
-export const TAG_ENTROPY = 'yahtzee:v1:entropy';
-export const TAG_ENTROPY_KEY = 'yahtzee:v1:entkey';
-export const TAG_SEED = 'yahtzee:v1:seed';
-export const TAG_MIX = 'yahtzee:v1:mix';
+export const TAG_ENTROPY = 'dust-dice:v1:entropy';
+export const TAG_ENTROPY_KEY = 'dust-dice:v1:entkey';
+export const TAG_SEED = 'dust-dice:v1:seed';
+export const TAG_MIX = 'dust-dice:v1:mix';
 
 /** Mirror of `forcedEntropy`: `entropy_s(r) = H("entropy", sk, tableId, r)`. */
 export function forcedEntropyTs(
@@ -148,7 +148,7 @@ export function seedCommitmentTs(tableId: Uint8Array, seed: Uint8Array): Uint8Ar
   return persistentHash(VEC3_BYTES32, [pad(32, TAG_SEED), tableId, seed]);
 }
 
-export const TAG_INVITE = 'yahtzee:v1:invite';
+export const TAG_INVITE = 'dust-dice:v1:invite';
 const VEC2_BYTES32 = new CompactTypeVector(2, BYTES32);
 
 /** Mirror of `inviteCommitment`: a private table's sealed `H("invite", code)`. */

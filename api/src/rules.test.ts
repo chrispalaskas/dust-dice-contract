@@ -5,7 +5,7 @@ import {
   type Dice,
   emptyScorecard,
   grandTotal,
-  isYahtzee,
+  isFiveOfAKind,
   rawScore,
   RuleViolation,
   type Scorecard,
@@ -33,7 +33,7 @@ describe('rawScore', () => {
     expect(rawScore(Category.FourOfAKind, d(5, 5, 5, 5, 5))).toBe(25);
   });
 
-  it('full house = 25, and a yahtzee counts as a full house', () => {
+  it('full house = 25, and a five of a kind counts as a full house', () => {
     expect(rawScore(Category.FullHouse, d(2, 2, 3, 3, 3))).toBe(25);
     expect(rawScore(Category.FullHouse, d(2, 2, 3, 3, 4))).toBe(0);
     expect(rawScore(Category.FullHouse, d(4, 4, 4, 4, 4))).toBe(25);
@@ -48,9 +48,9 @@ describe('rawScore', () => {
     expect(rawScore(Category.LargeStraight, d(1, 2, 3, 4, 6))).toBe(0);
   });
 
-  it('yahtzee and chance', () => {
-    expect(rawScore(Category.Yahtzee, d(6, 6, 6, 6, 6))).toBe(50);
-    expect(rawScore(Category.Yahtzee, d(6, 6, 6, 6, 5))).toBe(0);
+  it('five of a kind and chance', () => {
+    expect(rawScore(Category.FiveOfAKind, d(6, 6, 6, 6, 6))).toBe(50);
+    expect(rawScore(Category.FiveOfAKind, d(6, 6, 6, 6, 5))).toBe(0);
     expect(rawScore(Category.Chance, d(1, 2, 3, 4, 5))).toBe(15);
   });
 });
@@ -87,41 +87,41 @@ describe('applyScore + totals', () => {
   });
 });
 
-describe('yahtzee joker rules', () => {
-  const yahtzeeOf = (face: number) => d(face, face, face, face, face);
+describe('five-of-a-kind joker rules', () => {
+  const fiveOfAKindOf = (face: number) => d(face, face, face, face, face);
 
-  const withYahtzeeScored = (): Scorecard =>
-    applyScore(emptyScorecard(), Category.Yahtzee, yahtzeeOf(3));
+  const withFiveOfAKindScored = (): Scorecard =>
+    applyScore(emptyScorecard(), Category.FiveOfAKind, fiveOfAKindOf(3));
 
-  it('extra yahtzee forces the open matching upper box and pays the bonus', () => {
-    const card = withYahtzeeScored();
-    expect(() => applyScore(card, Category.Chance, yahtzeeOf(4))).toThrow(RuleViolation);
-    const next = applyScore(card, Category.Fours, yahtzeeOf(4));
+  it('an extra five of a kind forces the open matching upper box and pays the bonus', () => {
+    const card = withFiveOfAKindScored();
+    expect(() => applyScore(card, Category.Chance, fiveOfAKindOf(4))).toThrow(RuleViolation);
+    const next = applyScore(card, Category.Fours, fiveOfAKindOf(4));
     expect(next.scores[Category.Fours]).toBe(20);
-    expect(next.yahtzeeBonuses).toBe(1);
+    expect(next.fiveOfAKindBonuses).toBe(1);
     expect(grandTotal(next)).toBe(50 + 20 + 100);
   });
 
   it('joker full house / straights count in full when upper box is filled', () => {
-    let card = withYahtzeeScored();
+    let card = withFiveOfAKindScored();
     card = applyScore(card, Category.Fours, d(4, 4, 1, 2, 3)); // fill Fours = 8
-    const fh = applyScore(card, Category.FullHouse, yahtzeeOf(4));
+    const fh = applyScore(card, Category.FullHouse, fiveOfAKindOf(4));
     expect(fh.scores[Category.FullHouse]).toBe(25);
-    expect(fh.yahtzeeBonuses).toBe(1);
-    const ls = applyScore(card, Category.LargeStraight, yahtzeeOf(4));
+    expect(fh.fiveOfAKindBonuses).toBe(1);
+    const ls = applyScore(card, Category.LargeStraight, fiveOfAKindOf(4));
     expect(ls.scores[Category.LargeStraight]).toBe(40);
   });
 
-  it('scratched yahtzee box: joker placement rules apply but no bonus', () => {
-    let card = applyScore(emptyScorecard(), Category.Yahtzee, d(1, 2, 3, 4, 5)); // 0
+  it('scratched Five of a Kind box: joker placement rules apply but no bonus', () => {
+    let card = applyScore(emptyScorecard(), Category.FiveOfAKind, d(1, 2, 3, 4, 5)); // 0
     card = applyScore(card, Category.Fours, d(4, 4, 1, 2, 3));
-    const next = applyScore(card, Category.FullHouse, yahtzeeOf(4));
+    const next = applyScore(card, Category.FullHouse, fiveOfAKindOf(4));
     expect(next.scores[Category.FullHouse]).toBe(25);
-    expect(next.yahtzeeBonuses).toBe(0);
+    expect(next.fiveOfAKindBonuses).toBe(0);
   });
 
   it('upper fallback scores face value when everything else is filled', () => {
-    let card = withYahtzeeScored();
+    let card = withFiveOfAKindScored();
     // fill Fives and all lower categories
     card = applyScore(card, Category.Fives, d(5, 5, 1, 2, 3));
     for (const cat of [
@@ -134,9 +134,9 @@ describe('yahtzee joker rules', () => {
     ]) {
       card = applyScore(card, cat, d(1, 2, 3, 5, 6));
     }
-    const next = applyScore(card, Category.Twos, yahtzeeOf(5));
-    expect(next.scores[Category.Twos]).toBe(0); // no 2s in a yahtzee of 5s
-    expect(next.yahtzeeBonuses).toBe(1); // bonus still earned
+    const next = applyScore(card, Category.Twos, fiveOfAKindOf(5));
+    expect(next.scores[Category.Twos]).toBe(0); // no 2s in a five of a kind of 5s
+    expect(next.fiveOfAKindBonuses).toBe(1); // bonus still earned
   });
 });
 
@@ -180,8 +180,8 @@ describe('splitPot (mirrors circuit witness arithmetic)', () => {
     }
   });
 
-  it('isYahtzee sanity', () => {
-    expect(isYahtzee(d(2, 2, 2, 2, 2))).toBe(true);
-    expect(isYahtzee(d(2, 2, 2, 2, 3))).toBe(false);
+  it('isFiveOfAKind sanity', () => {
+    expect(isFiveOfAKind(d(2, 2, 2, 2, 2))).toBe(true);
+    expect(isFiveOfAKind(d(2, 2, 2, 2, 3))).toBe(false);
   });
 });

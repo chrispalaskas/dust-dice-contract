@@ -39,7 +39,7 @@
 //
 // So `holdMask` is computed ONCE, from roll 1, and both re-rolls use it. This is not a
 // concession -- it is what "pre-declared hold policy" already meant, and it is ordinary
-// Yahtzee (a player may keep their holds across both re-rolls). It also happens to be
+// a five of a kind (a player may keep their holds across both re-rolls). It also happens to be
 // cheaper. But it is a constraint the design did not choose freely, and if the defect is
 // fixed, re-evaluating per roll becomes available again.
 //
@@ -55,11 +55,11 @@ include "dice-core";
 
 /**
  * The hold policies measured here. Deliberately a small set -- this exists to measure the
- * cost shape, not to be good Yahtzee strategy.
+ * cost shape, not to be good strategy.
  *
  * * `keepNone` -- re-roll all five dice every time.
  * * `keepModalFace` -- keep every die showing the most common face (ties to the higher
- *   face, which scores more). The "chase a Yahtzee" policy.
+ *   face, which scores more). The "chase a five of a kind" policy.
  * * `keepGe4` -- keep 4s, 5s and 6s. The "chase upper-section points" policy.
  */
 export enum HoldPolicy {

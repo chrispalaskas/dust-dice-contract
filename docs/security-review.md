@@ -78,7 +78,7 @@ seed are never disclosed — only boolean assertion results — until the single
   the same on-chain commitment; the first table's settle (public seed reveal, by design)
   then hands any observer the live second table's full future randomness. **Fix:** bind
   `tableId` into the commitment; update `resolveRoll*`/`settle` call sites. Status:
-  **FIXED**. `seedCommitmentOf(tableId, seed) = H("yahtzee:v1:seed", tableId, seed)`, a
+  **FIXED**. `seedCommitmentOf(tableId, seed) = H("dust-dice:v1:seed", tableId, seed)`, a
   3-element vector hash. Call sites updated: `resolveRoll1`, `resolveRoll2`, `resolveRoll3`,
   `settle`, the `seedCommitmentTs` mirror in `contract/src/policy-mirror.ts`, the test harness
   (`tableConfig`), `cli/src/demo.ts`, `cli/src/timeouts.ts` and `cli/src/verify.ts`. Tests:
@@ -94,7 +94,7 @@ seed are never disclosed — only boolean assertion results — until the single
   [client-rules.md](client-rules.md) rule 1. **Consequence worth recording:** the commitment is
   hashed into the join digest and the join digest feeds every roll, so this changed every die at
   every table. The three swept tie-break table ids in `src/test/table.test.ts` were re-swept
-  (36 → 113, 18 → 16, 10 → 6); the joker id 30 still produces its double Yahtzee. That the old
+  (36 → 113, 18 → 16, 10 → 6); the joker id 30 still produces its double five of a kind. That the old
   ids stopped tying is the intended loud break.
 - **Low:** `join` accepts a zero `payoutTo` (self-harm only). Status: **FIXED** —
   `assert(who != default<UserAddress>, ...)` in `join`. Test:
