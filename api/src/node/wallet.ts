@@ -82,6 +82,14 @@ export async function waitForUsableSync(ctx: WalletContext): Promise<FacadeState
 }
 
 /**
+ * wallet-sdk 1.x signs synchronously, `(data) => Signature`. Wrapped in an arrow so the keystore
+ * keeps `this`; the unbound method reference the 2.x code passed is not safe to assume here.
+ */
+function signerFor(ctx: WalletContext): (data: Uint8Array) => ledger.Signature {
+  return (data) => ctx.unshieldedKeystore.signData(data);
+}
+
+/**
  * DUST coin selection: the LARGEST coin first.
  *
  * The SDK's default picks the smallest coin first. A wallet that has paid many fees holds a
@@ -102,12 +110,9 @@ export async function createWallet(network: NetworkConfig, seed: string): Promis
   const keys = deriveKeys(seed);
   const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(keys[Roles.Zswap]);
   const dustSecretKey = ledger.DustSecretKey.fromSeed(keys[Roles.Dust]);
-  // wallet-sdk 2.x takes a tagged UnshieldedSecretKey rather than raw bytes. Midnight's
-  // unshielded (NIGHT) keys are Schnorr.
-  const unshieldedKeystore = createKeystore(
-    { kind: 'schnorr', secret: keys[Roles.NightExternal] },
-    networkId,
-  );
+  // wallet-sdk 1.x (ledger 8) takes the raw Schnorr secret; 2.x wrapped it in a tagged
+  // `{ kind: 'schnorr', secret }`.
+  const unshieldedKeystore = createKeystore(keys[Roles.NightExternal], networkId);
 
   const configuration = {
     networkId,
@@ -169,6 +174,53 @@ export async function readBalances(ctx: WalletContext): Promise<Balances> {
   };
 }
 
+/** What the facade's registration estimate takes — the unshielded wallet's own coin records. */
+type NightUtxos = Parameters<WalletContext['wallet']['estimateRegistration']>[0];
+
+/**
+ * Waits until the DUST projected from exactly `nightUtxos` covers their own registration fee,
+ * and returns that fee.
+ *
+ * A registration pays its fee in DUST, and the only DUST a freshly funded wallet can draw on is
+ * what its not-yet-registered NIGHT has already projected — so a wallet funded seconds ago cannot
+ * register yet. wallet-sdk 2.x shipped this wait as `waitForGeneratedDust`; 1.x has no such
+ * helper, but `estimateRegistration` reports each UTXO's projection at the moment of the call
+ * (`generatedNow`) and the ceiling it can never exceed (`maxCap`), which is all the wait needs.
+ * Polled once a second, as the 2.x helper was. Fails fast when the ceiling itself is below the
+ * fee: no amount of waiting makes too little NIGHT register itself.
+ */
+export async function waitForRegistrationFeeCoverage(
+  ctx: WalletContext,
+  nightUtxos: NightUtxos,
+  timeoutMs: number,
+  log: (msg: string) => void = () => {},
+): Promise<bigint> {
+  const deadline = Date.now() + timeoutMs;
+  let announced = false;
+  for (;;) {
+    const { fee, dustGenerationEstimations } = await ctx.wallet.estimateRegistration(nightUtxos);
+    const available = dustGenerationEstimations.reduce((s, e) => s + e.dust.generatedNow, 0n);
+    if (available >= fee) return fee;
+    const ceiling = dustGenerationEstimations.reduce((s, e) => s + e.dust.maxCap, 0n);
+    if (ceiling < fee) {
+      throw new Error(
+        `these NIGHT UTXOs can generate at most ${ceiling} Specks of DUST, below their own ` +
+          `registration fee of ${fee} — fund more NIGHT`,
+      );
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `projected DUST ${available} never reached registration fee ${fee} within ${timeoutMs} ms`,
+      );
+    }
+    if (!announced) {
+      log(`waiting for projected DUST: have ${available}, registration fee ${fee}`);
+      announced = true;
+    }
+    await new Promise((r) => setTimeout(r, 1_000));
+  }
+}
+
 /**
  * Registers any unregistered NIGHT UTXOs for DUST generation, waiting first for the
  * projected DUST from exactly that UTXO set to cover the registration's own fee (the
@@ -185,16 +237,15 @@ export async function ensureDustRegistered(
   );
 
   if (unregistered.length > 0) {
-    const { fee } = await ctx.wallet.estimateRegistration(unregistered);
+    const fee = await waitForRegistrationFeeCoverage(ctx, unregistered, 600_000, log);
     log(`registering ${unregistered.length} NIGHT UTXO(s) for DUST generation (fee ${fee})`);
-    await ctx.wallet.waitForGeneratedDust(unregistered, fee, { timeoutMs: 600_000 });
 
     // The signer callback returns an ALREADY-SIGNED recipe. Do NOT signRecipe again —
     // double-signing is rejected as InputsSignaturesLengthMismatch (Custom error 192).
     const recipe = await ctx.wallet.registerNightUtxosForDustGeneration(
       unregistered,
       ctx.unshieldedKeystore.getPublicKey(),
-      ctx.unshieldedKeystore.signDataAsync,
+      signerFor(ctx),
     );
     const finalized = await ctx.wallet.finalizeRecipe(recipe);
     const txHash = await ctx.wallet.submitTransaction(finalized);
@@ -234,7 +285,7 @@ export async function transferTo(
     { shieldedSecretKeys: ctx.shieldedSecretKeys, dustSecretKey: ctx.dustSecretKey },
     { ttl: new Date(Date.now() + TX_TTL_MS) },
   );
-  const signed = await ctx.wallet.signRecipe(recipe, ctx.unshieldedKeystore.signDataAsync);
+  const signed = await ctx.wallet.signRecipe(recipe, signerFor(ctx));
   const tx = await ctx.wallet.finalizeRecipe(signed);
   return await ctx.wallet.submitTransaction(tx);
 }

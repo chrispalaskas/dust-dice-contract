@@ -92,13 +92,15 @@ export function createProviders<CK extends string, PS = unknown>(
   managedDir: string,
   phases?: Phases,
 ): MidnightProviders<CK, PrivateStateId, PS> {
+  // wallet-sdk 1.x signs synchronously, `(data) => Signature`. The arrow keeps the keystore as
+  // `this`; passing the method reference unbound, as the 2.x code did, is not safe to assume.
+  const signData = (data: Uint8Array) => ctx.unshieldedKeystore.signData(data);
+
   const walletProvider = {
     getCoinPublicKey: () => ctx.shieldedSecretKeys.coinPublicKey,
     getEncryptionPublicKey: () => ctx.shieldedSecretKeys.encryptionPublicKey,
 
-    // Balancing does NOT sign unshielded inputs; the recipe must be signed explicitly
-    // afterwards, and the signer on this SDK line is async — the keystore's signDataAsync
-    // already has the SignSegment shape.
+    // Balancing does NOT sign unshielded inputs; the recipe must be signed explicitly afterwards.
     async balanceTx(tx: unknown, ttl?: Date) {
       const t0 = performance.now();
       try {
@@ -108,7 +110,7 @@ export function createProviders<CK extends string, PS = unknown>(
           { shieldedSecretKeys: ctx.shieldedSecretKeys, dustSecretKey: ctx.dustSecretKey },
           { ttl: ttl ?? new Date(Date.now() + TX_TTL_MS) },
         );
-        const signed = await ctx.wallet.signRecipe(recipe, ctx.unshieldedKeystore.signDataAsync);
+        const signed = await ctx.wallet.signRecipe(recipe, signData);
         return await ctx.wallet.finalizeRecipe(signed);
       } finally {
         if (phases) phases.balanceMs += performance.now() - t0;
