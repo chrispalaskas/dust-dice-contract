@@ -38,3 +38,6 @@ ui/CLAUDE.md
 # on, letting anyone precompute that table's dice. See service/README.md.
 service/.state/
 service/.state-smoke-*/
+
+# local `npm pack` output for the ledger-8 branch — consumed by ../dust-dice as file: tarballs
+packs/
