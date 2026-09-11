@@ -42,6 +42,7 @@ import {
   UnshieldedAddress,
 } from '@midnight-ntwrk/wallet-sdk';
 import type { FacadeState } from '@midnight-ntwrk/wallet-sdk';
+import { DustAddress } from '@midnight-ntwrk/wallet-sdk-address-format';
 
 import { TX_TTL_MS, type NetworkConfig } from './network.js';
 
@@ -175,7 +176,79 @@ export async function assertLedgerGeneration(network: NetworkConfig): Promise<vo
   }
 }
 
-export async function createWallet(network: NetworkConfig, seed: string): Promise<WalletContext> {
+/**
+ * The addresses a seed derives to, without opening a wallet or touching the network.
+ *
+ * Needed before a wallet exists: a snapshot of replayed state is keyed by address
+ * (`service/src/wallet-snapshots.ts`), and funding an operator means publishing its addresses
+ * before it has ever started. Same derivation as `createWallet` — account 0, roles
+ * Zswap/NightExternal/Dust, index 0 — so the answers are the wallet's own.
+ */
+export function deriveAddresses(seed: string, networkId: string): { night: string; dust: string } {
+  setNetworkId(networkId);
+  const id = getNetworkId();
+  const keys = deriveKeys(seed);
+  return {
+    night: createKeystore(keys[Roles.NightExternal], id).getBech32Address().toString(),
+    dust: DustAddress.encodePublicKey(
+      id,
+      ledger.DustSecretKey.fromSeed(keys[Roles.Dust]).publicKey,
+    ),
+  };
+}
+
+/**
+ * A wallet's replayed state, as three opaque strings the SDK can restore from.
+ *
+ * WHY THIS EXISTS: a new wallet replays every ledger event since genesis before it can be used —
+ * on preprod that is ~1.5 million events, hours of CPU, dominated by rebuilding the DUST
+ * commitment and generation trees. Nothing about that work is specific to a run, so a daemon
+ * that snapshots it restarts in seconds instead of hours, and each new lane wallet pays the sync
+ * once rather than on every restart.
+ *
+ * The guard fields matter: restoring a snapshot into a wallet with different keys, or against a
+ * different chain, would present someone else's coins as spendable and fail at signing time.
+ * `restoreWallet` refuses unless the network and the derived address both match.
+ *
+ * Contains no secret: the states hold public chain data and the wallet's own view of it. The
+ * SEED is the secret, and it is not here.
+ */
+export interface WalletSnapshot {
+  networkId: string;
+  /** The unshielded address the snapshot's seed derives to. */
+  address: string;
+  /** ISO timestamp, for logs and for deciding a snapshot is too stale to bother with. */
+  savedAt: string;
+  shielded: string;
+  unshielded: string;
+  dust: string;
+}
+
+/**
+ * Serialise the three wallets' replayed state. Safe to call at any time; the snapshot is
+ * whatever has been applied so far, and restoring it resumes from there.
+ */
+export async function serializeWallet(ctx: WalletContext): Promise<WalletSnapshot> {
+  const [shielded, unshielded, dust] = await Promise.all([
+    ctx.wallet.shielded.serializeState(),
+    ctx.wallet.unshielded.serializeState(),
+    ctx.wallet.dust.serializeState(),
+  ]);
+  return {
+    networkId: ctx.network.networkId,
+    address: ctx.address,
+    savedAt: new Date().toISOString(),
+    shielded,
+    unshielded,
+    dust,
+  };
+}
+
+export async function createWallet(
+  network: NetworkConfig,
+  seed: string,
+  snapshot?: WalletSnapshot,
+): Promise<WalletContext> {
   setNetworkId(network.networkId);
   await assertLedgerGeneration(network);
   const networkId = getNetworkId();
@@ -199,16 +272,41 @@ export async function createWallet(network: NetworkConfig, seed: string): Promis
     costParameters: { additionalFeeOverhead: 300_000_000_000_000n, feeBlocksMargin: 5 },
   };
 
+  // A snapshot is only restored into the wallet it came from, on the chain it came from.
+  const address = unshieldedKeystore.getBech32Address().toString();
+  const restore =
+    snapshot !== undefined &&
+    snapshot.networkId === network.networkId &&
+    snapshot.address === address
+      ? snapshot
+      : undefined;
+  if (snapshot !== undefined && restore === undefined) {
+    throw new Error(
+      `refusing to restore a wallet snapshot for ${snapshot.address} on ${snapshot.networkId} ` +
+        `into ${address} on ${network.networkId}`,
+    );
+  }
+
   const wallet = await WalletFacade.init({
     configuration,
-    shielded: async (config) => ShieldedWallet(config).startWithSecretKeys(shieldedSecretKeys),
+    shielded: async (config) =>
+      restore
+        ? ShieldedWallet(config).restore(restore.shielded)
+        : ShieldedWallet(config).startWithSecretKeys(shieldedSecretKeys),
     unshielded: async (config) =>
-      UnshieldedWallet(config).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
+      restore
+        ? UnshieldedWallet(config).restore(restore.unshielded)
+        : UnshieldedWallet(config).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
     dust: async (config) =>
-      CustomDustWallet(
-        config,
-        new V1Builder().withDefaults().withCoinSelection(() => largestDustCoinFirst),
-      ).startWithSecretKey(dustSecretKey, ledger.LedgerParameters.initialParameters().dust),
+      restore
+        ? CustomDustWallet(
+            config,
+            new V1Builder().withDefaults().withCoinSelection(() => largestDustCoinFirst),
+          ).restore(restore.dust)
+        : CustomDustWallet(
+            config,
+            new V1Builder().withDefaults().withCoinSelection(() => largestDustCoinFirst),
+          ).startWithSecretKey(dustSecretKey, ledger.LedgerParameters.initialParameters().dust),
   });
 
   await wallet.start(shieldedSecretKeys, dustSecretKey);
@@ -218,7 +316,7 @@ export async function createWallet(network: NetworkConfig, seed: string): Promis
     shieldedSecretKeys,
     dustSecretKey,
     unshieldedKeystore,
-    address: unshieldedKeystore.getBech32Address().toString(),
+    address,
     network,
   };
 }
