@@ -195,9 +195,9 @@ const GROUP_RANK: Record<string, number> = {
 /**
  * Read the table's whole history: every transaction, and the state it left behind.
  *
- * One `queryContractState` per transaction, pinned to its block. `contractStateObservable` is
- * not usable for this -- it misses rapid successive updates and its first emission may predate
- * the write being read (bugs-found.md §0 #10).
+ * One state read per transaction, pinned to that transaction. `contractStateObservable` is not
+ * usable for this -- it misses rapid successive updates and its first emission may predate the
+ * write being read (bugs-found.md §0 #10).
  */
 async function readHistory(address: string): Promise<LogGroup[]> {
   const actions = (await contractActions(address)).filter((a) => a.kind !== 'ContractDeploy');
@@ -210,7 +210,7 @@ async function readHistory(address: string): Promise<LogGroup[]> {
       blockHeight: calls[0]!.blockHeight,
       txHash,
       entryPoints: calls.map((x) => x.entryPoint ?? '?'),
-      led: await readTableLedger(address, calls[0]!.blockHeight),
+      led: await readTableLedger(address, { txHash }),
       sharesBlock: false,
     });
   }

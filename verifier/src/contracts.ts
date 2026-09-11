@@ -15,6 +15,7 @@
  */
 
 import { CompiledContract } from '@midnight-ntwrk/midnight-js-protocol/compact-js';
+import { ContractState } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
 import {
   Table,
@@ -26,6 +27,7 @@ import {
 } from '@dust-dice/contract';
 
 import { NETWORK } from './config.ts';
+import { contractStateHexAt } from './indexer.ts';
 
 export { Table, Lobby };
 
@@ -71,6 +73,9 @@ export const CompiledLobbyContract = CompiledContract.make<Lobby.Contract<LobbyP
 export type TableLedger = Table.Ledger;
 export type LobbyLedger = Lobby.Ledger;
 
+/** Which state to read: the latest, or the one a specific transaction left behind. */
+export type LedgerAt = { txHash: string };
+
 /**
  * Read a table's ledger with a ONE-SHOT query.
  *
@@ -79,21 +84,22 @@ export type LobbyLedger = Lobby.Ledger;
  * driver -- and there is one after almost every transaction -- has to use `queryContractState`.
  * (bugs-found.md §0 #10; the same reason probes/gate0/src/step.ts reads this way.)
  *
- * `blockHeight` pins the read to a past block, which is what the chain-only verifier walks the
- * game with.
+ * `at.txHash` pins the read to the state a transaction left, which is what the chain-only
+ * verifier walks the game with. By TRANSACTION, not by block: on this indexer (4.3.x) a block
+ * offset means "the action in that block", and with simultaneous rounds several of a table's
+ * transactions routinely share one -- a block-keyed read cannot say which it returned. The SDK
+ * offers no transaction-hash offset, so that read goes straight to the indexer.
  */
-export async function readTableLedger(address: string, blockHeight?: number): Promise<TableLedger> {
-  const pdp = indexerPublicDataProvider(NETWORK.indexer, NETWORK.indexerWS);
-  const state =
-    blockHeight === undefined
-      ? await pdp.queryContractState(address)
-      : await pdp.queryContractState(address, { type: 'blockHeight', blockHeight });
-  if (!state) {
-    throw new Error(
-      `no contract state at ${address}${blockHeight === undefined ? '' : ` @ block ${blockHeight}`}`,
-    );
+export async function readTableLedger(address: string, at?: LedgerAt): Promise<TableLedger> {
+  if (at === undefined) {
+    const pdp = indexerPublicDataProvider(NETWORK.indexer, NETWORK.indexerWS);
+    const state = await pdp.queryContractState(address);
+    if (!state) throw new Error(`no contract state at ${address}`);
+    return Table.ledger(state.data);
   }
-  return Table.ledger(state.data);
+  const hex = await contractStateHexAt(address, at.txHash);
+  if (!hex) throw new Error(`no contract state at ${address} after tx ${at.txHash}`);
+  return Table.ledger(ContractState.deserialize(Buffer.from(hex.replace(/^0x/, ''), 'hex')).data);
 }
 
 export async function readLobbyLedger(address: string): Promise<LobbyLedger> {
