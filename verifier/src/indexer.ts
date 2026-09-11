@@ -10,7 +10,6 @@
  * 4,900,000 in exactly this situation (docs/bugs-found.md §9). PER-TRANSACTION UTXO MOVEMENT IS
  * THE ONLY TRUSTWORTHY MEASURE, and it is what these queries read:
  *
- *   - `contractAction(address){ unshieldedBalances }`  what the LEDGER says the contract holds
  *   - `transactions(offset:{hash}){ unshieldedCreatedOutputs / unshieldedSpentOutputs }`
  *                                                     who actually received or spent what, with
  *                                                     `registeredForDustGeneration` per created
@@ -26,6 +25,8 @@
  * `__schema.queryType.fields`: only `bridgeBalance(address)` takes an address, and that is the
  * Cardano bridge, not NIGHT), so per-address totals are derived from the UTXO sets above.
  */
+
+import { NATIVE_TOKEN_HEX } from '@dust-dice/contract';
 
 import { NETWORK } from './config.ts';
 
@@ -71,8 +72,11 @@ async function gql<T>(query: string, variables: Record<string, unknown> = {}): P
   return body.data;
 }
 
-/** The native (NIGHT) token type is 32 zero bytes. Matches Compact's `nativeToken()`. */
-export const NATIVE_TOKEN_HEX = '00'.repeat(32);
+/**
+ * The token-type constant and the balance decode live with the contract package, next to the
+ * ledger layout they read; re-exported here so callers of this module keep one import.
+ */
+export { NATIVE_TOKEN_HEX, nativeBalance } from '@dust-dice/contract';
 
 const isNative = (u: { tokenType: string }): boolean =>
   u.tokenType.replace(/^0x/, '').toLowerCase() === NATIVE_TOKEN_HEX;
@@ -85,35 +89,11 @@ export function sumNativeFor(utxos: GqlUnshieldedUtxo[], owner: string): bigint 
   return sumNative(utxos.filter((u) => u.owner === owner));
 }
 
-/**
- * The contract's own unshielded balances as the LEDGER sees them, keyed by token-type hex.
- *
- * `unshieldedBalances` hangs off `ContractAction`, NOT off `Contract` -- `contract(address)`
- * returns a `Contract` whose only fields are address/state/maintenanceAuthority/actions.
- * `contractAction(address)` returns the latest action, which is what carries the running
- * balances, and all three action variants declare the field so it selects on the interface.
- */
-export async function contractUnshieldedBalances(address: string): Promise<Record<string, bigint>> {
-  const data = await gql<{
-    contractAction: { unshieldedBalances: { tokenType: string; amount: string }[] } | null;
-  }>(
-    `query ($address: HexEncoded!) {
-       contractAction(address: $address) { unshieldedBalances { tokenType amount } }
-     }`,
-    { address },
-  );
-  const out: Record<string, bigint> = {};
-  for (const b of data.contractAction?.unshieldedBalances ?? [])
-    out[b.tokenType] = BigInt(b.amount);
-  return out;
-}
-
-export function nativeBalance(balances: Record<string, bigint>): bigint {
-  for (const [k, v] of Object.entries(balances)) {
-    if (k.replace(/^0x/, '').toLowerCase() === NATIVE_TOKEN_HEX) return v;
-  }
-  return 0n;
-}
+// What the contract HOLDS is deliberately NOT read here. The schema does offer
+// `contractAction { unshieldedBalances }`, and it answers `[]` for every action of every
+// contract on this indexer -- tables sitting on a pot included -- so a custody check built on
+// it reports a solvent table as empty, which is the shape of a solvency alarm. Custody comes
+// from the contract's own state: `contracts.ts`'s `contractUnshieldedBalances`.
 
 /**
  * One transaction by hash, with its UTXO deltas and its raw bytes.

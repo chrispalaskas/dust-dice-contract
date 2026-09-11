@@ -21,6 +21,9 @@
  * output exports the same names -- `Contract`/`Ledger`/`ledger`/`Witnesses`/`pureCircuits` --
  * and `export *` from more than one collides on all of them.
  *
+ * `custody.ts` is flat-exported for the same reason: reading what a contract HOLDS out of its
+ * ledger state is one decode, needed by the driver, the verifier and the UI alike.
+ *
  * The mirrors are flat-exported: together they ARE the settlement verifier -- the thing other
  * packages actually consume -- and their names are already specific. `dice-mirror` derives the
  * dice, `policy-mirror` applies the hold policies and the entropy scheme, `table-mirror` walks
@@ -28,6 +31,7 @@
  * reproduce every roll of a game offline, with no proof server and no chain access.
  */
 
+export * from './custody.ts';
 export * from './dice-mirror.ts';
 export * from './policy-mirror.ts';
 export * from './table-mirror.ts';

@@ -22,6 +22,8 @@ import {
   Lobby,
   tableWitnesses,
   lobbyWitnesses,
+  unshieldedBalances,
+  type UnshieldedBalances,
   type TablePrivateState,
   type LobbyPrivateState,
 } from '@dust-dice/contract';
@@ -90,23 +92,39 @@ export type LedgerAt = { txHash: string };
  * transactions routinely share one -- a block-keyed read cannot say which it returned. The SDK
  * offers no transaction-hash offset, so that read goes straight to the indexer.
  */
-export async function readTableLedger(address: string, at?: LedgerAt): Promise<TableLedger> {
+export async function readContractState(address: string, at?: LedgerAt): Promise<ContractState> {
   if (at === undefined) {
     const pdp = indexerPublicDataProvider(NETWORK.indexer, NETWORK.indexerWS);
     const state = await pdp.queryContractState(address);
     if (!state) throw new Error(`no contract state at ${address}`);
-    return Table.ledger(state.data);
+    return state;
   }
   const hex = await contractStateHexAt(address, at.txHash);
   if (!hex) throw new Error(`no contract state at ${address} after tx ${at.txHash}`);
-  return Table.ledger(ContractState.deserialize(Buffer.from(hex.replace(/^0x/, ''), 'hex')).data);
+  return ContractState.deserialize(Buffer.from(hex.replace(/^0x/, ''), 'hex'));
+}
+
+export async function readTableLedger(address: string, at?: LedgerAt): Promise<TableLedger> {
+  return Table.ledger((await readContractState(address, at)).data);
 }
 
 export async function readLobbyLedger(address: string): Promise<LobbyLedger> {
-  const pdp = indexerPublicDataProvider(NETWORK.indexer, NETWORK.indexerWS);
-  const state = await pdp.queryContractState(address);
-  if (!state) throw new Error(`no contract state at ${address}`);
-  return Lobby.ledger(state.data);
+  return Lobby.ledger((await readContractState(address)).data);
+}
+
+/**
+ * What the LEDGER says the contract holds, for checking against the `pot` it claims.
+ *
+ * Read out of the contract's own state, NOT out of the indexer's
+ * `contractAction { unshieldedBalances }` -- that field answers `[]` on this indexer even for a
+ * table sitting on a pot, which reads as a solvency alarm instead of a balance. See
+ * `@dust-dice/contract`'s `custody.ts` and the test that pins it.
+ */
+export async function contractUnshieldedBalances(
+  address: string,
+  at?: LedgerAt,
+): Promise<UnshieldedBalances> {
+  return unshieldedBalances(await readContractState(address, at));
 }
 
 /** `Dice` as the plain five-element array everything else in this repo speaks. */
