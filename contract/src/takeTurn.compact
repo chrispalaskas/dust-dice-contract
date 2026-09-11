@@ -56,7 +56,7 @@
 // that route is priced -- it costs a second transaction per turn, which bugs-found.md §0 #21
 // says is the safe shape anyway.
 
-pragma language_version >= 0.26;
+pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 

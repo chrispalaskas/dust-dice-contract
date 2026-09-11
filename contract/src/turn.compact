@@ -47,7 +47,7 @@
 // chases whatever the first roll's modal face was, even if rolls 2 and 3 hand it a better
 // one.
 
-pragma language_version >= 0.26;
+pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 

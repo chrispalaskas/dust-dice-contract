@@ -162,11 +162,17 @@ export function assertFieldMapIsComplete(): void {
  * is sound rather than merely convenient.
  */
 function bodyOf(circuit: string): string | undefined {
-  const start = source.indexOf(`async _${circuit}_0(`);
-  if (start < 0) return undefined;
+  // Ledger 8 generates SYNCHRONOUS circuits, so there is no `async` keyword to anchor on — and
+  // that keyword was what separated a method DEFINITION from a `this._name_0(` call site. The
+  // lookbehind does that job now: without it the first hit is usually a call, and the body
+  // sliced from there is an unrelated fragment that silently reports the wrong ledger access.
+  const defRe = (name: string): RegExp => new RegExp(`(?<![.\\w])_${name}_0\\(`, 'g');
+  const first = defRe(circuit).exec(source);
+  if (first === null) return undefined;
+  const start = first.index;
   // Every generated implementation is a top-level method of the same class, so the next
-  // `async _<name>_0(` (or the end of the class) bounds this one.
-  const nextRe = /async _\w+_0\(/g;
+  // definition (or the end of the class) bounds this one.
+  const nextRe = defRe('\\w+');
   nextRe.lastIndex = start + 1;
   const next = nextRe.exec(source);
   return source.slice(start, next ? next.index : source.length);

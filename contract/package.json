@@ -6,11 +6,11 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "compact": "npm run compact:dice && npm run compact:turn && npm run compact:scoring && npm run compact:takeTurn && npm run compact:table && npm run compact:lobby",
-    "compact:dice": "compact compile src/dice.compact src/managed/dice",
-    "compact:turn": "compact compile src/turn.compact src/managed/turn",
-    "compact:scoring": "compact compile src/scoring.compact src/managed/scoring",
-    "compact:takeTurn": "compact compile src/takeTurn.compact src/managed/takeTurn",
-    "compact:fast": "compact compile --skip-zk src/dice.compact src/managed/dice && compact compile --skip-zk src/turn.compact src/managed/turn && compact compile --skip-zk src/scoring.compact src/managed/scoring && compact compile --skip-zk src/takeTurn.compact src/managed/takeTurn && COMPACT_PATH=$PWD/src compact compile --skip-zk src/table.compact src/managed/table && COMPACT_PATH=$PWD/src compact compile --skip-zk src/lobby.compact src/managed/lobby",
+    "compact:dice": "compact compile +0.31.1 src/dice.compact src/managed/dice",
+    "compact:turn": "compact compile +0.31.1 src/turn.compact src/managed/turn",
+    "compact:scoring": "compact compile +0.31.1 src/scoring.compact src/managed/scoring",
+    "compact:takeTurn": "compact compile +0.31.1 src/takeTurn.compact src/managed/takeTurn",
+    "compact:fast": "compact compile +0.31.1 --skip-zk src/dice.compact src/managed/dice && compact compile +0.31.1 --skip-zk src/turn.compact src/managed/turn && compact compile +0.31.1 --skip-zk src/scoring.compact src/managed/scoring && compact compile +0.31.1 --skip-zk src/takeTurn.compact src/managed/takeTurn && COMPACT_PATH=$PWD/src compact compile +0.31.1 --skip-zk src/table.compact src/managed/table && COMPACT_PATH=$PWD/src compact compile +0.31.1 --skip-zk src/lobby.compact src/managed/lobby",
     "//build:skip-zk": ".github/workflows/ci.yml calls `npm run build:skip-zk -w contract --if-present`, and until now no such script existed -- so `--if-present` silently skipped it, src/managed was never generated in CI, and `npm test` could not have been passing there. Aliased to compact:fast rather than renaming it, so the CI workflow needs no change.",
     "build:skip-zk": "npm run compact:fast",
     "format:compact": "compact format src/dice-core.compact src/dice.compact src/turn.compact src/scoring-core.compact src/scoring.compact src/takeTurn.compact src/policy-core.compact src/table.compact src/lobby.compact",
@@ -22,12 +22,12 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json && for m in dice turn scoring takeTurn table lobby; do mkdir -p dist/managed/$m && cp -R src/managed/$m/contract dist/managed/$m/contract; done && for m in table lobby; do for d in keys zkir compiler; do [ -d src/managed/$m/$d ] && cp -R src/managed/$m/$d dist/managed/$m/$d; done; done; true",
     "ci": "npm run compact && npm run typecheck && npm run build && npm run test",
     "//compact": "table.compact and lobby.compact `include \"policy-core\"`, so COMPACT_PATH must point at src/. The four measurement contracts do not need it (their includes resolve relative to the source), but setting it uniformly keeps the two halves of this list from diverging.",
-    "compact:table": "COMPACT_PATH=$PWD/src compact compile src/table.compact src/managed/table",
-    "compact:lobby": "COMPACT_PATH=$PWD/src compact compile src/lobby.compact src/managed/lobby",
-    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 9 && test -d dist/managed/lobby/keys && test -f dist/managed/table/compiler/contract-manifest.json && test -f dist/managed/lobby/compiler/contract-manifest.json || { echo 'refusing to publish: dist/managed lacks the proving keys or the compiler manifest \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
+    "compact:table": "COMPACT_PATH=$PWD/src compact compile +0.31.1 src/table.compact src/managed/table",
+    "compact:lobby": "COMPACT_PATH=$PWD/src compact compile +0.31.1 src/lobby.compact src/managed/lobby",
+    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 9 && test -d dist/managed/lobby/keys && test -f dist/managed/table/compiler/contract-info.json && test -f dist/managed/lobby/compiler/contract-info.json || { echo 'refusing to publish: dist/managed lacks the proving keys or the compiler info \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
   },
   "dependencies": {
-    "@midnight-ntwrk/compact-runtime": "0.19.0"
+    "@midnight-ntwrk/compact-runtime": "0.16.0"
   },
   "devDependencies": {
     "@types/node": "^26.4.0"
@@ -44,6 +44,7 @@
     "directory": "contract"
   },
   "license": "Apache-2.0",
-  "//build": "dist/managed carries compiled JS for all six modules but keys, ZKIR and the compiler manifest only for the two deployables (table, lobby): the four sub-modules' keys are measurement builds nobody deploys, and they would triple the tarball. The compiler/ manifest is REQUIRED: midnight-js's ZK config providers verify every key and ZKIR against it and refuse to read them without it (0.4.0 shipped without it and could not prove).",
+  "//build": "dist/managed carries compiled JS for all six modules but keys, ZKIR and the compiler output only for the two deployables (table, lobby): the four sub-modules' keys are measurement builds nobody deploys, and they would triple the tarball.",
+  "//ledger-8": "This branch targets ledger 8 (preprod). Toolchain 0.31.1 emits ONLY compiler/contract-info.json — contract-manifest.json is a 0.34.0-era artifact, so the publish guard checks contract-info.json instead. Do not 'restore' the manifest check here without also moving off +0.31.1.",
   "//prepublishOnly": "A skip-ZK compile (CI) builds a dist without keys; a tarball made from it would install but could never prove. The guard makes that a loud failure instead of a silently broken package."
 }

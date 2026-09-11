@@ -40,7 +40,7 @@
 // Every circuit is padded for the same admission-floor reason as `table.compact` -- these are
 // the smallest circuits in the project and would otherwise be rejected outright by the node.
 
-pragma language_version >= 0.26;
+pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 

@@ -106,19 +106,18 @@ export function diceToArray(d: DiceStruct): number[] {
 }
 
 /**
- * What a generated circuit resolves to, in the shape this simulator needs.
+ * What a generated circuit returns, in the shape this simulator needs.
  *
- * The updated ledger and private state live under `context.callContext`, not directly on
- * `context` -- a `CircuitContext` holds a `queryContexts` map keyed by contract address for
- * the whole call tree, and `callContext` is the currently executing contract's view of it.
+ * On ledger 8 the updated ledger and private state sit DIRECTLY on `context`. Ledger 9 moved
+ * them under `context.callContext`, because its `CircuitContext` holds a `queryContexts` map
+ * keyed by contract address for a whole call tree. Reading the wrong one of the two is silent:
+ * the state simply never advances, and every assertion fails somewhere far from the cause.
  */
 type CircuitResult<PS, R> = {
   result: R;
   context: {
-    callContext: {
-      currentQueryContext: { state: ChargedState };
-      currentPrivateState?: PS;
-    };
+    currentQueryContext: { state: ChargedState };
+    currentPrivateState?: PS;
   };
 };
 
@@ -130,7 +129,7 @@ type InitialState<PS> = {
 
 /** A generated contract class with a no-argument constructor. */
 type AnyContract<PS> = {
-  initialState(ctx: never): Promise<InitialState<PS>>;
+  initialState(ctx: never): InitialState<PS>;
 };
 
 class BaseSimulator<PS> {
@@ -150,9 +149,15 @@ class BaseSimulator<PS> {
     this.privateState = privateState;
   }
 
-  /** Adopt the result of a generated `initialState` call. */
-  async adopt(pending: Promise<InitialState<PS>>): Promise<void> {
-    const { currentContractState, currentPrivateState } = await pending;
+  /**
+   * Adopt the result of a generated `initialState` call.
+   *
+   * Ledger 8 generates SYNCHRONOUS circuits, so this takes a plain value rather than a promise.
+   * The method itself stays `async` so the two dozen `await sim.adopt(...)` call sites read the
+   * same on either ledger.
+   */
+  async adopt(initial: InitialState<PS>): Promise<void> {
+    const { currentContractState, currentPrivateState } = initial;
     this.state = currentContractState.data;
     this.privateState = currentPrivateState;
   }
@@ -161,29 +166,37 @@ class BaseSimulator<PS> {
     return createConstructorContext(this.privateState, COIN_PUBLIC_KEY) as never;
   }
 
-  context(circuitId: string) {
+  // Ledger 8's `createCircuitContext` takes (address, coinPublicKey, state, privateState,
+  // gasLimit?, costModel?, time?) — no leading circuit id, and one fewer optional slot than
+  // ledger 9. `blockTime` must stay the LAST argument or it silently becomes the cost model.
+  context() {
     return createCircuitContext<PS>(
-      circuitId,
       this.address,
       COIN_PUBLIC_KEY,
       this.state,
       this.privateState,
       undefined,
       undefined,
-      undefined,
       this.blockTime,
     );
   }
 
-  /** Run a generated circuit and commit its resulting ledger and private state. */
+  /**
+   * Run a generated circuit and commit its resulting ledger and private state.
+   *
+   * `circuitId` is no longer needed to build the context on ledger 8, but it stays in the
+   * signature: it names the circuit at all 24 call sites, which is the only place a reader can
+   * see which one is being exercised.
+   */
   async run<R>(
     circuitId: string,
-    call: (ctx: ReturnType<BaseSimulator<PS>['context']>) => Promise<CircuitResult<PS, R>>,
+    call: (ctx: ReturnType<BaseSimulator<PS>['context']>) => CircuitResult<PS, R>,
   ): Promise<R> {
-    const res = await call(this.context(circuitId));
-    this.state = res.context.callContext.currentQueryContext.state;
-    if (res.context.callContext.currentPrivateState !== undefined) {
-      this.privateState = res.context.callContext.currentPrivateState;
+    void circuitId;
+    const res = call(this.context());
+    this.state = res.context.currentQueryContext.state;
+    if (res.context.currentPrivateState !== undefined) {
+      this.privateState = res.context.currentPrivateState;
     }
     return res.result;
   }

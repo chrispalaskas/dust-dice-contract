@@ -23,7 +23,7 @@
 //                       This is the shape `Table.takeTurn`'s scoring path will have.
 //   settleTable      -- winner tie-break over 6 seats + the rake assertion. Once per game.
 
-pragma language_version >= 0.26;
+pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 

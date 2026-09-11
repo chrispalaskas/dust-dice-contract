@@ -17,7 +17,7 @@
 // The wrappers are also the cost-attribution ladder: `probeHashOnly` < `probeOneDie` <
 // `rollDice` isolates hash cost, per-die ladder cost, and the five-dice total.
 
-pragma language_version >= 0.26;
+pragma language_version >= 0.23;
 
 import CompactStandardLibrary;
 

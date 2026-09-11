@@ -22,16 +22,16 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@midnight-ntwrk/midnight-js-contracts": "5.0.0-beta.7",
-    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "5.0.0-beta.7",
-    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "5.0.0-beta.7",
-    "@midnight-ntwrk/midnight-js-network-id": "5.0.0-beta.7",
-    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "5.0.0-beta.7",
-    "@midnight-ntwrk/midnight-js-protocol": "5.0.0-beta.7",
-    "@midnight-ntwrk/midnight-js-types": "5.0.0-beta.7",
-    "@midnight-ntwrk/midnight-js-utils": "5.0.0-beta.7",
-    "@midnight-ntwrk/wallet-sdk": "2.0.0-beta.2",
-    "@midnight-ntwrk/wallet-sdk-dust-wallet": "5.0.0-beta.2",
+    "@midnight-ntwrk/midnight-js-contracts": "4.1.1",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-network-id": "4.1.1",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-protocol": "4.1.1",
+    "@midnight-ntwrk/midnight-js-types": "4.1.1",
+    "@midnight-ntwrk/midnight-js-utils": "4.1.1",
+    "@midnight-ntwrk/wallet-sdk": "1.1.0",
+    "@midnight-ntwrk/wallet-sdk-dust-wallet": "4.1.0",
     "rxjs": "^7.8.1"
   },
   "devDependencies": {
