@@ -77,8 +77,51 @@ function isUsableSync(state: FacadeState): boolean {
   );
 }
 
-export async function waitForUsableSync(ctx: WalletContext): Promise<FacadeState> {
-  return Rx.firstValueFrom(ctx.wallet.state().pipe(Rx.filter(isUsableSync)));
+/**
+ * One line of where each wallet's replay stands: `applied/highest` per wallet.
+ *
+ * The unshielded wallet counts transactions (`appliedId/highestTransactionId`), the dust and
+ * shielded ones count ledger events (`appliedIndex/highestIndex`); both pairs read the same way.
+ */
+function describeProgress(state: FacadeState): string {
+  const pair = (progress: object): string => {
+    const p = progress as Record<string, unknown>;
+    const applied = p.appliedIndex ?? p.appliedId;
+    const highest = p.highestIndex ?? p.highestTransactionId;
+    return `${String(applied)}/${String(highest)}${p.isConnected === false ? ' (disconnected)' : ''}`;
+  };
+  return (
+    `unshielded ${pair(state.unshielded.state.progress)} · ` +
+    `dust ${pair(state.dust.state.progress)} · ` +
+    `shielded ${pair(state.shielded.state.progress)}`
+  );
+}
+
+/**
+ * Resolves once the unshielded and dust wallets have replayed the chain to its tip.
+ *
+ * With `log`, reports progress every 30 s until then. A fresh wallet on preprod replays every
+ * event since genesis — well over an hour at 100% CPU — and without this the daemon's log shows
+ * its startup banner and then nothing, indistinguishable from a hang.
+ */
+export async function waitForUsableSync(
+  ctx: WalletContext,
+  log?: (msg: string) => void,
+): Promise<FacadeState> {
+  const states = ctx.wallet.state();
+  const progress = log
+    ? states
+        .pipe(
+          Rx.throttleTime(30_000),
+          Rx.takeWhile((s) => !isUsableSync(s)),
+        )
+        .subscribe((s) => log(`syncing: ${describeProgress(s)}`))
+    : undefined;
+  try {
+    return await Rx.firstValueFrom(states.pipe(Rx.filter(isUsableSync)));
+  } finally {
+    progress?.unsubscribe();
+  }
 }
 
 /**
@@ -260,7 +303,7 @@ export async function ensureDustRegistered(
   ctx: WalletContext,
   log: (msg: string) => void = () => {},
 ): Promise<void> {
-  const state = await waitForUsableSync(ctx);
+  const state = await waitForUsableSync(ctx, log);
 
   const unregistered = state.unshielded.availableCoins.filter(
     (c) => !c.meta.registeredForDustGeneration,
