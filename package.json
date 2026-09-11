@@ -2,7 +2,7 @@
   "name": "dust-dice-contract",
   "version": "0.4.4",
   "private": true,
-  "description": "Dust Dice \u2014 a Yahtzee-style dice game on Midnight: the Compact contracts, their TypeScript mirrors and witnesses, the independent game verifier, and the protocol documentation. Local devnet / testnet only.",
+  "description": "Dust Dice — a Yahtzee-style dice game on Midnight: the Compact contracts, their TypeScript mirrors and witnesses, the independent game verifier, and the protocol documentation. Local devnet / testnet only.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -14,7 +14,8 @@
     "verifier"
   ],
   "overrides": {
-    "@midnight-ntwrk/wallet-sdk-utilities": "1.2.1"
+    "@midnight-ntwrk/wallet-sdk-utilities": "1.2.1",
+    "@midnight-ntwrk/onchain-runtime-v3": "3.0.0"
   },
   "scripts": {
     "compact": "npm run compact -w contract",
