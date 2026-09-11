@@ -103,8 +103,38 @@ function signerFor(ctx: WalletContext): (data: Uint8Array) => ledger.Signature {
 const largestDustCoinFirst: DustCoins.CoinSelection = (coins) =>
   [...coins].sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : 0)).at(0);
 
+/**
+ * Refuses a node from another ledger generation before any wallet starts syncing against it.
+ *
+ * The wallet SDK's own failure mode is a 200-line Schema dump a minute into sync — "Could not
+ * deserialize Ledger Event", payload tagged `midnight:event[v14]` — which is exactly what a
+ * ledger-8 build produces when pointed at a ledger-9 devnet. Two devnets of different generations
+ * can sit on one machine (main's board holds the default ports), so this asks the node first.
+ * Ledger-8 nodes report `=8.1.x`; ledger-9 nodes report `... crate-ledger-9.1.0.0-rc.N ...`.
+ */
+export async function assertLedgerGeneration(network: NetworkConfig): Promise<void> {
+  const rpc = network.node.replace(/^ws/, 'http');
+  const res = await fetch(rpc, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'midnight_ledgerVersion', params: [] }),
+  });
+  const { result } = (await res.json()) as { result?: unknown };
+  if (typeof result !== 'string') {
+    throw new Error(`node at ${rpc} did not answer midnight_ledgerVersion (HTTP ${res.status})`);
+  }
+  if (!/(^=|ledger-)8\./.test(result)) {
+    throw new Error(
+      `node at ${rpc} speaks ledger "${result}" but this build speaks ledger 8 — wrong network or ` +
+        `ports? Set MIDNIGHT_NODE_URL / MIDNIGHT_INDEXER_URL / MIDNIGHT_INDEXER_WS_URL / ` +
+        `MIDNIGHT_PROOF_SERVER_URL to the ledger-8 stack (see docker-compose.beside-ledger9.yml).`,
+    );
+  }
+}
+
 export async function createWallet(network: NetworkConfig, seed: string): Promise<WalletContext> {
   setNetworkId(network.networkId);
+  await assertLedgerGeneration(network);
   const networkId = getNetworkId();
 
   const keys = deriveKeys(seed);
