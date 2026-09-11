@@ -60,8 +60,8 @@
     "dust-dice-verify": "dist/verify.js"
   },
   "peerDependencies": {
-    "@dust-dice/api": ">=0.4.0",
-    "@dust-dice/contract": ">=0.4.1"
+    "@dust-dice/api": "0.4.4",
+    "@dust-dice/contract": "0.4.4"
   },
   "//peerDependencies": "The verifier resolves the compiled contract artifacts from wherever @dust-dice/contract is installed next to it. As regular dependencies with exact pins, npm nested a second copy of the contract package under the verifier whenever the consumer's version differed \u2014 and that copy was the one its config found (dust-dice bug #33). Peers make the consumer's single copy the only one."
 }
