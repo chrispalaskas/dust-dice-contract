@@ -2,15 +2,19 @@ import { describe, expect, it } from 'vitest';
 
 import { Bech32Error, decodeBech32m, unshieldedAddressBytes } from './bech32.js';
 // The test — not the browser-safe module — may reach for Node-only plumbing: the whole point is
-// to check this decoder against the authoritative wallet-sdk one.
-import { createWallet, GENESIS_SEED, UNDEPLOYED, userAddressBytes } from './node/index.js';
+// to check this decoder against the authoritative wallet-sdk one. It derives the keys itself
+// rather than through `createWallet`, which contacts the node (its ledger-generation check) and
+// the indexer (wallet sync) — neither has any bearing on how an address is spelled.
+import { HDWallet, Roles, createKeystore } from '@midnight-ntwrk/wallet-sdk';
+import { GENESIS_SEED, userAddressBytes } from './node/index.js';
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString('hex');
 
 /**
  * Derives real addresses through the wallet SDK and checks the hand-rolled decoder against the
  * SDK's own. Deriving keys is local (no chain contact), so this needs no devnet — but it does
- * need the wallet SDK's WASM, hence the generous timeout.
+ * need the wallet SDK's WASM, hence the generous timeout. The derivation path (account 0, role
+ * NightExternal, index 0) is the one `createWallet` uses.
  */
 describe('unshieldedAddressBytes agrees with the wallet SDK', () => {
   const seeds = [
@@ -23,8 +27,16 @@ describe('unshieldedAddressBytes agrees with the wallet SDK', () => {
   it.each(seeds)(
     'seed %s',
     async (seed) => {
-      const ctx = await createWallet(UNDEPLOYED, seed);
-      const address = ctx.address;
+      const hd = HDWallet.fromSeed(Buffer.from(seed, 'hex'));
+      if (hd.type !== 'seedOk') throw new Error('invalid seed');
+      const derived = hd.hdWallet
+        .selectAccount(0)
+        .selectRoles([Roles.NightExternal])
+        .deriveKeysAt(0);
+      if (derived.type !== 'keysDerived') throw new Error('key derivation failed');
+      const address = createKeystore(derived.keys[Roles.NightExternal], 'undeployed')
+        .getBech32Address()
+        .toString();
 
       // The authoritative answer, via wallet-sdk's MidnightBech32m/UnshieldedAddress.
       const expected = userAddressBytes(address);
