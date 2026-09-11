@@ -24,7 +24,7 @@ uses the word only to describe the style of play.
 
 ```sh
 npm ci
-npm run compact          # compactc 0.34.0 — full keys; `npm run compact:fast -w contract` skips ZK
+npm run compact          # compactc 0.31.1 (ledger 8, pinned in the scripts) — full keys; `npm run compact:fast -w contract` skips ZK
 npm run typecheck && npm test
 ```
 
