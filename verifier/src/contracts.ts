@@ -14,6 +14,7 @@
  * combinator is `withWitnesses` (`withVacantWitnesses` is for contracts that declare none).
  */
 
+import { withIndexerRetry } from '@dust-dice/api';
 import { CompiledContract } from '@midnight-ntwrk/midnight-js-protocol/compact-js';
 import { ContractState } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
@@ -95,7 +96,10 @@ export type LedgerAt = { txHash: string };
 export async function readContractState(address: string, at?: LedgerAt): Promise<ContractState> {
   if (at === undefined) {
     const pdp = indexerPublicDataProvider(NETWORK.indexer, NETWORK.indexerWS);
-    const state = await pdp.queryContractState(address);
+    // The SDK's provider does not retry: a burst-throttled `403` from the public indexer
+    // surfaces as `ServerError: Response not successful` and, untreated, kills the daemon tick
+    // that asked. `contractStateHexAt` below goes through `gql`, which retries already.
+    const state = await withIndexerRetry(() => pdp.queryContractState(address));
     if (!state) throw new Error(`no contract state at ${address}`);
     return state;
   }

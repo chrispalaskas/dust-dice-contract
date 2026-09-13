@@ -26,6 +26,7 @@
  * Cardano bridge, not NIGHT), so per-address totals are derived from the UTXO sets above.
  */
 
+import { withIndexerRetry } from '@dust-dice/api';
 import { NATIVE_TOKEN_HEX } from '@dust-dice/contract';
 
 import { NETWORK } from './config.ts';
@@ -57,19 +58,27 @@ export interface ContractAction {
   blockTimestamp: number;
 }
 
+/**
+ * One GraphQL query, retried when the indexer refuses rather than answers.
+ *
+ * The public preprod indexer throttles bursts with a bare nginx `403 Forbidden` — see
+ * `@dust-dice/api`'s `indexer-retry.ts`. A GraphQL error is NOT retried: that is an answer.
+ */
 async function gql<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
-  const res = await fetch(NETWORK.indexer, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, variables }),
+  return withIndexerRetry(async () => {
+    const res = await fetch(NETWORK.indexer, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, variables }),
+    });
+    if (!res.ok) throw new Error(`indexer HTTP ${res.status}: ${await res.text()}`);
+    const body = (await res.json()) as { data?: T; errors?: { message: string }[] };
+    if (body.errors?.length) {
+      throw new Error(`indexer GraphQL: ${body.errors.map((e) => e.message).join('; ')}`);
+    }
+    if (!body.data) throw new Error('indexer returned no data');
+    return body.data;
   });
-  if (!res.ok) throw new Error(`indexer HTTP ${res.status}: ${await res.text()}`);
-  const body = (await res.json()) as { data?: T; errors?: { message: string }[] };
-  if (body.errors?.length) {
-    throw new Error(`indexer GraphQL: ${body.errors.map((e) => e.message).join('; ')}`);
-  }
-  if (!body.data) throw new Error('indexer returned no data');
-  return body.data;
 }
 
 /**
