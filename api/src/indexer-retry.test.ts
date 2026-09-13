@@ -86,14 +86,27 @@ describe('withIndexerRetry', () => {
   });
 
   it('retries a throttled read and returns the answer when it clears', async () => {
+    // One retry is all a quota refusal gets (see the rate-limit test below), so this clears on
+    // the second attempt — the brief case, where another client tripped a shared limit.
     let calls = 0;
     const result = await withIndexerRetry(async () => {
       calls += 1;
-      if (calls < 3) throw new Error('indexer HTTP 403: <html>403 Forbidden</html>');
+      if (calls < 2) throw new Error('indexer HTTP 403: <html>403 Forbidden</html>');
       return 'state';
     }, noJitter);
     expect(result).toBe('state');
-    expect(calls).toBe(3);
+    expect(calls).toBe(2);
+  });
+
+  it('retries a server fault the full number of times, since retrying does fix those', async () => {
+    let calls = 0;
+    const result = await withIndexerRetry(async () => {
+      calls += 1;
+      if (calls < 4) throw new Error('indexer HTTP 503: upstream unavailable');
+      return 'state';
+    }, noJitter);
+    expect(result).toBe('state');
+    expect(calls).toBe(4);
   });
 
   it('doubles the wait between attempts and caps it', async () => {
@@ -117,8 +130,33 @@ describe('withIndexerRetry', () => {
     expect(waits).toEqual([1_000, 2_000, 4_000, 4_000, 4_000]);
   });
 
+  it('stops after TWO tries when the failure is a rate limit — the retry is the load', async () => {
+    // The indexer blocks an IP for five minutes past 300 requests in five minutes, answering
+    // 403 throughout. Five attempts is five more requests inside the window that is counting
+    // them; the caller's own pacing has to take over instead.
+    const call = vi.fn(async () => {
+      throw apolloServerError(403);
+    });
+    await expect(withIndexerRetry(call, { ...noJitter, attempts: 5 })).rejects.toThrow('403');
+    expect(call).toHaveBeenCalledTimes(2);
+
+    const throttled = vi.fn(async () => {
+      throw apolloServerError(429);
+    });
+    await expect(withIndexerRetry(throttled, { ...noJitter, attempts: 5 })).rejects.toThrow('429');
+    expect(throttled).toHaveBeenCalledTimes(2);
+  });
+
+  it('still tries five times for a server fault, which retrying does fix', async () => {
+    const call = vi.fn(async () => {
+      throw apolloServerError(503);
+    });
+    await expect(withIndexerRetry(call, { ...noJitter, attempts: 5 })).rejects.toThrow('503');
+    expect(call).toHaveBeenCalledTimes(5);
+  });
+
   it('gives up after the last attempt and throws the indexer’s own error', async () => {
-    const err = apolloServerError(403);
+    const err = apolloServerError(503);
     const call = vi.fn(async () => {
       throw err;
     });
@@ -150,6 +188,6 @@ describe('withIndexerRetry', () => {
         onRetry: ({ attempt, of, delayMs }) => notices.push(`${attempt}/${of} in ${delayMs}ms`),
       },
     );
-    expect(notices).toEqual(['1/5 in 500ms']);
+    expect(notices).toEqual(['1/2 in 500ms']);
   });
 });

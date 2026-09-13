@@ -30,6 +30,9 @@ export interface IndexerRetryNotice {
   readonly error: unknown;
 }
 
+/** Total attempts when the failure is a quota refusal, however many `attempts` allows. */
+const RATE_LIMITED_ATTEMPTS = 2;
+
 export interface IndexerRetryOptions {
   /** Total attempts, including the first. Default 5 — about 15 s of waiting in all. */
   readonly attempts?: number;
@@ -45,6 +48,17 @@ export interface IndexerRetryOptions {
 }
 
 const RETRYABLE_STATUS = new Set([403, 408, 425, 429, 500, 502, 503, 504]);
+
+/**
+ * Statuses that mean "you are over a quota", where retrying is what caused the problem.
+ *
+ * The public indexer blocks an IP for a FIVE MINUTE window past 300 requests, answering 403
+ * throughout. Five attempts against that is five more requests inside the window that is
+ * counting them — the retry becomes the load. One more try covers the brief bursts (a shared
+ * limit another client tripped, clearing in seconds); beyond that the caller should slow down,
+ * which is what a poller's own backoff is for.
+ */
+const RATE_LIMITED_STATUS = new Set([403, 429]);
 
 /**
  * Network failures worth another go: the request never reached the indexer, so nothing it says
@@ -138,10 +152,17 @@ export async function withIndexerRetry<T>(
     try {
       return await call();
     } catch (err) {
-      if (attempt >= attempts || !isRetryableIndexerError(err)) throw err;
+      // A rate limit is not a hiccup: attempts against it are themselves the thing being
+      // counted, so this stops early and lets the caller's own pacing take over.
+      const status = statusOf(err);
+      const budget =
+        status !== undefined && RATE_LIMITED_STATUS.has(status)
+          ? Math.min(attempts, RATE_LIMITED_ATTEMPTS)
+          : attempts;
+      if (attempt >= budget || !isRetryableIndexerError(err)) throw err;
       const backoff = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
       const delayMs = Math.round(backoff * (1 + 0.25 * random()));
-      options.onRetry?.({ attempt, of: attempts, delayMs, error: err });
+      options.onRetry?.({ attempt, of: budget, delayMs, error: err });
       await sleep(delayMs);
     }
   }
