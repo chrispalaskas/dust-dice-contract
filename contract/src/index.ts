@@ -22,7 +22,9 @@
  * and `export *` from more than one collides on all of them.
  *
  * `custody.ts` is flat-exported for the same reason: reading what a contract HOLDS out of its
- * ledger state is one decode, needed by the driver, the verifier and the UI alike.
+ * ledger state is one decode, needed by the driver, the verifier and the UI alike. `rescue.ts`
+ * likewise answers "what does this stuck table need next?" from the ledger alone, so the page
+ * offering the button and the tests proving it agree by construction.
  *
  * The mirrors are flat-exported: together they ARE the settlement verifier -- the thing other
  * packages actually consume -- and their names are already specific. `dice-mirror` derives the
@@ -32,6 +34,7 @@
  */
 
 export * from './custody.ts';
+export * from './rescue.ts';
 export * from './dice-mirror.ts';
 export * from './policy-mirror.ts';
 export * from './table-mirror.ts';
