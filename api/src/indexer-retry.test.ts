@@ -29,6 +29,26 @@ describe('which indexer failures are worth retrying', () => {
     expect(isRetryableIndexerError(apolloServerError(429))).toBe(true);
   });
 
+  it('retries what a BROWSER says when a fetch never completes', () => {
+    // The gap this pins: the matcher listed Node's "fetch failed" but not the browser's
+    // wordings, so a lobby page that hit a blip showed the reader an error for a failure one
+    // retry would have cleared — "Could not read the lobby … Failed to fetch", fixed by reload.
+    const typeError = (message: string): Error =>
+      Object.assign(new TypeError(message), { name: 'TypeError' });
+    expect(isRetryableIndexerError(typeError('Failed to fetch'))).toBe(true); // Chrome
+    expect(
+      isRetryableIndexerError(typeError('NetworkError when attempting to fetch resource.')),
+    ).toBe(true); // Firefox
+    expect(isRetryableIndexerError(typeError('Load failed'))).toBe(true); // Safari
+    // And a request this code cut off itself, which exists precisely to be tried again.
+    expect(
+      isRetryableIndexerError(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+    ).toBe(true);
+    expect(isRetryableIndexerError(new Error('indexer request timed out after 12000 ms'))).toBe(
+      true,
+    );
+  });
+
   it('retries server faults and requests that never landed', () => {
     for (const status of [500, 502, 503, 504, 408]) {
       expect(isRetryableIndexerError(apolloServerError(status))).toBe(true);

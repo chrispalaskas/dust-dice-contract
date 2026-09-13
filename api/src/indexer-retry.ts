@@ -48,11 +48,20 @@ const RETRYABLE_STATUS = new Set([403, 408, 425, 429, 500, 502, 503, 504]);
 
 /**
  * Network failures worth another go: the request never reached the indexer, so nothing it says
- * can be trusted as an answer. Matched on message text because this crosses three HTTP clients
- * (fetch, Apollo, undici) that agree on nothing else.
+ * can be trusted as an answer. Matched on message text because this crosses four HTTP clients
+ * — browser fetch, undici, Apollo, and whatever the SDK wraps them in — that agree on nothing.
+ *
+ * THE BROWSER WORDINGS ARE NOT OPTIONAL. Chrome says "Failed to fetch", Firefox "NetworkError
+ * when attempting to fetch resource", Safari "Load failed"; Node says "fetch failed". Listing
+ * only the Node one — as this did until 2026-09-13 — means a lobby page that hits a blip shows
+ * the reader an error for a failure that a single retry would have cleared, which is exactly
+ * what happened: "Could not read the lobby … Failed to fetch", fixed by pressing reload.
+ *
+ * An aborted request counts too: `fetchWithTimeout` below cuts off a request that hangs, and the
+ * whole point of cutting it off is to try again.
  */
 const RETRYABLE_TEXT =
-  /\b(fetch failed|network error|socket hang up|connect timeout|request timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|UND_ERR)\b/i;
+  /(fetch failed|failed to fetch|networkerror|load failed|network error|socket hang up|connect timeout|request timed out|timeouterror|the operation was aborted|aborterror|signal is aborted|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|UND_ERR)/i;
 
 /** The HTTP status an error carries, wherever the client happened to put it. */
 function statusOf(err: unknown): number | undefined {
@@ -74,8 +83,36 @@ function statusOf(err: unknown): number | undefined {
 export function isRetryableIndexerError(err: unknown): boolean {
   const status = statusOf(err);
   if (status !== undefined) return RETRYABLE_STATUS.has(status);
+  // `TypeError` is what the browser throws when a fetch never completes — DNS, a dropped
+  // connection, a refused preflight. Its `name` is stable where its message is not.
+  const name = err instanceof Error ? err.name : '';
+  if (name === 'TypeError' || name === 'AbortError' || name === 'TimeoutError') return true;
   const message = err instanceof Error ? err.message : String(err);
   return RETRYABLE_TEXT.test(message);
+}
+
+/**
+ * `fetch` with a deadline, because nothing else bounds one.
+ *
+ * A request left to hang holds the page: the lobby showed "Failed to fetch" after more than
+ * thirty seconds of nothing, when failing at ten and retrying would have been invisible. The
+ * abort surfaces as a retryable error, so `withIndexerRetry` picks it up.
+ */
+export async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs = 12_000,
+): Promise<Response> {
+  const abort = new AbortController();
+  const timer = setTimeout(
+    () => abort.abort(new Error(`indexer request timed out after ${timeoutMs} ms`)),
+    timeoutMs,
+  );
+  try {
+    return await fetch(input, { ...init, signal: abort.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
