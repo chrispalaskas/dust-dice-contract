@@ -64,11 +64,28 @@ export interface ContractAction {
  * The public preprod indexer throttles bursts with a bare nginx `403 Forbidden` — see
  * `@dust-dice/api`'s `indexer-retry.ts`. A GraphQL error is NOT retried: that is an answer.
  */
+/**
+ * Extra headers for every indexer request, from the environment.
+ *
+ * The public indexer blocks an IP past 300 requests in 5 minutes. Shielded's WAF exempts a
+ * request carrying a shared token — `x-shielded-ratelimit-bypass`, documented in the SRE
+ * handbook's `docs/infrastructure/waf.md` — which is what an operator polling dozens of tables
+ * needs. The token is a CREDENTIAL: it lives in the operator's environment file, never in this
+ * repository, and never in anything served to a browser (the site is public static files, so
+ * shipping it there would publish it).
+ */
+const extraHeaders = (): Record<string, string> => {
+  const token = process.env.MIDNIGHT_INDEXER_BYPASS_TOKEN;
+  if (!token) return {};
+  const name = process.env.MIDNIGHT_INDEXER_BYPASS_HEADER ?? 'x-shielded-ratelimit-bypass';
+  return { [name]: token };
+};
+
 async function gql<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
   return withIndexerRetry(async () => {
     const res = await fetch(NETWORK.indexer, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...extraHeaders() },
       body: JSON.stringify({ query, variables }),
     });
     if (!res.ok) throw new Error(`indexer HTTP ${res.status}: ${await res.text()}`);
