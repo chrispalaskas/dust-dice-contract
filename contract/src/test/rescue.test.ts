@@ -87,6 +87,34 @@ describe('rescuing a stuck table: what to offer, and does the chain accept it', 
     assert.match(done.why, /finished/);
   });
 
+  it('an EMPTY table waiting to fill is not stuck — offer nothing', async () => {
+    // The bug this pins: the live site showed "This table is stuck … The contract is holding
+    // 0 NIGHT" on a private table its creator was about to join, and offered to abort it. The
+    // contract requires seatCount > 0 for that branch; without nobody seated there is nothing to
+    // refund and the call would be refused after the caller had paid a fee for it.
+    const g = await GameDriver.open({ seats: 2, fastMode: true }, { holds: alwaysStopEarly });
+    const led = g.ledger();
+    assert.equal(Number(led.seatCount), 0, 'nobody has joined yet');
+    const step = nextRescueStep(led, led.roundDeadline + 10_000n);
+    assert.equal(step.kind, 'none', step.why);
+    assert.match(step.why, /still filling/);
+  });
+
+  it('a filling table whose early-start wait has run STARTS, and says so', async () => {
+    // Same circuit, opposite meaning: offering "abort the table and release the stakes" here
+    // would start the game instead. The button has to say which.
+    const g = await GameDriver.open(
+      { seats: 6, fastMode: true, startAfterSecs: 60n },
+      { holds: alwaysStopEarly },
+    );
+    await g.join(0);
+    await g.join(1);
+    const led = g.ledger();
+    const step = nextRescueStep(led, led.fillOpenedAt + led.startAfterSecs + 1n);
+    assert.equal(step.kind, 'start', step.why);
+    assert.match(step.why, /starts the game/);
+  });
+
   it('a table that never filled: abort refunds in full', async () => {
     const g = await GameDriver.open({ seats: 2, fastMode: true }, { holds: alwaysStopEarly });
     await g.join(0);
