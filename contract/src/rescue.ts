@@ -35,7 +35,14 @@ export type RescueStep =
   /** `abortTable(q, rem, now)` — finish a table that cannot finish itself. */
   | { readonly kind: 'abort'; readonly why: string }
   /** `abortTable` again, but on a filling table this STARTS the game rather than ending it. */
-  | { readonly kind: 'start'; readonly why: string };
+  | { readonly kind: 'start'; readonly why: string }
+  /**
+   * `settle(seed, q, rem)` with any seed — past `roundDeadline + tableTimeoutSecs` the contract
+   * WAIVES the seed check, so an operator that vanished (or lost its seed file) cannot lock the
+   * stakes. This is the only exit from a completed game or a decided walkover: `playerMove`,
+   * `closeRound`, `eliminate` and `abortTable` all refuse those states.
+   */
+  | { readonly kind: 'settle'; readonly why: string };
 
 export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
   const phase = Number(led.phase);
@@ -86,11 +93,30 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
 
   if (phase !== PHASE.playing) return { kind: 'none', why: 'Nothing to do.' };
 
+  // The operator's own grace, after which the contract stops requiring its seed.
+  const graceExpired = past(led.roundDeadline + led.tableTimeoutSecs);
+
+  // A COMPLETED GAME is the one state with a single exit. `closeRound` has stamped the deadline
+  // one last time precisely so this waiver has a clock, and every other circuit refuses:
+  // openRound == 13 means no seat owes a move to eliminate and no roll is in flight to abort.
+  if (Number(led.openRound) >= ROUND_COUNT) {
+    return graceExpired
+      ? {
+          kind: 'settle',
+          why:
+            'All thirteen rounds are played and the operator has not settled within its grace. ' +
+            'Anyone can settle it now: the winner is already fixed by public state, so this pays ' +
+            'the winner and makes every other seat redeemable. The dice seed goes unrevealed, ' +
+            'which means the finished game cannot be re-verified afterwards.',
+        }
+      : {
+          kind: 'none',
+          why: 'The last round is closing; the table settles from here.',
+        };
+  }
+
   if (!past(led.roundDeadline))
     return { kind: 'none', why: 'The round deadline has not passed yet.' };
-  if (Number(led.openRound) >= ROUND_COUNT) {
-    return { kind: 'none', why: 'The last round is closing; the table settles from here.' };
-  }
 
   // A seat still in the game that has not played the open round is what stops the table. The
   // stage parity is the contract's rule about WHOSE silence it is: an odd stage means the seat
@@ -110,13 +136,49 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
     };
   }
 
+  // A DECIDED WALKOVER: one seat left, so the winner cannot change however long the table sits,
+  // and `settle` says so itself ("eleven more solo rounds would change nothing but the calendar").
+  // This is checked AFTER the elimination pass on purpose — if the sole survivor is the one
+  // letting the deadline pass, knocking it out instead reaches `abandoned`, where every penalty
+  // is refunded, rather than handing the pot to the seat that stopped playing.
+  if (led.activeSeats === 1n) {
+    return graceExpired
+      ? {
+          kind: 'settle',
+          why:
+            'Only one seat is still in, so the game is already decided, and the operator has not ' +
+            'settled within its grace. Anyone can settle it now: the survivor is paid and every ' +
+            'eliminated seat becomes redeemable.',
+        }
+      : {
+          kind: 'none',
+          why: 'One seat is left, so this table settles as a walkover; the operator has not run out of time yet.',
+        };
+  }
+
   // Nobody owes a move that can be enforced, so what is missing is the operator's own half of a
-  // turn. That is `abortTable`'s operatorStalled branch, gated on a longer grace of its own.
-  return past(led.roundDeadline + led.tableTimeoutSecs)
+  // turn. That is `abortTable`'s operatorStalled branch — and it is gated on a seat actually
+  // SITTING at one of the operator's odd stages (`awaitingOperatorAt`), not merely on the
+  // deadline having passed. Offering abort without that check proposed a call the contract
+  // refuses, which is the one thing this module exists to avoid.
+  const waitingOnOperator = (): boolean => {
+    for (let seat = 0; seat < Number(led.seatCount); seat++) {
+      if (Number(led.seatTurn.lookup(BigInt(seat)).stage) % 2 !== 0) return true;
+    }
+    return false;
+  };
+
+  if (!waitingOnOperator()) {
+    return {
+      kind: 'none',
+      why: 'The round deadline has passed but no seat owes a move and none is mid-roll; the table is between rounds and the operator closes it.',
+    };
+  }
+  return graceExpired
     ? {
         kind: 'abort',
         why:
-          'Every remaining seat is waiting on the operator and the operator grace has passed. ' +
+          'A seat is waiting on the operator mid-roll and the operator grace has passed. ' +
           'Aborting returns the stakes.',
       }
     : {

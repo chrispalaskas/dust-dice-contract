@@ -18,7 +18,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { nextRescueStep } from '../rescue.ts';
-import { GameDriver, PHASE, alwaysStopEarly, penaltySplit } from './table-harness.ts';
+import { GameDriver, PHASE, alwaysStopEarly, bytes32, penaltySplit } from './table-harness.ts';
 
 /** Open a table and seat everyone, the way table.test.ts does. */
 const seated = async (seats: number, fastMode = true): Promise<GameDriver> => {
@@ -113,6 +113,65 @@ describe('rescuing a stuck table: what to offer, and does the chain accept it', 
     const step = nextRescueStep(led, led.fillOpenedAt + led.startAfterSecs + 1n);
     assert.equal(step.kind, 'start', step.why);
     assert.match(step.why, /starts the game/);
+  });
+
+  it('a decided walkover: SETTLE, because abortTable is refused here', async () => {
+    // The live shape this pins (table 3076b6fa, 2026-09-14): seat 1 eliminated, seat 2 finished
+    // the open round, so `activeSeats == 1` and the game is already decided — nobody owes a move
+    // and nobody is mid-roll. The advice used to be "abort the table", and the contract REFUSES
+    // that: `operatorStalled` needs a seat sitting at one of the operator's odd stages, which is
+    // exactly what this state does not have. The player would have paid a fee to be told no.
+    const g = await seated(2);
+    await g.playTurn(1, 0); // seat 2 finishes the round
+    await g.eliminate(0, 0); // seat 1 misses it — one active seat left
+    const led = g.ledger();
+    assert.equal(Number(led.activeSeats), 1);
+    assert.equal(Number(led.phase), PHASE.playing);
+
+    // Before the operator's grace runs out, offer nothing: settling is its job first.
+    const waiting = nextRescueStep(led, led.roundDeadline + 1n);
+    assert.equal(waiting.kind, 'none', waiting.why);
+    assert.match(waiting.why, /walkover/);
+
+    const past = led.roundDeadline + led.tableTimeoutSecs + 1n;
+    const step = nextRescueStep(g.ledger(), past);
+    assert.equal(step.kind, 'settle', step.why);
+
+    // The call the OLD advice proposed, proven refused — this is why the branch exists.
+    const [aq, arem] = g.abortRake();
+    await assert.rejects(
+      () => g.sim.abortTable(aq, arem, Number(past)),
+      /neither stalled past its deadline nor abandoned/,
+    );
+
+    // And the one it proposes now, proven accepted — with a seed that opens nothing, which is
+    // the whole point: an operator that lost its seed file cannot lock the stakes.
+    const [q, r] = g.rakeSplit();
+    const winner = await g.sim.settle(bytes32(0x99), q, r, Number(past));
+    assert.equal(Number(winner), 1, 'the survivor takes the pot');
+    assert.equal(Number(g.ledger().phase), PHASE.settled);
+    assert.equal(g.ledger().seatRedeemable.lookup(0n) > 0n, true, 'seat 1 can now redeem');
+  });
+
+  it('a completed game the operator never settled: SETTLE once its grace has passed', async () => {
+    const g = await seated(2);
+    await g.playToEnd();
+    const led = g.ledger();
+    assert.equal(Number(led.openRound), 13);
+
+    // `playerMove`, `closeRound`, `eliminate` and `abortTable` all refuse this state, so silence
+    // here is the one place a vanished operator could have locked the stakes permanently.
+    const early = nextRescueStep(led, led.roundDeadline + 1n);
+    assert.equal(early.kind, 'none', early.why);
+
+    const past = led.roundDeadline + led.tableTimeoutSecs + 1n;
+    const step = nextRescueStep(led, past);
+    assert.equal(step.kind, 'settle', step.why);
+    assert.match(step.why, /cannot be re-verified/);
+
+    const [q, r] = g.rakeSplit();
+    await g.sim.settle(bytes32(0x99), q, r, Number(past));
+    assert.equal(Number(g.ledger().phase), PHASE.settled);
   });
 
   it('a table that never filled: abort refunds in full', async () => {
