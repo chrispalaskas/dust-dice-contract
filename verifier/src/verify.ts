@@ -554,7 +554,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
       const extras = g.entryPoints.filter((k) => !TURN_CALLS.has(k));
       if (turnCalls.length > 1 && extras.length > 0 && extras.every((k) => k === 'closeRound')) {
         verifyMergedTurn({ ...g, entryPoints: turnCalls });
-        for (const _ of extras) verifyCloseRound(g);
+        for (let k = 0; k < extras.length; k++) verifyCloseRound(g);
         continue;
       }
     }
