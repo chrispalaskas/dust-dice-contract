@@ -379,6 +379,40 @@ async function verify(address: string, verbose: boolean): Promise<number> {
    * Reading only this seat's fields is what makes it sound when two seats settle in the same
    * block: their turns touch disjoint cells, and the digest this replay folds is its own.
    */
+  /**
+   * One round closing. Also reached for a close FOLDED into the last seat's settlement (below),
+   * which is why it is a function: the check is identical, and it reads the state AFTER the
+   * transaction either way — `closeRound` only reads `seatProgress` and writes the digest, the
+   * round and the deadline, so the per-seat cells it folded are the same before and after it.
+   */
+  const verifyCloseRound = (g: LogGroup): void => {
+    const led = g.led;
+    // The round is the replay's own count of closes, so a close that landed without effect
+    // cannot shift the chain.
+    const round = closes;
+    if (Number(led.openRound) !== round + 1) {
+      console.log(
+        `  (a closeRound in block ${g.blockHeight} left openRound at ${led.openRound} -- ` +
+          'it landed on chain without effect; nothing to replay)',
+      );
+      return;
+    }
+    // The ONE place the digest advances. All six slots, in SEAT ORDER, read at this block --
+    // which is what makes the replay independent of the order the chain saw the moves in.
+    digest = roundDigestTs(digest, round, seatCount, roundResults(led));
+    closes += 1;
+    c.ok(
+      `round ${round}: digest chain`,
+      same(led.roundDigest, digest),
+      `chain ${hex(led.roundDigest)} vs replay ${hex(digest)}`,
+    );
+    c.ok(
+      `round ${round}: openRound advanced`,
+      Number(led.openRound) === round + 1,
+      `chain ${led.openRound}`,
+    );
+  };
+
   const verifyMergedTurn = (g: LogGroup): void => {
     const led = g.led;
     const moves = g.entryPoints.filter((k) => k === 'playerMove').length;
@@ -510,6 +544,19 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     if (isTurn && g.entryPoints.length > 1) {
       verifyMergedTurn(g);
       continue;
+    }
+    // A merged turn that also CLOSED THE ROUND: the operator folds `closeRound` into the last
+    // seat's settlement so the round ends in the block the score lands in. The turn is checked
+    // as any merged turn -- it reads the seat's own cells and the replay's frozen digest, neither
+    // of which the close touches -- and then the close is checked against the same after-state.
+    {
+      const turnCalls = g.entryPoints.filter((k) => TURN_CALLS.has(k));
+      const extras = g.entryPoints.filter((k) => !TURN_CALLS.has(k));
+      if (turnCalls.length > 1 && extras.length > 0 && extras.every((k) => k === 'closeRound')) {
+        verifyMergedTurn({ ...g, entryPoints: turnCalls });
+        for (const _ of extras) verifyCloseRound(g);
+        continue;
+      }
     }
     // A SINGLE turn call sharing its block with another transaction. The per-call replay below
     // needs the state before the call, and in a shared block the previous group's state is the
@@ -731,32 +778,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
       }
 
       case 'closeRound': {
-        // The round is the replay's own count of closes, so a close that landed without effect
-        // cannot shift the chain. `roundResults` is read AFTER the close, which is equivalent:
-        // `closeRound` only reads `seatProgress` (it writes the digest, the round and the
-        // deadline), so the per-seat cells it folded are unchanged by it.
-        const round = closes;
-        if (Number(led.openRound) !== round + 1) {
-          console.log(
-            `  (a closeRound in block ${g.blockHeight} left openRound at ${led.openRound} -- ` +
-              'it landed on chain without effect; nothing to replay)',
-          );
-          break;
-        }
-        // The ONE place the digest advances. All six slots, in SEAT ORDER, read at this block --
-        // which is what makes the replay independent of the order the chain saw the moves in.
-        digest = roundDigestTs(digest, round, seatCount, roundResults(led));
-        closes += 1;
-        c.ok(
-          `round ${round}: digest chain`,
-          same(led.roundDigest, digest),
-          `chain ${hex(led.roundDigest)} vs replay ${hex(digest)}`,
-        );
-        c.ok(
-          `round ${round}: openRound advanced`,
-          Number(led.openRound) === round + 1,
-          `chain ${led.openRound}`,
-        );
+        verifyCloseRound(g);
         break;
       }
 
