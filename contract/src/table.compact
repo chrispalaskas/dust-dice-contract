@@ -1359,6 +1359,24 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   const commit = disclose(entropyKeyCommitment(tableId, playerEntropySecret()));
   assert(!joinedKeys.member(commit), "join: this entropy key already holds a seat");
 
+  // ONE SEAT PER PAYOUT ADDRESS, which is a different rule from the one above and catches a
+  // case it cannot. The entropy key binds the wallet AND the site origin it was derived at, so
+  // the same person on two origins -- two browsers, a laptop and a phone -- produces two
+  // unrelated commitments and sits down twice at the same table. That happened in testing and
+  // read as a bug in the game rather than a property of the key.
+  //
+  // WHAT THIS IS NOT: sybil resistance. A player with two addresses takes two seats and nothing
+  // here can tell. It makes the ACCIDENT impossible and the deliberate version deliberate,
+  // which is all a rule at this layer can honestly claim.
+  assert(!(addressHolds(0, who) ||
+           addressHolds(1, who) ||
+           addressHolds(2, who) ||
+           addressHolds(3, who) ||
+           addressHolds(4, who) ||
+           addressHolds(5, who)),
+         "join: this payout address already holds a seat at this table"
+         );
+
   // A private table admits only a joiner who knows the invite code. The comparison result is
   // the only thing disclosed -- a boolean -- so a wrong guess reveals nothing about the code.
   const code = inviteCode();
@@ -2431,6 +2449,19 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
 /** Is this slot's next move the operator's -- i.e. is a roll outstanding? */
 circuit awaitingOperatorAt(s: Uint<8>): Boolean {
   return s < seatCount && !playerOwes(seatTurn.lookup(s).stage);
+}
+
+/**
+ * Does slot `s` already pay out to `who`?
+ *
+ * Bounded by `seatCount` first, like `awaitingOperatorAt`, so the lookups are only made for
+ * slots that exist. An eliminated slot does not count: a player who left before the start took
+ * their stake back, and refusing them a rejoin would punish the one exit the table encourages.
+ */
+circuit addressHolds(s: Uint<8>, who: UserAddress): Boolean {
+  return s < seatCount &&
+         !seatProgress.lookup(s).eliminated &&
+         seatIdentity.lookup(s).addr == who;
 }
 
 /** Does this slot take a share in an abort: a seated player, or one eliminated during play? */

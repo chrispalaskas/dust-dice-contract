@@ -2194,6 +2194,58 @@ describe('settlement guards', () => {
     await TableSimulator.create({ ...base, tier: max });
   });
 
+  it('refuses a SECOND seat paying the same address, and says which rule bit', async () => {
+    // The entropy-key rule above cannot catch this. That key binds the wallet AND the site
+    // origin it was derived at, so one person in two browsers — or a laptop and a phone —
+    // produces two unrelated commitments and sits down twice. Observed in testing on preprod,
+    // where it read as a bug in the game rather than a property of the key.
+    const g = await GameDriver.open({ seats: 2 });
+    const [a, b] = [g.players[0]!, g.players[1]!];
+
+    g.sim.asPlayer(a.sk);
+    assert.equal(await g.sim.join(a.addr, g.tick()), 0n);
+
+    g.sim.asPlayer(b.sk); // a different secret: the entropy-key rule is satisfied
+    await assert.rejects(
+      () => g.sim.join(a.addr, g.tick()), // the same payout address
+      /this payout address already holds a seat/,
+    );
+
+    // And the rule is about the ADDRESS, not the person: b's own address is fine.
+    assert.equal(await g.sim.join(b.addr, g.tick()), 1n);
+  });
+
+  it('frees a payout address when the seat holding it leaves before the start', async () => {
+    // The carve-out: `addressHolds` skips eliminated slots, so a pre-start leaver's address is
+    // not locked to a table it walked away from.
+    //
+    // Note what this does NOT allow, because it surprised me: the SAME player cannot rejoin.
+    // `joinedKeys` keeps every entropy-key commitment for the life of the table, so one key gets
+    // one seat ever, leaving or not. The address rule therefore only ever matters for a
+    // DIFFERENT key paying the same address — the same person on another origin, or somebody
+    // paying winnings to an address a departed seat used.
+    const g = await GameDriver.open({ seats: 2 });
+    const [a, b] = [g.players[0]!, g.players[1]!];
+
+    g.sim.asPlayer(a.sk);
+    await g.sim.join(a.addr, g.tick());
+
+    g.sim.asPlayer(a.sk);
+    await g.sim.resign(0, 0n, 0n, g.tick());
+    assert.equal(g.ledger().seatProgress.lookup(0n).eliminated, true);
+
+    // A different key, the departed seat's address: allowed, because that seat is out.
+    g.sim.asPlayer(b.sk);
+    assert.equal(await g.sim.join(a.addr, g.tick()), 1n, 'the freed address takes a new slot');
+
+    // And the same key is still refused, by the rule that was already there.
+    g.sim.asPlayer(a.sk);
+    await assert.rejects(
+      () => g.sim.join(a.addr, g.tick()),
+      /this entropy key already holds a seat/,
+    );
+  });
+
   it('refuses a join that would record the zero payout address', async () => {
     const g = await GameDriver.open({ seats: 2 });
     g.sim.asPlayer(g.players[0]!.sk);
