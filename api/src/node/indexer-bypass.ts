@@ -27,6 +27,54 @@
 /** Set once, so repeated calls (a restart in-process, a second wallet) do not re-wrap. */
 let installed = false;
 
+/**
+ * When each indexer request was made, newest last, trimmed to the window below.
+ *
+ * COUNTED BECAUSE THE LIMIT IS COUNTED. The cap is 300 requests in 5 minutes per IP, and every
+ * estimate of how close we run to it — including the ones in this repository's commit messages —
+ * was arithmetic over the polling intervals, never a measurement. Arithmetic missed that the
+ * daemon read every table twice a tick, and missed a per-tick lobby read that was two thirds of
+ * the total. A number the process actually observed does not miss those.
+ */
+const requestTimes: number[] = [];
+const WINDOW_MS = 5 * 60 * 1000;
+
+function record(): void {
+  const now = Date.now();
+  requestTimes.push(now);
+  // Trim from the front; the array is at most a few hundred entries by construction.
+  while (requestTimes.length > 0 && now - requestTimes[0]! > WINDOW_MS) requestTimes.shift();
+}
+
+export interface IndexerRequestStats {
+  /** Requests in the last 60 seconds. */
+  readonly lastMinute: number;
+  /** Requests in the last 5 minutes — the window the WAF actually counts. */
+  readonly lastFiveMinutes: number;
+  /** What the public indexer allows per IP in that window. */
+  readonly capPerFiveMinutes: number;
+  /** Whether this process is exempt from that cap. */
+  readonly exempt: boolean;
+}
+
+let exemptNow = false;
+
+/** What this process has asked the indexer for, lately. */
+export function indexerRequestStats(): IndexerRequestStats {
+  const now = Date.now();
+  let lastMinute = 0;
+  for (let i = requestTimes.length - 1; i >= 0; i--) {
+    if (now - requestTimes[i]! > 60_000) break;
+    lastMinute += 1;
+  }
+  return {
+    lastMinute,
+    lastFiveMinutes: requestTimes.length,
+    capPerFiveMinutes: 300,
+    exempt: exemptNow,
+  };
+}
+
 export interface IndexerBypass {
   readonly enabled: boolean;
   readonly header?: string;
@@ -41,8 +89,8 @@ export interface IndexerBypass {
  */
 export function installIndexerBypass(indexerUrl: string): IndexerBypass {
   const token = process.env.MIDNIGHT_INDEXER_BYPASS_TOKEN;
-  if (!token) return { enabled: false };
   const header = process.env.MIDNIGHT_INDEXER_BYPASS_HEADER ?? 'x-shielded-ratelimit-bypass';
+  exemptNow = token !== undefined && token !== '';
 
   let origin: string;
   try {
@@ -50,7 +98,7 @@ export function installIndexerBypass(indexerUrl: string): IndexerBypass {
   } catch {
     return { enabled: false };
   }
-  if (installed) return { enabled: true, header, origin };
+  if (installed) return token ? { enabled: true, header, origin } : { enabled: false };
 
   const original = globalThis.fetch;
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -67,6 +115,9 @@ export function installIndexerBypass(indexerUrl: string): IndexerBypass {
       matches = false;
     }
     if (!matches) return original(input, init);
+    record();
+    // No token: the wrapper is here only to count, so pass the request through untouched.
+    if (!token) return original(input, init);
     // Headers may arrive as a Headers, an array of pairs, or a plain object; `new Headers`
     // normalises all three, and setting after copying means a caller's own value wins only if
     // it set this same header deliberately.
@@ -75,5 +126,5 @@ export function installIndexerBypass(indexerUrl: string): IndexerBypass {
     return original(input, { ...init, headers });
   };
   installed = true;
-  return { enabled: true, header, origin };
+  return token ? { enabled: true, header, origin } : { enabled: false };
 }
