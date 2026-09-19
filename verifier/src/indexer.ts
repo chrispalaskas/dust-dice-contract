@@ -172,85 +172,20 @@ export const allowanceMs = (bytes: number): number => Math.max(15.0, 0.002 * byt
 export const ADMISSION_FLOOR_BYTES = 7984;
 
 /**
- * One graphql-transport-ws subscription, collected until `done` accepts a row (that row included)
- * or `max` rows have arrived.
- *
- * A raw WebSocket on purpose: the protocol is four message types -- init, ack, subscribe, next --
- * and a client library would be a second copy of what the SDK already bundles. Node's global
- * WebSocket (22+, this package's floor) is all it needs.
- */
-function subscribeUntil<T>(
-  query: string,
-  variables: Record<string, unknown>,
-  field: string,
-  done: (row: T) => boolean,
-  max: number,
-  timeoutMs = 60_000,
-): Promise<T[]> {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(NETWORK.indexerWS, 'graphql-transport-ws');
-    const rows: T[] = [];
-    let settled = false;
-    const finish = (err?: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      ws.close();
-      if (err) reject(err);
-      else resolve(rows);
-    };
-    const timer = setTimeout(
-      () => finish(new Error(`indexer subscription ${field}: still open after ${timeoutMs} ms`)),
-      timeoutMs,
-    );
-    ws.onopen = () => ws.send(JSON.stringify({ type: 'connection_init' }));
-    ws.onerror = () => finish(new Error(`indexer subscription ${field}: websocket error`));
-    ws.onclose = () =>
-      finish(new Error(`indexer subscription ${field}: closed after ${rows.length} rows`));
-    ws.onmessage = (ev) => {
-      const m = JSON.parse(String(ev.data)) as { type: string; payload?: unknown };
-      if (m.type === 'connection_ack') {
-        ws.send(JSON.stringify({ id: '1', type: 'subscribe', payload: { query, variables } }));
-      } else if (m.type === 'next') {
-        const p = m.payload as { data?: Record<string, T>; errors?: { message: string }[] };
-        if (p.errors?.length) {
-          finish(new Error(`indexer GraphQL: ${p.errors.map((e) => e.message).join('; ')}`));
-          return;
-        }
-        const row = p.data?.[field];
-        if (row === undefined) return;
-        rows.push(row);
-        if (done(row) || rows.length >= max) finish();
-      } else if (m.type === 'error') {
-        finish(
-          new Error(`indexer subscription ${field}: ${JSON.stringify(m.payload).slice(0, 300)}`),
-        );
-      } else if (m.type === 'complete') {
-        finish();
-      }
-    };
-  });
-}
-
-const sameAddress = (a: string, b: string): boolean =>
-  a.replace(/^0x/, '').toLowerCase() === b.replace(/^0x/, '').toLowerCase();
-
-/**
  * A contract's whole public history, oldest first.
  *
- * This is the ONLY thing `verify.ts` is given beyond the table's address: every join, every
- * turn and the settlement are recovered from these actions and the contract states they point
- * at.
+ * This is the ONLY thing the verify panel is given beyond the table's address: every join,
+ * every turn and the settlement are recovered from these actions and the contract states they
+ * point at.
  *
- * The indexer this build talks to (4.3.x, the preprod line) has no query that LISTS a contract's
- * actions -- the ledger-9 `contract(address){ actions }` is gone. It has the `contractActions`
- * SUBSCRIPTION, which replays every action from a block offset and then stays open for new ones;
- * it is what midnight-js's own provider uses. The stream has no "caught up" marker of its own,
- * so the latest action is fetched first over plain HTTP and its transaction ends the collection
- * -- after as many rows as that transaction has actions on this contract, because a fast turn is
- * one transaction carrying up to seven calls and stopping at the first would drop the rest. The
- * deploy block comes from the same query (`ContractCall.deploy`), so nothing from before the
- * contract existed is streamed.
+ * One query, not the `contractActions` SUBSCRIPTION. Indexer 4.3 (the ledger-8 preprod line)
+ * dropped `contract(address) { actions }` and left only the subscription, which replays from a
+ * block offset and then stays open with no "caught up" marker -- so reading a finite history
+ * through it meant fetching the newest action first and counting rows until that transaction
+ * came back. Indexer 4.4 has the query again, and it answers the exact question being asked.
+ *
+ * The indexer returns them newest-first, so they are reversed here: everything downstream --
+ * the verify panel especially -- reads this as a timeline.
  */
 export async function contractActions(address: string, limit = 1000): Promise<ContractAction[]> {
   type Row = {
@@ -258,53 +193,29 @@ export async function contractActions(address: string, limit = 1000): Promise<Co
     entryPoint?: string;
     transaction: { hash: string; block: { height: number; timestamp: string | number } };
   };
-  const head = await gql<{
-    contractAction: (Row & { deploy?: { transaction: { block: { height: number } } } }) | null;
-  }>(
-    `query ($address: HexEncoded!) {
-       contractAction(address: $address) {
-         __typename
-         transaction { hash block { height timestamp } }
-         ... on ContractCall { deploy { transaction { block { height } } } }
+  const data = await gql<{ contract: { actions: Row[] } | null }>(
+    `query ($address: HexEncoded!, $limit: Int!) {
+       contract(address: $address) {
+         actions(limit: $limit) {
+           __typename
+           ... on ContractCall { entryPoint transaction { hash block { height timestamp } } }
+           ... on ContractDeploy { transaction { hash block { height timestamp } } }
+           ... on ContractUpdate { transaction { hash block { height timestamp } } }
+         }
        }
      }`,
-    { address },
+    { address, limit },
   );
-  if (!head.contractAction) throw new Error(`no contract at ${address}`);
-  const latest = head.contractAction;
-  const fromHeight = latest.deploy?.transaction.block.height ?? latest.transaction.block.height;
-
-  const lastTx = await gql<{ transactions: { contractActions: { address: string }[] }[] }>(
-    `query ($hash: HexEncoded!) {
-       transactions(offset: { hash: $hash }) { contractActions { address } }
-     }`,
-    { hash: latest.transaction.hash },
-  );
-  const lastTxActions = (lastTx.transactions[0]?.contractActions ?? []).filter((a) =>
-    sameAddress(a.address, address),
-  ).length;
-
-  let seenOfLast = 0;
-  const rows = await subscribeUntil<Row>(
-    `subscription ($address: HexEncoded!, $offset: BlockOffset) {
-       contractActions(address: $address, offset: $offset) {
-         __typename
-         ... on ContractCall { entryPoint }
-         transaction { hash block { height timestamp } }
-       }
-     }`,
-    { address, offset: { height: fromHeight } },
-    'contractActions',
-    (row) => row.transaction.hash === latest.transaction.hash && ++seenOfLast >= lastTxActions,
-    limit,
-  );
-  return rows.map((a) => ({
-    kind: a.__typename,
-    entryPoint: a.entryPoint,
-    txHash: a.transaction.hash,
-    blockHeight: a.transaction.block.height,
-    blockTimestamp: Number(a.transaction.block.timestamp),
-  }));
+  if (!data.contract) throw new Error(`no contract at ${address}`);
+  return data.contract.actions
+    .map((a) => ({
+      kind: a.__typename,
+      entryPoint: a.entryPoint,
+      txHash: a.transaction.hash,
+      blockHeight: a.transaction.block.height,
+      blockTimestamp: Number(a.transaction.block.timestamp),
+    }))
+    .reverse();
 }
 
 /** The state a specific transaction left the contract in, as the indexer's hex; null if none. */

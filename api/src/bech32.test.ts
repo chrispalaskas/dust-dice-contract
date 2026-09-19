@@ -34,7 +34,10 @@ describe('unshieldedAddressBytes agrees with the wallet SDK', () => {
         .selectRoles([Roles.NightExternal])
         .deriveKeysAt(0);
       if (derived.type !== 'keysDerived') throw new Error('key derivation failed');
-      const address = createKeystore(derived.keys[Roles.NightExternal], 'undeployed')
+      const address = createKeystore(
+        { kind: 'schnorr', secret: derived.keys[Roles.NightExternal] },
+        'undeployed',
+      )
         .getBech32Address()
         .toString();
 

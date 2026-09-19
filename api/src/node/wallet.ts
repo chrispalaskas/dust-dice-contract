@@ -126,11 +126,12 @@ export async function waitForUsableSync(
 }
 
 /**
- * wallet-sdk 1.x signs synchronously, `(data) => Signature`. Wrapped in an arrow so the keystore
- * keeps `this`; the unbound method reference the 2.x code passed is not safe to assume here.
+ * wallet-sdk 2.x's `SignSegment` is async, so out-of-process backends (MPC, HSM) can satisfy it.
+ * `signDataAsync` is the keystore's own resolve-immediately wrapper over the sync `signData`.
+ * Wrapped in an arrow so the keystore keeps `this`.
  */
-function signerFor(ctx: WalletContext): (data: Uint8Array) => ledger.Signature {
-  return (data) => ctx.unshieldedKeystore.signData(data);
+function signerFor(ctx: WalletContext): (data: Uint8Array) => Promise<ledger.Signature> {
+  return (data) => ctx.unshieldedKeystore.signDataAsync(data);
 }
 
 /**
@@ -147,14 +148,28 @@ function signerFor(ctx: WalletContext): (data: Uint8Array) => ledger.Signature {
 const largestDustCoinFirst: DustCoins.CoinSelection = (coins) =>
   [...coins].sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : 0)).at(0);
 
+/** What a ledger-9 node answers `midnight_ledgerVersion` with. See `assertLedgerGeneration`. */
+const LEDGER_9_VERSIONS = ['=1.0.0', 'ledger-9'];
+
 /**
  * Refuses a node from another ledger generation before any wallet starts syncing against it.
  *
  * The wallet SDK's own failure mode is a 200-line Schema dump a minute into sync — "Could not
  * deserialize Ledger Event", payload tagged `midnight:event[v14]` — which is exactly what a
- * ledger-8 build produces when pointed at a ledger-9 devnet. Two devnets of different generations
- * can sit on one machine (main's board holds the default ports), so this asks the node first.
- * Ledger-8 nodes report `=8.1.x`; ledger-9 nodes report `... crate-ledger-9.1.0.0-rc.N ...`.
+ * build of the wrong generation produces. Two devnets of different generations can sit on one
+ * machine (the ledger-8 stack holds the default ports while this one runs beside it), so this
+ * asks the node first.
+ *
+ * What the node reports is NOT the generation number, and guessing it wrong is why this check
+ * exists twice over. Measured, not assumed:
+ *
+ *   node 1.0.1 (ledger 8)      midnight_ledgerVersion -> "=8.1.2"
+ *   node 2.0.0-rc.4 (ledger 9) midnight_ledgerVersion -> "=1.0.0"
+ *
+ * The ledger crate was renumbered to 1.0.0 for the v9 wire format — the "9" survives only in
+ * the WASM package name (`@midnightntwrk/ledger-v9`). So this matches the generation this build
+ * speaks against a list of strings known to mean it, and refuses anything else rather than
+ * trying to parse a number whose meaning has already changed once.
  */
 export async function assertLedgerGeneration(network: NetworkConfig): Promise<void> {
   const rpc = network.node.replace(/^ws/, 'http');
@@ -167,11 +182,11 @@ export async function assertLedgerGeneration(network: NetworkConfig): Promise<vo
   if (typeof result !== 'string') {
     throw new Error(`node at ${rpc} did not answer midnight_ledgerVersion (HTTP ${res.status})`);
   }
-  if (!/(^=|ledger-)8\./.test(result)) {
+  if (!LEDGER_9_VERSIONS.some((v) => result === v || result.includes(v))) {
     throw new Error(
-      `node at ${rpc} speaks ledger "${result}" but this build speaks ledger 8 — wrong network or ` +
+      `node at ${rpc} speaks ledger "${result}" but this build speaks ledger 9 — wrong network or ` +
         `ports? Set MIDNIGHT_NODE_URL / MIDNIGHT_INDEXER_URL / MIDNIGHT_INDEXER_WS_URL / ` +
-        `MIDNIGHT_PROOF_SERVER_URL to the ledger-8 stack (see docker-compose.beside-ledger9.yml).`,
+        `MIDNIGHT_PROOF_SERVER_URL to the ledger-9 stack (see docker-compose.beside-preprod.yml).`,
     );
   }
 }
@@ -189,7 +204,9 @@ export function deriveAddresses(seed: string, networkId: string): { night: strin
   const id = getNetworkId();
   const keys = deriveKeys(seed);
   return {
-    night: createKeystore(keys[Roles.NightExternal], id).getBech32Address().toString(),
+    night: createKeystore({ kind: 'schnorr', secret: keys[Roles.NightExternal] }, id)
+      .getBech32Address()
+      .toString(),
     dust: DustAddress.encodePublicKey(
       id,
       ledger.DustSecretKey.fromSeed(keys[Roles.Dust]).publicKey,
@@ -256,9 +273,12 @@ export async function createWallet(
   const keys = deriveKeys(seed);
   const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(keys[Roles.Zswap]);
   const dustSecretKey = ledger.DustSecretKey.fromSeed(keys[Roles.Dust]);
-  // wallet-sdk 1.x (ledger 8) takes the raw Schnorr secret; 2.x wrapped it in a tagged
-  // `{ kind: 'schnorr', secret }`.
-  const unshieldedKeystore = createKeystore(keys[Roles.NightExternal], networkId);
+  // wallet-sdk 2.x takes a tagged UnshieldedSecretKey rather than raw bytes. Midnight's
+  // unshielded (NIGHT) keys are Schnorr.
+  const unshieldedKeystore = createKeystore(
+    { kind: 'schnorr', secret: keys[Roles.NightExternal] },
+    networkId,
+  );
 
   const configuration = {
     networkId,

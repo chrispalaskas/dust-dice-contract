@@ -108,7 +108,7 @@ export function installIndexerBypass(indexerUrl: string): IndexerBypass {
         : input instanceof URL
           ? input.href
           : (input as Request).url;
-    let matches = false;
+    let matches: boolean;
     try {
       matches = new URL(url).origin === origin;
     } catch {

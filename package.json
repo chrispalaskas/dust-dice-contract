@@ -2,7 +2,7 @@
   "name": "dust-dice-contract",
   "version": "0.4.4",
   "private": true,
-  "description": "Dust Dice — a Yahtzee-style dice game on Midnight: the Compact contracts, their TypeScript mirrors and witnesses, the independent game verifier, and the protocol documentation. Local devnet / testnet only.",
+  "description": "Dust Dice \u2014 a Yahtzee-style dice game on Midnight: the Compact contracts, their TypeScript mirrors and witnesses, the independent game verifier, and the protocol documentation. Local devnet / testnet only.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
@@ -13,9 +13,9 @@
     "api",
     "verifier"
   ],
+  "//overrides": "@midnight-ntwrk/wallet-sdk 2.0.0-beta.2 depends on wallet-sdk-utilities EXACTLY 1.2.0, but its siblings (facade, dust-wallet, capabilities) import `Clock` from it, and `Clock` only exists from 1.2.1. Without this override every wallet import dies at load time with \"does not provide an export named 'Clock'\" \u2014 a link error that names no version and no culprit. Drop it once a beta ships with the dependency corrected.",
   "overrides": {
-    "@midnight-ntwrk/wallet-sdk-utilities": "1.2.1",
-    "@midnight-ntwrk/onchain-runtime-v3": "3.0.0"
+    "@midnight-ntwrk/wallet-sdk-utilities": "1.2.1"
   },
   "scripts": {
     "compact": "npm run compact -w contract",

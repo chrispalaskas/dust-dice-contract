@@ -92,9 +92,9 @@ export function createProviders<CK extends string, PS = unknown>(
   managedDir: string,
   phases?: Phases,
 ): MidnightProviders<CK, PrivateStateId, PS> {
-  // wallet-sdk 1.x signs synchronously, `(data) => Signature`. The arrow keeps the keystore as
-  // `this`; passing the method reference unbound, as the 2.x code did, is not safe to assume.
-  const signData = (data: Uint8Array) => ctx.unshieldedKeystore.signData(data);
+  // wallet-sdk 2.x's `SignSegment` is async. The arrow keeps the keystore as `this`; passing
+  // the method reference unbound is not safe to assume.
+  const signData = (data: Uint8Array) => ctx.unshieldedKeystore.signDataAsync(data);
 
   const walletProvider = {
     getCoinPublicKey: () => ctx.shieldedSecretKeys.coinPublicKey,
