@@ -24,7 +24,7 @@
     "//compact": "table.compact and lobby.compact `include \"policy-core\"`, so COMPACT_PATH must point at src/. The four measurement contracts do not need it (their includes resolve relative to the source), but setting it uniformly keeps the two halves of this list from diverging.",
     "compact:table": "COMPACT_PATH=$PWD/src compact compile +0.34.0 src/table.compact src/managed/table",
     "compact:lobby": "COMPACT_PATH=$PWD/src compact compile +0.34.0 src/lobby.compact src/managed/lobby",
-    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 9 && test -d dist/managed/lobby/keys && test -f dist/managed/table/compiler/contract-info.json && test -f dist/managed/lobby/compiler/contract-info.json || { echo 'refusing to publish: dist/managed lacks the proving keys or the compiler info \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
+    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 9 && test -d dist/managed/lobby/keys && test -f dist/managed/table/compiler/contract-manifest.json && test -f dist/managed/lobby/compiler/contract-manifest.json || { echo 'refusing to publish: dist/managed lacks the proving keys or the ZK artifact manifest \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-runtime": "0.19.0-rc.0"
@@ -45,6 +45,6 @@
   },
   "license": "Apache-2.0",
   "//build": "dist/managed carries compiled JS for all six modules but keys, ZKIR and the compiler output only for the two deployables (table, lobby): the four sub-modules' keys are measurement builds nobody deploys, and they would triple the tarball.",
-  "//ledger-8": "This branch targets ledger 8 (preprod). Toolchain 0.31.1 emits ONLY compiler/contract-info.json \u2014 contract-manifest.json is a 0.34.0-era artifact, so the publish guard checks contract-info.json instead. Do not 'restore' the manifest check here without also moving off +0.31.1.",
+  "//ledger-9": "This branch targets ledger 9. Toolchain 0.34.0 emits BOTH compiler/contract-info.json and compiler/contract-manifest.json. The manifest is load-bearing, not incidental: the UI serves it and FetchZkConfigProvider verifies every prover key, verifier key and zkir it fetches against it, failing closed when it is absent. So the publish guard checks for it. 0.31.1 emitted only contract-info.json, which is why the check was relaxed on the ledger-8 branch.",
   "//prepublishOnly": "A skip-ZK compile (CI) builds a dist without keys; a tarball made from it would install but could never prove. The guard makes that a loud failure instead of a silently broken package."
 }
