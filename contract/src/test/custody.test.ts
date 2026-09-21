@@ -13,8 +13,10 @@
  *
  * The fixture is a capture of a live table mid-game, both seats joined, nothing redeemed:
  * `fixtures/table-state-two-seats.hex` is the `contractAction { state }` hex for
- * 3cab19db2dad265a2327eff6746245b361697725e8986145f3ad819e141e58fb at block 387 of a local
- * ledger-9 chain (the `npm run demo -w cli` table, tier 5000025, two seats). Being a real
+ * 698ff14f2f4af17f1b17b027d8fc23adffa728176b77aae350cfa0ea2a1501f0 at block 96 (the second
+ * join) of a local ledger-9 chain running the VRF contract (the `npm run demo -w cli` table,
+ * tier 5000025, two seats; captured 2026-09-21 with
+ * `contractAction(address, offset: { blockOffset: { height } }) { state }`). Being a real
  * state, it also fails if a future runtime stops carrying balances in the serialisation at all
  * -- which is the failure mode the indexer already has.
  *
@@ -48,39 +50,30 @@ function fixtureState(): ContractState {
   return ContractState.deserialize(Uint8Array.from(Buffer.from(hex, 'hex')));
 }
 
-describe(
-  'custody: a real table state',
-  {
-    skip:
-      'fixtures/table-state-two-seats.hex predates the VRF ledger layout (seatSecretRevealed at ' +
-      '1,14 slid every bucket-1 cell): `pot` now decodes as roundDeadline. Recapture it from a ' +
-      'live VRF table once one has two seats joined -- the same way the ledger-9 capture was made.',
-  },
-  () => {
-    it('carries the staked NIGHT in its balance map', () => {
-      const state = fixtureState();
-      assert.equal(state.balance.size, 1, 'the fixture table holds exactly one token type');
-      assert.equal(nativeBalanceOf(state), 10_000_050n);
-    });
+describe('custody: a real table state', () => {
+  it('carries the staked NIGHT in its balance map', () => {
+    const state = fixtureState();
+    assert.equal(state.balance.size, 1, 'the fixture table holds exactly one token type');
+    assert.equal(nativeBalanceOf(state), 10_000_050n);
+  });
 
-    it('backs the pot the contract itself claims -- the custody invariant', () => {
-      const state = fixtureState();
-      const led = Table.ledger(state.data);
+  it('backs the pot the contract itself claims -- the custody invariant', () => {
+    const state = fixtureState();
+    const led = Table.ledger(state.data);
 
-      let redeemable = 0n;
-      for (let seat = 0n; seat < led.seatCount; seat++) {
-        if (led.seatRedeemable.member(seat)) redeemable += led.seatRedeemable.lookup(seat);
-      }
+    let redeemable = 0n;
+    for (let seat = 0n; seat < led.seatCount; seat++) {
+      if (led.seatRedeemable.member(seat)) redeemable += led.seatRedeemable.lookup(seat);
+    }
 
-      // docs/table-interface.md §6: the ledger holds the pot plus anything owed but not yet paid.
-      assert.equal(nativeBalanceOf(state), led.pot + redeemable);
-      // and this particular capture is two seats' worth of the tier's stake, nothing eliminated
-      assert.equal(led.seatCount, 2n);
-      assert.equal(redeemable, 0n);
-      assert.equal(led.pot, led.tier * led.seatCount);
-    });
-  },
-);
+    // docs/table-interface.md §6: the ledger holds the pot plus anything owed but not yet paid.
+    assert.equal(nativeBalanceOf(state), led.pot + redeemable);
+    // and this particular capture is two seats' worth of the tier's stake, nothing eliminated
+    assert.equal(led.seatCount, 2n);
+    assert.equal(redeemable, 0n);
+    assert.equal(led.pot, led.tier * led.seatCount);
+  });
+});
 
 describe('custody: decoding', () => {
   const state = (entries: [string, string, bigint][]): ContractState =>
