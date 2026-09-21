@@ -95,19 +95,15 @@ export const MAX_SEATS = 6;
 export const TICK = 10;
 
 /**
- * `seatTurn.stage`, as table.compact numbers it.
- *
- * Even stages are owed by the PLAYER and odd stages by the OPERATOR, which is the split
- * `eliminate` and `abortTable` divide on.
+ * `seatTurn.stage`, as table.compact numbers it: written by the player's moves only. Whether
+ * the player or the operator owes the next move is not the stage's parity any more but whether
+ * the seat's answer cell holds the answer to its current query -- see `playerOwes` in vrf.ts.
  */
 export const STAGE = {
   idle: 0,
-  awaitRoll1: 1,
-  rolled1: 2,
-  awaitRoll2: 3,
-  rolled2: 4,
-  awaitRoll3: 5,
-  rolled3: 6,
+  askedRoll1: 1,
+  askedRoll2: 2,
+  askedRoll3: 3,
 } as const;
 
 /**
@@ -680,11 +676,16 @@ export class GameDriver {
 
     // ---- open ---------------------------------------------------------------------------
     this.sim.asPlayer(player.sk);
-    assert.equal(await this.sim.openTurn(seat, entropy, this.tick()), BigInt(STAGE.awaitRoll1));
+    assert.equal(await this.sim.openTurn(seat, entropy, this.tick()), BigInt(STAGE.askedRoll1));
     this.playerTx += 1;
     let after = this.ledger();
     assert.equal(after.seatTurn.lookup(BigInt(seat)).round, BigInt(round));
     assert.deepEqual(after.seatTurn.lookup(BigInt(seat)).entropy, entropy);
+    assert.deepEqual(
+      after.seatTurn.lookup(BigInt(seat)).mixed,
+      mixed,
+      'the open must latch the mirror-computed mixed entropy',
+    );
     assert.equal(
       after.seatProgress.lookup(BigInt(seat)).round,
       BigInt(round),
@@ -697,17 +698,17 @@ export class GameDriver {
     // PLAYER's next move unblinds it, so every roll is asserted one step later than it used to
     // be — which is itself the property worth pinning.
     this.sim.asOperator();
-    await this.sim.resolveRoll1(seat, this.tick());
+    await this.sim.resolveRoll(seat, this.tick());
     this.operatorTx += 1;
     assert.deepEqual(
       diceToArray(this.ledger().seatTurn.lookup(BigInt(seat)).roll),
       [1, 1, 1, 1, 1],
       'the operator answered and the roll cell moved -- its transaction must not contain dice',
     );
-    assert.deepEqual(
-      this.ledger().seatTurn.lookup(BigInt(seat)).mixed,
-      mixed,
-      'resolveRoll1 must latch the mirror-computed mixed entropy',
+    assert.equal(
+      this.ledger().seatTurn.lookup(BigInt(seat)).stage,
+      BigInt(STAGE.askedRoll1),
+      'the operator answered and the stage moved -- only the player advances the turn',
     );
     assert.deepEqual(
       this.ledger().roundDigest,
@@ -719,7 +720,7 @@ export class GameDriver {
     const rolls: number[][] = [];
     for (let i = 0; i < holds.length; i++) {
       this.sim.asPlayer(player.sk);
-      const expectStage = i === 0 ? STAGE.awaitRoll2 : STAGE.awaitRoll3;
+      const expectStage = i === 0 ? STAGE.askedRoll2 : STAGE.askedRoll3;
       assert.equal(await this.sim.hold(seat, holds[i]!, this.tick()), BigInt(expectStage));
       this.playerTx += 1;
 
@@ -749,7 +750,7 @@ export class GameDriver {
       );
 
       this.sim.asOperator();
-      await this.sim.resolveReroll(seat, this.tick());
+      await this.sim.resolveRoll(seat, this.tick());
       this.operatorTx += 1;
     }
 

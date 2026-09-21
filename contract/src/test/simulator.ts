@@ -607,12 +607,20 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * rejection for the right reason.
    */
   #reveal(seat: number): void {
-    const t = this.getLedger().seatTurn.lookup(BigInt(seat));
+    const led = this.getLedger();
+    const t = led.seatTurn.lookup(BigInt(seat));
     const rho = this.blindings.get(seat);
+    // The answer lives in the operator's cell for the roll this seat is asking about, not in
+    // the turn. An idle seat has no such cell; the placeholder lets the contract speak.
+    const cell =
+      Number(t.stage) === vrf.STAGE.idle
+        ? undefined
+        : led.vrfAnswer.lookup(vrf.answerKey(seat, vrf.askedIndex(t.stage)));
     this.privateState = {
       ...this.privateState,
       vrfBlinding: rho ?? 1n,
-      vrfGamma: rho === undefined ? NO_GAMMA : vrf.unblind(t.response, rho),
+      vrfGamma:
+        rho === undefined || cell === undefined ? NO_GAMMA : vrf.unblind(cell.response, rho),
     };
   }
 
@@ -677,7 +685,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   hold(seat: number, mask: boolean[], blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.#reveal(seat);
     const t = this.getLedger().seatTurn.lookup(BigInt(seat));
-    const nextIndex = t.stage === 2n ? 1n : 2n;
+    const nextIndex = t.stage === 1n ? 1n : 2n;
     const q = this.#query(seat, t.round, nextIndex, mask);
     return this.#ask(seat, q.rho, () =>
       this.playerMove(seat, MOVE_HOLD, ZERO_BYTES32(), mask, 0, q.blinded, blockTime),
@@ -700,50 +708,39 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   }
 
   /**
-   * One roll of the operator's move, for one seat. The three steps must run in order; each
-   * asserts the `stage` it is the successor of, so a skipped or repeated step is refused on
-   * chain. Six seats have six independent pipelines and may be interleaved freely.
-   */
-  resolveRoll1(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<[]> {
-    this.blockTime = blockTime;
-    const { response, proof } = this.#answer(seat);
-    return this.run('resolveRoll1', (ctx) =>
-      this.table.impureCircuits.resolveRoll1(
-        ctx,
-        BigInt(seat),
-        response,
-        proof.a1,
-        proof.a2,
-        proof.z,
-      ),
-    );
-  }
-
-  /**
-   * The operator's answer to the query already on chain for `seat`.
+   * The operator's move: answer the query `seat` is currently asking. An honest operator
+   * reads the seat's pending turn off the ledger -- which roll, which round, which query --
+   * and posts `S = x*B` with its DLEQ into the seat's answer cell. It does not touch the turn.
    *
-   * It reads `blinded` off the ledger rather than being told it: the operator answers the
-   * question that was ASKED, and the contract admits one per (seat, round, rollIndex).
+   * Six seats have six independent pipelines and may be interleaved freely; answering an idle
+   * seat is accepted and unlocks nothing (see `resolveRollRaw` for the dishonest shapes).
    */
-  #answer(seat: number): { response: JubjubPoint; proof: vrf.DleqProof } {
+  resolveRoll(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<[]> {
     const t = this.getLedger().seatTurn.lookup(BigInt(seat));
-    return vrf.evaluate(this.config.vrfSecret, t.blinded);
+    return this.resolveRollRaw(seat, vrf.askedIndex(t.stage), t.round, t.blinded, blockTime);
   }
 
   /**
-   * Rolls 2 AND 3, from one circuit.
-   *
-   * Which reroll this is comes from the seat's own `stage`, so there is no step argument -- and
-   * no way for a caller to ask for the wrong one. The merge is forced by the deploy ceiling; see
-   * section 8 of table.compact's header.
+   * The raw resolve: answer `blinded` as if it were `seat`'s query for `rollIndex` in `round`.
+   * The circuit checks only the DLEQ; whether the answer matches what the seat actually asked
+   * is the MOVE's check, one call later. Tests use this to post answers nobody asked for.
    */
-  resolveReroll(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<[]> {
+  resolveRollRaw(
+    seat: number,
+    rollIndex: number,
+    round: bigint,
+    blinded: JubjubPoint,
+    blockTime = DEFAULT_BLOCK_TIME,
+  ): Promise<[]> {
     this.blockTime = blockTime;
-    const { response, proof } = this.#answer(seat);
-    return this.run('resolveReroll', (ctx) =>
-      this.table.impureCircuits.resolveReroll(
+    const { response, proof } = vrf.evaluate(this.config.vrfSecret, blinded);
+    return this.run('resolveRoll', (ctx) =>
+      this.table.impureCircuits.resolveRoll(
         ctx,
         BigInt(seat),
+        BigInt(rollIndex),
+        round,
+        blinded,
         response,
         proof.a1,
         proof.a2,

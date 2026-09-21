@@ -77,6 +77,10 @@ import {
   genesisDigestTs,
   joinDigestTs,
   mixEntropyTs,
+  answerKey,
+  askedIndex,
+  blindQuery,
+  deriveBlinding,
   packHoldMask,
   rerollUnderMaskTs,
   rollDigestFor,
@@ -92,6 +96,7 @@ import { userAddressBytes } from '@dust-dice/api/node';
 import { NETWORK } from './config.ts';
 import {
   diceToArray,
+  effectiveStage,
   FINAL_ROUND,
   readTableLedger,
   ROUND_COUNT,
@@ -168,13 +173,7 @@ interface LogGroup {
 }
 
 /** The calls a turn is made of, merged into one transaction or spread over several. */
-const TURN_CALLS = new Set([
-  'playerMove',
-  'resolveRoll1',
-  'resolveRoll2',
-  'resolveRoll3',
-  'resolveReroll',
-]);
+const TURN_CALLS = new Set(['playerMove', 'resolveRoll']);
 
 /**
  * Causal order for two transactions that landed in the same block. Not a guess: the contract's
@@ -184,10 +183,7 @@ const TURN_CALLS = new Set([
 const GROUP_RANK: Record<string, number> = {
   join: 0,
   playerMove: 1,
-  resolveRoll1: 1,
-  resolveRoll2: 1,
-  resolveRoll3: 1,
-  resolveReroll: 1,
+  resolveRoll: 1,
   eliminate: 2,
   closeRound: 3,
   settle: 4,
@@ -228,15 +224,17 @@ async function readHistory(address: string): Promise<LogGroup[]> {
   return groups;
 }
 
-/** The seat whose `seatTurn` entry changed between two states, or -1. */
+/**
+ * The seat whose EFFECTIVE stage changed between two states, or -1.
+ *
+ * Effective, not the ledger's: a resolve moves no `seatTurn` cell at all -- it posts into the
+ * answer map -- and shows only as "asked, unanswered" becoming "asked, answered". A move that
+ * changed nothing at all is not a move.
+ */
 function movedSeat(prev: TableLedger, led: TableLedger): number {
   for (let s = 0; s < Number(led.seatCount); s++) {
-    const a = prev.seatTurn.lookup(BigInt(s));
-    const b = led.seatTurn.lookup(BigInt(s));
-    if (a.stage !== b.stage) return s;
+    if (effectiveStage(prev, s) !== effectiveStage(led, s)) return s;
   }
-  // A score returns the stage to idle from a non-idle value, so it is caught above. A move that
-  // changed nothing at all is not a move.
   return -1;
 }
 
@@ -283,6 +281,8 @@ interface SeatReplay {
    * turn and the hold it was taken under. Set by a resolve, consumed by the next playerMove.
    */
   pending?: { index: number; mask: boolean[] };
+  /** The query this seat committed with its last move, for checking the answer against. */
+  query?: { round: number; index: number; blinded: { x: bigint; y: bigint } };
 }
 
 async function verify(address: string, verbose: boolean): Promise<number> {
@@ -527,18 +527,14 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   const verifyMergedTurn = (g: LogGroup): void => {
     const led = g.led;
     const moves = g.entryPoints.filter((k) => k === 'playerMove').length;
-    const firsts = g.entryPoints.filter((k) => k === 'resolveRoll1').length;
-    const rerolls = g.entryPoints.filter(
-      (k) => k === 'resolveReroll' || k === 'resolveRoll2' || k === 'resolveRoll3',
-    ).length;
-    const rolls = firsts + rerolls;
+    const rolls = g.entryPoints.filter((k) => k === 'resolveRoll').length;
+    const rerolls = rolls - 1;
     const where = `tx ${g.txHash.slice(0, 10)}… (block ${g.blockHeight})`;
-    if (firsts !== 1 || moves !== rolls + 1) {
+    if (rolls < 1 || rolls > 3 || moves !== rolls + 1) {
       c.ok(
         `${where}: reads as one turn`,
         false,
-        `${moves} playerMove + ${firsts} resolveRoll1 + ${rerolls} reroll is not ` +
-          'open/(hold,resolve)*/score',
+        `${moves} playerMove + ${rolls} resolveRoll is not open/(hold,resolve)*/score`,
       );
       return;
     }
@@ -616,6 +612,39 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     r.roll = derived.dice;
     r.rolls = rolls;
     r.mixed = derived.mixed;
+
+    // THE OPERATOR'S ANSWERS, one cell per roll. The three resolves of a merged turn run before
+    // its moves (bugs-found #35), so they could not check the query they answered against the
+    // seat's turn -- the moves did, one call later, and the turn settled, so they passed. Here
+    // the replay does it directly: with the seat's secret the query for each roll is
+    // re-derived, and with the key so is the answer.
+    for (let k = 0; k < rolls; k++) {
+      const mask = k === 0 ? NO_HOLD : [...(k === 1 ? turn.hold1 : turn.hold2).bits];
+      const cell = led.vrfAnswer.lookup(answerKey(seat, k));
+      const expectedQuery = blindQuery({
+        tableId,
+        round: BigInt(round),
+        rollIndex: BigInt(k),
+        holdMask: packHoldMask(mask),
+        seatSecret: r.secret!,
+        blinding: deriveBlinding({
+          seatSecret: r.secret!,
+          tableId,
+          round: BigInt(round),
+          rollIndex: BigInt(k),
+          holdMask: packHoldMask(mask),
+        }),
+      }).blinded;
+      c.ok(
+        `seat ${seat} r${round}: answer ${k + 1} is to this seat's query for this round`,
+        Number(cell.round) === round && samePoint(cell.blinded, expectedQuery),
+        `cell round ${cell.round}`,
+      );
+      c.ok(
+        `seat ${seat} r${round}: answer ${k + 1} is the table key applied to that query`,
+        samePoint(cell.response, Table.pureCircuits.vrfScalarMul(expectedQuery, x)),
+      );
+    }
 
     // SCORE. The category is whichever box the chain filled that this replay had not, and the
     // placement is recomputed with the contract-canonical rules engine from the DERIVED dice.
@@ -731,10 +760,20 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         const r = seats[seat]!;
 
         if (wasStage === STAGE.idle && nowStage === STAGE.awaitRoll1) {
-          // OPEN. The turn's mixed entropy is not latched until roll 1, but the entropy the
-          // player declared is on chain now, and it is what roll 1 will hash.
+          // OPEN. It latches the turn's mixed entropy: the entropy the player declared against
+          // the digest FROZEN AT ROUND OPEN -- which is the digest the replay is holding right
+          // now, because it only advances at a closeRound. Getting that ordering wrong is the
+          // easiest way to make an unverifiable game, so the latched value is checked.
           opens += 1;
           r.rolls = 0;
+          const opened = led.seatTurn.lookup(BigInt(seat));
+          const mixed = mixEntropyTs(opened.entropy, digest);
+          r.mixed = mixed;
+          c.ok(
+            `seat ${seat} r${round}: mixed entropy`,
+            same(opened.mixed, mixed),
+            `chain ${hex(opened.mixed)} vs replay ${hex(mixed)}`,
+          );
           c.ok(
             `seat ${seat} r${round}: open records the round`,
             Number(led.seatTurn.lookup(BigInt(seat)).round) === round,
@@ -816,57 +855,61 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         break;
       }
 
-      case 'resolveRoll1':
-      case 'resolveReroll': {
+      case 'resolveRoll': {
         if (!prev) break;
         const seat = movedSeat(prev, led);
         if (seat < 0) {
-          c.ok('a resolve changed exactly one seat', false, 'no seat changed stage');
+          // The resolve checks only the DLEQ; an answer to nothing any seat was asking -- wrong
+          // round, wrong query, wrong cell -- lands on chain and unlocks nothing.
+          console.log(
+            `  (a resolveRoll in block ${g.blockHeight} answered nothing any seat was asking ` +
+              '-- it landed on chain without effect; nothing to replay)',
+          );
           break;
         }
         const round = Number(prev.openRound);
         const r = seats[seat]!;
         const before = prev.seatTurn.lookup(BigInt(seat));
         const turn = led.seatTurn.lookup(BigInt(seat));
+        const index = askedIndex(before.stage);
+        const cell = led.vrfAnswer.lookup(answerKey(seat, index));
 
-        // THE OPERATOR'S TRANSACTION CONTAINS NO DICE. It answers the query the player put on
-        // chain, `S = x*B`, and the contract checked its DLEQ against the sealed key. With `x`
-        // now public the replay does something stronger than re-checking that proof: it
-        // recomputes `S` itself. A response that is not `x*B` is an operator that did not use
-        // the table's key -- which the DLEQ would also have caught, but this says so directly.
+        // THE OPERATOR'S TRANSACTION CONTAINS NO DICE AND TOUCHES NO TURN. It posts `S = x*B`
+        // into the seat's answer cell for this roll, and the contract checked its DLEQ against
+        // the sealed key. With `x` now public the replay does something stronger than re-checking
+        // that proof: it recomputes `S` itself. A response that is not `x*B` is an operator that
+        // did not use the table's key -- which the DLEQ would also have caught, but this says so
+        // directly. And the cell must answer THIS seat's committed query for THIS round: the
+        // resolve could not check that (it reads nothing a move writes); the move that spent the
+        // answer did, and so does this.
+        c.ok(
+          `seat ${seat} r${round}: the answer is to this seat's query for this round`,
+          Number(cell.round) === round && samePoint(cell.blinded, before.blinded),
+          `cell round ${cell.round}`,
+        );
         const expectedResponse = Table.pureCircuits.vrfScalarMul(before.blinded, x);
         c.ok(
           `seat ${seat} r${round}: the operator's answer is the table key applied to the query`,
-          samePoint(turn.response, expectedResponse),
-          `S = (${turn.response.x.toString(16).slice(0, 12)}…)`,
+          samePoint(cell.response, expectedResponse),
+          `S = (${cell.response.x.toString(16).slice(0, 12)}…)`,
         );
         c.ok(
           `seat ${seat} r${round}: a resolve reveals no dice`,
           arrayEq(diceToArray(turn.roll), diceToArray(before.roll)),
           'the roll cell must not move until the player unblinds',
         );
-
-        if (g.entryPoints[0] === 'resolveRoll1') {
-          // Roll 1 hashes the seat's declared entropy against the digest FROZEN AT ROUND OPEN --
-          // which is the digest the replay is holding right now, because it only advances at a
-          // closeRound. Getting that ordering wrong is the easiest way to make an unverifiable
-          // game, so the latched value is checked too.
-          const mixed = mixEntropyTs(before.entropy, digest);
-          r.mixed = mixed;
-          c.ok(
-            `seat ${seat} r${round}: mixed entropy`,
-            same(turn.mixed, mixed),
-            `chain ${hex(turn.mixed)} vs replay ${hex(mixed)}`,
-          );
-          r.pending = { index: 0, mask: NO_HOLD };
-        } else {
-          // WHICH reroll this is comes from the seat's stage before the call -- the same place
-          // the circuit reads it. There is one entry point for both rerolls, so the log does not
-          // say, and inferring it from the stage is both necessary and a stronger check.
-          const step = Number(before.stage) === STAGE.awaitRoll2 ? 1 : 2;
-          const mask = [...(step === 1 ? before.hold1 : before.hold2).bits];
-          r.pending = { index: step, mask };
-        }
+        c.ok(
+          `seat ${seat} r${round}: a resolve leaves the turn itself untouched`,
+          turn.stage === before.stage &&
+            samePoint(turn.blinded, before.blinded) &&
+            same(turn.mixed, before.mixed),
+          `stage ${before.stage} -> ${turn.stage}`,
+        );
+        // WHICH roll this answered comes from the seat's stage before the call -- the same place
+        // the move that spends it reads it -- and the hold it was taken under from the cell that
+        // hold landed in.
+        const mask = index === 0 ? NO_HOLD : [...(index === 1 ? before.hold1 : before.hold2).bits];
+        r.pending = { index, mask };
         c.ok(
           `seat ${seat} r${round}: no resolve moved the round digest`,
           same(led.roundDigest, digest),

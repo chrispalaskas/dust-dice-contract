@@ -57,7 +57,7 @@ describe('a turn played through the blind VRF', () => {
 
     // ---- roll 1 ---------------------------------------------------------------------
     sim.asOperator();
-    await sim.resolveRoll1(seat);
+    await sim.resolveRoll(seat);
 
     // THE OPERATOR'S TRANSACTION DOES NOT CONTAIN THE DICE. All it wrote is `S`, and `S`
     // without `rho` is a point like any other.
@@ -83,7 +83,7 @@ describe('a turn played through the blind VRF', () => {
 
     // ---- roll 2, and the hold must survive it ---------------------------------------
     sim.asOperator();
-    await sim.resolveReroll(seat);
+    await sim.resolveRoll(seat);
     sim.asPlayer(skA);
     const hold2 = [true, true, true, false, false];
     await sim.hold(seat, hold2);
@@ -96,7 +96,7 @@ describe('a turn played through the blind VRF', () => {
 
     // ---- roll 3, then score ----------------------------------------------------------
     sim.asOperator();
-    await sim.resolveReroll(seat);
+    await sim.resolveRoll(seat);
     sim.asPlayer(skA);
     const shownBefore = diceToArray(sim.getLedger().seatTurn.lookup(BigInt(seat)).roll);
     await sim.score(seat, 6); // chance-like box; any open one
@@ -166,8 +166,8 @@ describe('a turn played through the blind VRF', () => {
     sim.asOperator();
     sim.config = { ...sim.config, vrfSecret: SECRET + 1n };
     await assert.rejects(
-      () => sim.resolveRoll1(0),
-      /VRF applied to the seat's query/,
+      () => sim.resolveRoll(0),
+      /VRF applied to the query/,
       'a response from the wrong key must be refused',
     );
   });

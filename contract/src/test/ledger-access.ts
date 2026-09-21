@@ -107,22 +107,24 @@ const FIELDS = fieldNames();
  * `assertFieldMapIsComplete` rather than as a silently mislabelled read.
  */
 const ADT_FIELDS: ReadonlyArray<readonly [PathKey, string]> = [
-  ['2,2', 'seatIdentity'],
-  ['2,3', 'seatCard'],
-  ['2,4', 'seatProgress'],
-  ['2,5', 'seatTurn'],
+  // `vrfAnswer` (the operator's answer cells) is declared right after `seatTurn`. Its arrival
+  // took the field count from 32 to 33 and the compiler rebalanced again: `winnerSeatIndex`
+  // slid up into bucket 1, so bucket 2 now opens with `finalDigest` at 2,0 and the whole ADT
+  // block sits one lower than before (2,1..2,8), while bucket 1's tail moved down by one
+  // (`phase` 1,6 -> 1,5, `seatSecretRevealed` 1,14 -> 1,13). Re-derived from the generated
+  // accessor on 2026-09-21, reading each Map's own method paths rather than by arithmetic.
+  ['2,1', 'seatIdentity'],
+  ['2,2', 'seatCard'],
+  ['2,3', 'seatProgress'],
+  ['2,4', 'seatTurn'],
+  ['2,5', 'vrfAnswer'],
   ['2,6', 'seatRedeemable'],
   ['2,7', 'seatReceipt'],
   ['2,8', 'joinedKeys'],
   // Declared after `padStore` (2,9) with the other late fields, between `started` and
   // `fillOpenedAt`.
   ['2,12', 'seatPaid'],
-  // The VRF: `seatSecretRevealed` is declared right after `revealedVrfSecret` and lands as the
-  // last cell of bucket 1. Its arrival took the field count from 31 to 32, and the compiler
-  // rebalanced by sliding `tier` into bucket 0 -- so every bucket-1 address moved down by one
-  // (`phase` 1,7 -> 1,6) while bucket 2 did not move at all. Re-derived from the generated
-  // accessor on 2026-09-21, reading the Map's own method paths rather than by arithmetic.
-  ['1,14', 'seatSecretRevealed'],
+  ['1,13', 'seatSecretRevealed'],
 ];
 for (const [key, name] of ADT_FIELDS) FIELDS.set(key, name);
 
@@ -152,9 +154,10 @@ export function assertFieldMapIsComplete(): void {
   // generated accessor on 2026-09-04.
   // Bucket 1 begins at `seatLimit` since the VRF field count pushed `tier` into bucket 0; see
   // the `seatSecretRevealed` entry above.
-  expect('1,6', 'phase');
-  expect('1,14', 'seatSecretRevealed');
-  expect('2,1', 'finalDigest');
+  // The `vrfAnswer` map (2026-09-21) rebalanced once more: bucket 2 opens with `finalDigest`.
+  expect('1,5', 'phase');
+  expect('1,13', 'seatSecretRevealed');
+  expect('2,0', 'finalDigest');
   expect('2,9', 'padStore');
   expect('2,10', 'startAfterSecs');
   expect('2,13', 'fillOpenedAt');

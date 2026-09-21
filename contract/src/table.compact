@@ -344,56 +344,50 @@ pure circuit penaltyDenom(): Uint<64> {
 // The interactive turn, as a state machine
 // -------------------------------------------------------------------------------------------
 //
-// `seatTurn.stage` for one seat within one round:
+// `seatTurn.stage` for one seat within one round -- WRITTEN BY THE PLAYER'S MOVES ONLY:
 //
-//     0  idle          the seat has not opened its turn, or has finished it
-//     1  awaiting r1   playerMove(open) ran; the operator owes resolveRoll1
-//     2  rolled once   the player may hold, or score and stop
-//     3  awaiting r2   playerMove(hold) ran; the operator owes resolveRoll2
-//     4  rolled twice  the player may hold again, or score and stop
-//     5  awaiting r3   playerMove(hold) ran; the operator owes resolveRoll3
-//     6  rolled thrice the player must score; there are no rolls left
+//     0  idle           the seat has not opened its turn, or has finished it
+//     1  asked roll 1   playerMove(open) ran and committed the query for roll 1
+//     2  asked roll 2   playerMove(hold) revealed roll 1 and committed the query for roll 2
+//     3  asked roll 3   playerMove(hold) revealed roll 2 and committed the query for roll 3
 //
-// EVEN STAGES ARE OWED BY THE PLAYER AND ODD STAGES BY THE OPERATOR. That split is what
-// `eliminate` and `abortTable` divide on, and it is the whole of the "whose fault is the stall"
-// question: a player who never sends a hold is eliminable at 2 or 4 exactly as one who never
-// opened a turn is eliminable at 0, and an operator that never resolves leaves the seat at 1, 3
-// or 5 where `eliminate` refuses and `abortTable` is the remedy.
+// The operator's `resolveRoll` does NOT advance the stage. It answers the query into the
+// `vrfAnswer` map, keyed by (seat, rollIndex), and the player's next move consumes that answer
+// and moves the stage on. So "whose move is it" is no longer the stage's parity but a read of
+// two cells: at a non-idle stage the OPERATOR owes the seat until `vrfAnswer` holds an answer
+// for this round and this query (`answered`), and from then on the PLAYER owes it. That is
+// what `eliminate` and `abortTable` divide on -- see `playerOwes`.
+//
+// WHY THE RESOLVE IS KEPT OUT OF THE STAGE MACHINE (2026-09-21, bugs-found #35). A fast table
+// settles a whole turn as ONE transaction of up to seven merged calls, and the ledger-9 node
+// executes every call's GUARANTEED transcript before any call's FALLIBLE one, refusing outright
+// a transaction where a guaranteed call follows a fallible one. The ledger itself decides the
+// class per call by size -- a resolve is small enough to be guaranteed, a player move is not --
+// so the resolves MUST be able to run first, against a state none of the turn's moves has
+// touched yet. Hence a resolve reads nothing a move writes: not the stage, not the query. The
+// query arrives as an argument, the answer lands in its own cell, and the binding between the
+// two -- "the operator answered THIS seat's THIS query" -- is asserted by the move that spends
+// the answer, one call later, where it is just as strong.
 
 pure circuit stageIdle(): Uint<8> {
   return 0;
 }
 
-pure circuit stageAwaitRoll1(): Uint<8> {
+pure circuit stageAskedRoll1(): Uint<8> {
   return 1;
 }
 
-pure circuit stageRolled1(): Uint<8> {
+pure circuit stageAskedRoll2(): Uint<8> {
   return 2;
 }
 
-pure circuit stageAwaitRoll2(): Uint<8> {
+pure circuit stageAskedRoll3(): Uint<8> {
   return 3;
 }
 
-pure circuit stageRolled2(): Uint<8> {
-  return 4;
-}
-
-pure circuit stageAwaitRoll3(): Uint<8> {
-  return 5;
-}
-
-pure circuit stageRolled3(): Uint<8> {
-  return 6;
-}
-
-/** Is the PLAYER the one who owes the next move? See the state machine above. */
-pure circuit playerOwes(stage: Uint<8>): Boolean {
-  return stage == stageIdle() ||
-         stage == stageRolled1() ||
-         stage == stageRolled2() ||
-         stage == stageRolled3();
+/** The roll index (0..2) a non-idle stage is asking about. Meaningless at idle; callers guard. */
+pure circuit askedIndex(stage: Uint<8>): Uint<8> {
+  return stage == stageAskedRoll1() ? 0 : (stage == stageAskedRoll2() ? 1 : 2);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -740,7 +734,8 @@ export struct SeatProgress {
 }
 
 /**
- * One seat's interactive turn. The ONLY map the three resolve circuits touch.
+ * One seat's interactive turn. Written by the player's moves (and reset by `join` and
+ * `eliminate`); the operator's `resolveRoll` neither reads nor writes it -- see `vrfAnswer`.
  *
  * Under the cursor model these were seven shared singletons (`pendingEntropy`, `pendingPolicy`,
  * `pendingParam`, `rollStep`, `pendingMixed`, `pendingHold`, `pendingRoll`) and every resolve
@@ -751,7 +746,7 @@ export struct SeatProgress {
 export struct SeatTurn {
   /** 0..6. See the state-machine comment above `stageIdle`. */
   stage: Uint<8>,
-  /** The round this turn belongs to. Asserted equal to `openRound` by `resolveRoll1`. */
+  /** The round this turn belongs to. The answer a move spends must carry the same round. */
   round: Uint<8>,
   /** `H(sk_s, tableId, round)`, proven against the seat's join-time commitment when opened. */
   entropy: Bytes<32>,
@@ -766,19 +761,10 @@ export struct SeatTurn {
    */
   blinded: JubjubPoint,
   /**
-   * `S = x*B`, the operator's answer, with its DLEQ already verified against `vrfPublicKey`.
+   * `mixEntropy(entropy, roundDigest)`, latched by the OPEN.
    *
-   * The dice are NOT derivable from this by anyone but the seat: unblinding needs `rho`. So a
-   * resolve no longer publishes the roll — it publishes an answer only the player can read,
-   * and the player reveals the dice with its next move.
-   */
-  response: JubjubPoint,
-  /**
-   * `mixEntropy(entropy, roundDigest)`, latched by `resolveRoll1`.
-   *
-   * Carried in the ledger rather than recomputed by steps 2 and 3 because recomputing it is a
-   * `persistentHash` per step and the whole point of the split is to fit under k=15. Not a new
-   * disclosure: both its inputs were already public.
+   * Carried in the ledger rather than recomputed at each reveal because recomputing it is a
+   * `persistentHash` per move. Not a new disclosure: both its inputs were already public.
    */
   mixed: Bytes<32>,
   /**
@@ -818,6 +804,65 @@ export ledger seatCard: Map<Uint<8>, Scorecard>;
 export ledger seatProgress: Map<Uint<8>, SeatProgress>;
 
 export ledger seatTurn: Map<Uint<8>, SeatTurn>;
+
+/**
+ * The operator's VRF answer to one query: `S = x*B`, with the query it answers and the round it
+ * was asked in, so the move that spends it can check it is the answer to ITS question.
+ *
+ * The dice are NOT derivable from this by anyone but the seat: unblinding needs `rho`. So a
+ * resolve does not publish the roll -- it publishes an answer only the player can read, and the
+ * player reveals the dice with its next move.
+ */
+export struct VrfAnswer {
+  /** The round the query belonged to; `noAnswerRound()` in a cell nobody has answered into. */
+  round: Uint<8>,
+  /** The query answered, `B = rho*P`, exactly as the operator was given it. */
+  blinded: JubjubPoint,
+  /** `x*B`, its DLEQ against `vrfPublicKey` verified by the resolve that wrote it. */
+  response: JubjubPoint,
+}
+
+/**
+ * The operator's answers, keyed by `answerKey(seat, rollIndex)`: one cell per roll of a turn,
+ * overwritten round after round. The ONLY map `resolveRoll` touches, and the only thing it
+ * writes at all besides the padding.
+ *
+ * ONE CELL PER ROLL INDEX, not one per seat, and not appended: in a merged fast turn the three
+ * resolves all run before any of the four moves, so the cell a move reads must be one that no
+ * LATER resolve of the same turn overwrites. Three fixed cells make each move's read exactly
+ * the value its own resolve wrote, whichever order the ledger runs them in.
+ *
+ * Pre-populated with `noAnswer()` for a seat's three cells by `join`, and for `noAnswerKey()`
+ * by the constructor, so every `lookup` in a circuit is total (section 7).
+ */
+export ledger vrfAnswer: Map<Uint<8>, VrfAnswer>;
+
+/** Where `vrfAnswer` holds the answer for `rollIndex` (0..2) of `seat`'s current turn. */
+pure circuit answerKey(seat: Uint<8>, rollIndex: Uint<8>): Uint<8> {
+  return (seat * 3 + rollIndex) as Uint<8>;
+}
+
+/**
+ * The cell an IDLE seat's move reads instead of a real answer. A move reads exactly one answer
+ * cell whatever its kind (a circuit has no branches), and an open must not read any of the
+ * three cells the resolves of the very turn it opens will write -- a merged fast turn runs
+ * those resolves first, and a read that saw a stale value at build time would fail on chain.
+ * This cell is never written after the constructor, so it is the same at both times.
+ */
+pure circuit noAnswerKey(): Uint<8> {
+  return 255;
+}
+
+/** A round no turn can have, marking an answer cell nobody has answered into. */
+pure circuit noAnswerRound(): Uint<8> {
+  return 255;
+}
+
+pure circuit noAnswer(): VrfAnswer {
+  return VrfAnswer { round: noAnswerRound(),
+                     blinded: default<JubjubPoint>,
+                     response: default<JubjubPoint>, };
+}
 
 /**
  * Native NIGHT owed to a seat personally, and payable only to that seat's join-time address.
@@ -1346,9 +1391,8 @@ constructor(id: Bytes<32>,
       SeatTurn { stage: stageIdle(),
                  round: 0,
                  entropy: default<Bytes<32>>,
-                 // No query outstanding and no answer to spend: an idle seat has asked nothing.
+                 // No query outstanding: an idle seat has asked nothing.
                  blinded: default<JubjubPoint>,
-                 response: default<JubjubPoint>,
                  mixed: default<Bytes<32>>,
                  hold1: default<HoldMask>,
                  hold2: default<HoldMask>,
@@ -1357,6 +1401,8 @@ constructor(id: Bytes<32>,
     seatRedeemable.insert(s as Uint<8>, 0);
     seatPaid.insert(s as Uint<8>, 0);
   }
+  // The one answer cell an idle seat's move reads. See `noAnswerKey`.
+  vrfAnswer.insert(noAnswerKey(), noAnswer());
 }
 
 // ===========================================================================================
@@ -1423,6 +1469,10 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   seatIdentity.insert(seat, SeatIdentity { addr: who, keyCommit: commit });
   seatCard.insert(seat, emptyScorecard());
   seatReceipt.insert(seat, default<Bytes<32>>);
+  // The seat's three answer cells, so every `vrfAnswer.lookup` a move makes is total.
+  vrfAnswer.insert(answerKey(seat, 0), noAnswer());
+  vrfAnswer.insert(answerKey(seat, 1), noAnswer());
+  vrfAnswer.insert(answerKey(seat, 2), noAnswer());
   joinedKeys.insert(commit);
 
   receiveUnshielded(nativeToken(), tier as Uint<128>);
@@ -1578,43 +1628,49 @@ export circuit playerMove(
   assert(!prog.eliminated, "playerMove: this seat has been eliminated");
   assert(!opening || prog.round == r, "playerMove: this seat has already played the open round");
   assert(!opening || pend.stage == stageIdle(), "playerMove: this seat already opened its turn");
-  const between = pend.stage == stageRolled1() ||
-                  pend.stage == stageRolled2() ||
-                  pend.stage == stageRolled3();
-  assert(!holding || pend.stage == stageRolled1() || pend.stage == stageRolled2(),
-         "playerMove: a hold needs a resolved roll with another roll left"
+  const between = pend.stage != stageIdle();
+  assert(!holding || pend.stage == stageAskedRoll1() || pend.stage == stageAskedRoll2(),
+         "playerMove: a hold needs an asked roll with another roll left"
          );
   assert(!scoring || between, "playerMove: nothing has been rolled to score");
 
   // ---- reveal the roll this move acts on ------------------------------------------------
   //
-  // The operator's resolve published `S = x*B` and learned nothing from it; the dice appear
-  // here, in the PLAYER's transaction, because unblinding needs `rho`. Three things are
-  // checked and they are not interchangeable:
+  // The operator's resolve published `S = x*B` into `vrfAnswer` and learned nothing from it;
+  // the dice appear here, in the PLAYER's transaction, because unblinding needs `rho`. Four
+  // things are checked and they are not interchangeable:
   //
-  //   1. `P` is rebuilt from ledger state — this table, this round, this roll index, and the
+  //   1. The answer cell for this seat and roll index holds an answer to THIS query: same
+  //      round, same `B` as the one this seat committed with its previous move. The resolve
+  //      could not check that (it must not read this seat's turn -- see the state machine),
+  //      so the binding is made here, by the party the answer is for.
+  //   2. `P` is rebuilt from ledger state — this table, this round, this roll index, and the
   //      hold that PRECEDED this roll — plus the seat's own secret. A player cannot point the
   //      VRF at an input of its choosing; every field but `sk` is one the contract already
   //      knows, and `sk` is the one the join commitment pinned.
-  //   2. `B == rho*P` ties the query the operator actually answered to that `P`.
-  //   3. `S == rho*Gamma` unblinds it, stated that way so no scalar inverse is needed here.
+  //   3. `B == rho*P` ties the query the operator actually answered to that `P`.
+  //   4. `S == rho*Gamma` unblinds it, stated that way so no scalar inverse is needed here.
   //
   // Together they say: this Gamma is `x*P` for this exact roll, and the operator's DLEQ at
   // resolve time already said the `x` was the sealed one. The dice follow from Gamma alone.
   const rho = vrfBlinding();
   const gamma = vrfGamma();
-  const revealIndex = (pend.stage == stageRolled1() ? 0 : (pend.stage == stageRolled2() ? 1 : 2))
-                        as Uint<8>;
+  const revealIndex = askedIndex(pend.stage);
   // The hold that the roll being revealed was taken UNDER. Roll 1 is taken under no hold, so
   // the mask is empty — which is also what makes roll 1's query formable at open time.
-  const priorHold = pend.stage == stageRolled1()
+  const priorHold = pend.stage == stageAskedRoll1()
                       ? default<Vector<5, Boolean>>
-                      : (pend.stage == stageRolled2() ? pend.hold1.bits : pend.hold2.bits);
+                      : (pend.stage == stageAskedRoll2() ? pend.hold1.bits : pend.hold2.bits);
+  // An idle seat (an open) reads the never-written sentinel cell instead of a real one.
+  const answer = vrfAnswer.lookup(between ? answerKey(s, revealIndex) : noAnswerKey());
+  assert(!between || (answer.round == pend.round && answer.blinded == pend.blinded),
+         "playerMove: the operator has not answered this seat's query yet"
+         );
   const inputPoint = vrfInputPoint(tableId, pend.round, revealIndex, packHoldMask(priorHold), sk);
   assert(disclose(!between || ecMul(inputPoint, rho as JubjubScalar) == pend.blinded),
          "playerMove: the blinded query on chain is not this seat's input point blinded"
          );
-  assert(disclose(!between || ecMul(gamma, rho as JubjubScalar) == pend.response),
+  assert(disclose(!between || ecMul(gamma, rho as JubjubScalar) == answer.response),
          "playerMove: gamma does not unblind the operator's response"
          );
 
@@ -1677,13 +1733,13 @@ export circuit playerMove(
 
   // ---- the turn's next stage -----------------------------------------------------------
   //
-  // Open moves to "awaiting roll 1"; a hold moves to the next odd stage, which is the operator's
-  // to discharge; a score returns the seat to idle for the next round.
+  // Open asks for roll 1; a hold asks for the next roll; a score returns the seat to idle for
+  // the next round. Every stage change is the player's.
   const nextStage =
           opening
-            ? stageAwaitRoll1()
+            ? stageAskedRoll1()
             : (holding
-                 ? (pend.stage == stageRolled1() ? stageAwaitRoll2() : stageAwaitRoll3())
+                 ? (pend.stage == stageAskedRoll1() ? stageAskedRoll2() : stageAskedRoll3())
                  : stageIdle());
 
   seatTurn.insert(
@@ -1697,25 +1753,22 @@ export circuit playerMove(
                // A score ends the turn, so its value is never read; the sentinel assert below
                // still pins it so the public log has one representation.
                blinded: disclose(nextBlinded),
-               // Cleared: the answer to the previous query has been spent by the reveal above,
-               // and leaving it would let a later move re-check against a stale response.
-               response: default<JubjubPoint>,
                // Written on open, carried afterwards. A hold or a score cannot change it -- the
                // sentinel assert above already forces `e` to zeros for those kinds.
                entropy: opening ? e : pend.entropy,
-               // Latched by resolveRoll1; nothing to write here. Cleared on open so a turn never
-               // inherits the previous round's mix.
-               mixed: opening ? default<Bytes<32>> : pend.mixed,
+               // Latched HERE, on the open, from two public reads: the operator's resolve no
+               // longer touches this turn, so nothing later could latch it. Carried afterwards.
+               mixed: opening ? mixEntropy(e, roundDigest) : pend.mixed,
                // A hold writes the mask for the roll it precedes and leaves the other alone;
                // opening a turn clears both so a turn never inherits the previous round's.
                hold1: opening
                         ? default<HoldMask>
-                        : (holding && pend.stage == stageRolled1()
+                        : (holding && pend.stage == stageAskedRoll1()
                              ? HoldMask { bits: m }
                              : pend.hold1),
                hold2: opening
                         ? default<HoldMask>
-                        : (holding && pend.stage == stageRolled2()
+                        : (holding && pend.stage == stageAskedRoll2()
                              ? HoldMask { bits: m }
                              : pend.hold2),
                // The dice this move revealed, so the next reroll knows what was kept and the
@@ -1731,154 +1784,63 @@ export circuit playerMove(
 }
 
 // ===========================================================================================
-// resolveRoll1 / resolveRoll2 / resolveRoll3 -- the operator's move, one roll per transaction
+// resolveRoll -- the operator's move: answer one query, prove the key, touch nothing else
 // ===========================================================================================
 //
-// This is the one place ZK genuinely earns its keep in the base game. The seed stays a private
-// witness -- each circuit proves `H(tableId, seed) == seedCommitment` without revealing `seed`
-// -- so the dice are proven correct against a commitment made before any player existed, while
-// the game is still live and the player still must not know the seed.
+// This is the one place ZK genuinely earns its keep in the base game. The operator applies the
+// table's VRF key `x` to a blinded point `B` it cannot interpret and proves, with a DLEQ against
+// the sealed `vrfPublicKey`, that it used that key -- so exactly one `S` has a valid proof for a
+// given `B`, and the operator can neither choose the answer nor aim it. The dice need `rho`,
+// which only the seat has: the operator learns nothing, and the player reveals the roll with
+// its next move.
 //
-// Authorisation is knowledge of the seed and nothing else, in all three steps. There is no
-// operator address anywhere in this contract. Re-checking the seed in every step is not
-// redundant: each step derives a roll from it.
+// THE SEAT, THE ROLL INDEX, THE ROUND AND THE QUERY ARE ALL ARGUMENTS. Nothing here reads
+// `seatTurn`, on purpose: see the state-machine comment above `stageIdle`. The resolve is an
+// oracle post -- "the VRF of this table at B is S" -- filed under (seat, rollIndex) with the
+// round attached, and the move that spends it checks that it answers that seat's actual
+// committed query. Filing a wrong round, a wrong seat or a query nobody asked is harmless: no
+// move will ever match it, and the cell is overwritten by the next honest answer. That is not
+// discretion over outcomes -- a seat's dice are fixed by its committed query and the sealed key.
 //
-// THE SEAT IS AN ARGUMENT. Under the cursor model the operator resolved whoever `currentSeat`
-// named; under simultaneous rounds up to six seats can be awaiting a roll at once, so the
-// operator has to say which. That is not discretion over outcomes -- a seat's dice are fixed by
-// the frozen round digest, its own forced entropy and the seed, so the order the operator picks
-// changes nothing about what any seat receives (section 2 of the header).
+// NO TIME CHECK. A resolve is never late: `eliminate` refuses a seat whose next move is the
+// operator's, and an operator that abandons one mid-turn is `abortTable`'s business. Adding a
+// deadline here would only give the operator a way to lose a seat's move to the clock.
 //
-// THE ROLL INPUTS ARE `H(tableId, seed, mixEntropy(entropy_s(r), roundDigest_r), r, rollIndex)`,
-// and `roundDigest_r` is the digest FROZEN AT ROUND OPEN. `resolveRoll1` latches the mixed
-// entropy into the seat's own pipeline so all three rolls hash against the same value.
-//
-// NO TIME CHECK, IN ANY OF THE THREE. A resolve is never late: `eliminate` refuses a seat whose
-// next move is the operator's, and an operator that abandons one mid-turn is `abortTable`'s
-// business. Adding a deadline here would only give the operator a way to lose a seat's move to
-// the clock.
-//
-// WHY THREE TRANSACTIONS AND NOT ONE: the single-circuit version compiles to k=17 and the proof
-// server has no SRS above 15. The measured corpus forces the cut at one roll per transaction:
-// one roll is k=15, two are k=16. With interactive holds the cut is no longer a compromise
-// anyway -- the player has to see each roll to choose the next hold, so the rolls MUST be
-// separate transactions.
+// ONE CIRCUIT FOR ALL THREE ROLLS. They were two (roll 1 latched the mixed entropy; rerolls did
+// not) and the deploy ceiling is nine exported circuits (section 8); with the latch moved to the
+// open there is no difference left between them, and the merge frees a slot.
 
 /**
- * Roll 1 of 3: five fresh dice for one seat, and the latch of that seat's mixed entropy.
- *
- * Nothing is held: the player has not seen anything yet. Under pre-declared policies this step
- * also checked a witnessed modal face and computed the hold mask, which is where its
- * instruction count went; both are gone.
- *
- * Touches exactly ONE map, and that is deliberate -- this circuit is at k=15 with no headroom.
+ * Answer one VRF query. Touches exactly ONE map, `vrfAnswer`, and reads only constants of the
+ * playing table -- which is what lets a merged fast turn run its three resolves first.
  */
-export circuit resolveRoll1(seat: Uint<8>,
-                            response: JubjubPoint,
-                            dleqA1: JubjubPoint,
-                            dleqA2: JubjubPoint,
-                            dleqZ: Field,
-                            ): [] {
-  assert(phase == Phase.playing, "resolveRoll1: table is not playing");
+export circuit resolveRoll(seat: Uint<8>,
+                           rollIndex: Uint<8>,
+                           round: Uint<8>,
+                           blinded: JubjubPoint,
+                           response: JubjubPoint,
+                           dleqA1: JubjubPoint,
+                           dleqA2: JubjubPoint,
+                           dleqZ: Field,
+                           ): [] {
+  assert(phase == Phase.playing, "resolveRoll: table is not playing");
 
   const s = disclose(seat);
-  const t = seatTurn.lookup(s);
-  assert(t.stage == stageAwaitRoll1(), "resolveRoll1: this seat is not awaiting its first roll");
-  // The digest below is the OPEN round's. A pending turn from another round would derive its
-  // dice from the wrong entropy, so pin the two together rather than trusting `closeRound`'s
-  // own guard to have held. Reading `openRound` is free: it cannot move while a roll is pending.
-  assert(t.round == openRound, "resolveRoll1: pending turn is not in the open round");
+  const i = disclose(rollIndex);
+  // `seatCount` cannot move while the table plays, so this read is as constant as the sealed
+  // key. It also keeps every key below `noAnswerKey()`.
+  assert(s < seatCount, "resolveRoll: no such seat");
+  assert(i < 3, "resolveRoll: a turn has three rolls");
 
-  // THE OPERATOR NO LONGER LEARNS THE DICE. It applies the table key to a point it cannot
-  // interpret and proves it used that key; `Gamma`, and so the roll, needs `rho`, which only
-  // the player has. What the operator's authority now rests on is the DLEQ rather than a seed
-  // preimage: exactly one `S` has a valid proof for a given `B`, so it can neither choose the
-  // answer nor aim it.
-  assert(disclose(vrfDleqHolds(vrfPublicKey, t.blinded, disclose(response), disclose(dleqA1),
-                               disclose(dleqA2), disclose(dleqZ))),
-         "resolveRoll1: the response is not this table's VRF applied to the seat's query"
+  const b = disclose(blinded);
+  const answer = disclose(response);
+  assert(disclose(vrfDleqHolds(vrfPublicKey, b, answer, disclose(dleqA1), disclose(dleqA2),
+                               disclose(dleqZ))),
+         "resolveRoll: the response is not this table's VRF applied to the query"
          );
 
-  // `mixed` needs NO `disclose`: it is a hash of the seat's entropy and the round digest, both
-  // public ledger reads, so anyone could already compute it.
-  const mixed = mixEntropy(t.entropy, roundDigest);
-
-  seatTurn.insert(
-    s,
-    SeatTurn { stage: stageRolled1(),
-               round: t.round,
-               entropy: t.entropy,
-               blinded: t.blinded,
-               response: disclose(response),
-               mixed: mixed,
-               hold1: t.hold1,
-               hold2: t.hold2,
-               roll: t.roll, }
-    );
-
-  padTransaction();
-}
-
-/**
- * Rolls 2 AND 3: reroll exactly the positions the player did not hold.
- *
- * ONE CIRCUIT FOR BOTH REROLLS, and the merge is forced by a limit nobody had measured. See
- * section 8 of this header: the deploy transaction carries one verifier key per exported
- * circuit, and at ten circuits it is refused by the node with "Transaction would exhaust the
- * block limits". Nine deploy; ten do not. So one circuit had to go, and these two were the
- * right pair to lose:
- *
- *   * they are the SAME computation. Roll 2 and roll 3 differ only in which roll hash they
- *     draw from and which of the two stored masks they apply -- both of which the seat's own
- *     `stage` already determines, so the merge needs no new argument and grants the operator no
- *     new discretion.
- *   * merging them costs no PLONK step. The domain of a reroll is set by the roll hash and its
- *     rejection ladder -- 30 `div_mod_power_of_two` and ~120 `less_than` -- and the merge adds
- *     seven conditional selects to that. Measured at k=15 before and after, which is the only
- *     reason this pair was chosen over any other: every other candidate merge either doubled a
- *     hash or joined two circuits with different read sets.
- *   * it SIMPLIFIES the operator, which was already dispatching on the stage to decide which of
- *     `resolveRoll2` and `resolveRoll3` to call.
- *
- * The fresh roll is consumed LEFT TO RIGHT over the rerolled positions -- see `mergeStream` in
- * policy-core.compact. Writes no seat progress: the turn is still in progress and the player may
- * still stop and score after either reroll.
- */
-export circuit resolveReroll(seat: Uint<8>,
-                             response: JubjubPoint,
-                             dleqA1: JubjubPoint,
-                             dleqA2: JubjubPoint,
-                             dleqZ: Field,
-                             ): [] {
-  assert(phase == Phase.playing, "resolveReroll: table is not playing");
-
-  const s = disclose(seat);
-  const t = seatTurn.lookup(s);
-  const second = t.stage == stageAwaitRoll2();
-  const third = t.stage == stageAwaitRoll3();
-  assert(second || third, "resolveReroll: this seat is not awaiting a reroll");
-
-  // Same as roll 1: answer the query on chain, prove the key, learn nothing. Which roll this
-  // is comes from the seat's own stage, and the query it answers was fixed by the player in
-  // the transaction that set the hold — so the operator cannot be asked a second question for
-  // the same (seat, round, rollIndex) without another on-chain move.
-  assert(disclose(vrfDleqHolds(vrfPublicKey, t.blinded, disclose(response), disclose(dleqA1),
-                               disclose(dleqA2), disclose(dleqZ))),
-         "resolveReroll: the response is not this table's VRF applied to the seat's query"
-         );
-
-  seatTurn.insert(
-    s,
-    SeatTurn { stage: second ? stageRolled2() : stageRolled3(),
-               round: t.round,
-               entropy: t.entropy,
-               blinded: t.blinded,
-               response: disclose(response),
-               mixed: t.mixed,
-               hold1: t.hold1,
-               hold2: t.hold2,
-               roll: t.roll, }
-    );
+  vrfAnswer.insert(answerKey(s, i),
+                   VrfAnswer { round: disclose(round), blinded: b, response: answer, });
 
   padTransaction();
 }
@@ -2076,12 +2038,11 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
   assert(vol || prog.round == r, "eliminate: this seat has already played the open round");
 
   const pend = seatTurn.lookup(s);
-  // On a FAST table the stage-parity shield is waived: resolves are off-chain there, so a seat
-  // parked at stage 1 past the deadline is a stalled fast turn, not an operator debt -- and
-  // between transactions a fast seat can rest at no other odd stage. On-chain-mode tables keep
-  // the rule exactly: an odd stage is the operator's silence and eliminating it would punish
-  // the wrong party.
-  assert(vol || fastMode || playerOwes(pend.stage),
+  // On a FAST table the owes-shield is waived: resolves are off-chain there, so a seat parked
+  // at an asked stage past the deadline is a stalled fast turn, not an operator debt. On-chain
+  // tables keep the rule exactly: an asked-but-unanswered stage is the operator's silence and
+  // eliminating it would punish the wrong party.
+  assert(vol || fastMode || playerOwes(s, pend),
          "eliminate: this seat is waiting on the operator, not the other way round"
          );
 
@@ -2126,10 +2087,9 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
     SeatTurn { stage: stageIdle(),
                round: pend.round,
                entropy: pend.entropy,
-               // An eliminated seat's outstanding query and unspent answer are cleared: there
-               // is no move left that could reveal against them.
+               // An eliminated seat's outstanding query is cleared: there is no move left that
+               // could reveal against it, and no answer can match a query that is gone.
                blinded: default<JubjubPoint>,
-               response: default<JubjubPoint>,
                mixed: pend.mixed,
                hold1: pend.hold1,
                hold2: pend.hold2,
@@ -2561,9 +2521,26 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
   return starting ? 0 : share;
 }
 
-/** Is this slot's next move the operator's -- i.e. is a roll outstanding? */
+/** Is this slot's next move the operator's -- i.e. is a roll asked and unanswered? */
 circuit awaitingOperatorAt(s: Uint<8>): Boolean {
-  return s < seatCount && !playerOwes(seatTurn.lookup(s).stage);
+  return s < seatCount && !playerOwes(s, seatTurn.lookup(s));
+}
+
+/**
+ * Has the operator answered the query this seat is currently asking? False at idle.
+ *
+ * The answer cell for the asked roll must carry this turn's round and this turn's query; an
+ * answer from an earlier round, or to a query this seat never committed, does not count.
+ */
+circuit answered(s: Uint<8>, pend: SeatTurn): Boolean {
+  const asked = pend.stage != stageIdle();
+  const a = vrfAnswer.lookup(asked ? answerKey(s, askedIndex(pend.stage)) : noAnswerKey());
+  return asked && a.round == pend.round && a.blinded == pend.blinded;
+}
+
+/** Is the PLAYER the one who owes the next move? See the state machine above `stageIdle`. */
+circuit playerOwes(s: Uint<8>, pend: SeatTurn): Boolean {
+  return pend.stage == stageIdle() || answered(s, pend);
 }
 
 /** Does this slot take a share in an abort: a seated player, or one eliminated during play? */

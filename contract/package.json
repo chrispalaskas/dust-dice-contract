@@ -24,7 +24,7 @@
     "//compact": "table.compact and lobby.compact `include \"policy-core\"`, so COMPACT_PATH must point at src/. The four measurement contracts do not need it (their includes resolve relative to the source), but setting it uniformly keeps the two halves of this list from diverging.",
     "compact:table": "COMPACT_PATH=$PWD/src compact compile +0.34.0 src/table.compact src/managed/table",
     "compact:lobby": "COMPACT_PATH=$PWD/src compact compile +0.34.0 src/lobby.compact src/managed/lobby",
-    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 9 && test -d dist/managed/lobby/keys && test -f dist/managed/table/compiler/contract-manifest.json && test -f dist/managed/lobby/compiler/contract-manifest.json || { echo 'refusing to publish: dist/managed lacks the proving keys or the ZK artifact manifest \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
+    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 8 && test -d dist/managed/lobby/keys && test -f dist/managed/table/compiler/contract-manifest.json && test -f dist/managed/lobby/compiler/contract-manifest.json || { echo 'refusing to publish: dist/managed lacks the proving keys or the ZK artifact manifest \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-runtime": "0.19.0-rc.0"

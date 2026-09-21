@@ -27,6 +27,10 @@ import {
   type UnshieldedBalances,
   type TablePrivateState,
   type LobbyPrivateState,
+  answered,
+  answerKey,
+  askedIndex,
+  STAGE as LEDGER_STAGE_VALUES,
 } from '@dust-dice/contract';
 
 import { NETWORK } from './config.ts';
@@ -47,8 +51,7 @@ export { Table, Lobby };
 export type TableCircuitId =
   | 'join'
   | 'playerMove'
-  | 'resolveRoll1'
-  | 'resolveReroll'
+  | 'resolveRoll'
   | 'closeRound'
   | 'eliminate'
   | 'settle'
@@ -156,10 +159,19 @@ export const MOVE_HOLD = 1;
 export const MOVE_SCORE = 2;
 
 /**
- * `seatTurn.stage`.
+ * A seat's EFFECTIVE stage: where its turn is, counting the operator's answer.
  *
- * EVEN STAGES ARE OWED BY THE PLAYER, ODD ONES BY THE OPERATOR. That split is what the driver
- * dispatches on and what `eliminate` and `abortTable` divide on in the contract.
+ * The ledger's own `seatTurn.stage` is written by the player's moves only -- 0 idle, then
+ * "asked roll k" for k = 1..3 (`LEDGER_STAGE`) -- and the operator's `resolveRoll` answers into
+ * the separate `vrfAnswer` map without touching it (table.compact, the state machine above
+ * `stageIdle`; bugs-found #35 for why). Clients want the older, finer picture: has the roll the
+ * seat asked for been ANSWERED yet? That is one more read, so it is folded in here:
+ *
+ *     asked roll k, unanswered  ->  2k - 1   (1, 3, 5: the operator owes)
+ *     asked roll k, answered    ->  2k       (2, 4, 6: the player owes)
+ *
+ * EVEN STAGES ARE OWED BY THE PLAYER, ODD ONES BY THE OPERATOR -- exactly the split the driver
+ * dispatches on and the contract's `playerOwes` divides on, so nothing downstream changed.
  */
 export const STAGE = {
   idle: 0,
@@ -170,6 +182,18 @@ export const STAGE = {
   awaitRoll3: 5,
   rolled3: 6,
 } as const;
+
+/** The ledger's own numbering: 0 idle, 1..3 "asked roll k". */
+export { STAGE as LEDGER_STAGE } from '@dust-dice/contract';
+
+/** The effective stage of one seat -- see `STAGE`. */
+export function effectiveStage(led: TableLedger, seat: number): number {
+  const turn = led.seatTurn.lookup(BigInt(seat));
+  const asked = Number(turn.stage);
+  if (asked === LEDGER_STAGE_VALUES.idle) return STAGE.idle;
+  const cell = led.vrfAnswer.lookup(answerKey(seat, askedIndex(asked)));
+  return answered(turn, cell) ? 2 * asked : 2 * asked - 1;
+}
 
 /** Is this seat's next move the player's? */
 export const playerOwes = (stage: number): boolean => stage % 2 === 0;
@@ -197,8 +221,10 @@ export function seatView(led: TableLedger, seat: number): SeatView {
   return {
     seat,
     round: Number(prog.round),
-    stage: Number(turn.stage),
+    stage: effectiveStage(led, seat),
     eliminated: prog.eliminated,
+    // At an even stage this is the PREVIOUS reveal: the roll just answered is in the answer
+    // cell, blinded, and only the seat can read it (see the CLI driver's `revealedRoll`).
     roll: diceToArray(turn.roll),
   };
 }

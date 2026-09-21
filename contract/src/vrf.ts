@@ -203,3 +203,59 @@ export function deriveBlinding(args: {
  */
 export const vrfSecretFromSeed = (seed: Uint8Array): bigint =>
   mod(pureCircuits.vrfSecretFromSeed(seed));
+
+// -------------------------------------------------------------------------------------------
+// The turn's stage machine and the operator's answer map, as table.compact numbers them
+// -------------------------------------------------------------------------------------------
+
+/**
+ * `seatTurn.stage`. Written by the player's moves only: 0 idle, then "asked roll k" for k=1..3.
+ * The operator's `resolveRoll` never touches it -- see `answerKey`.
+ */
+export const STAGE = {
+  idle: 0,
+  askedRoll1: 1,
+  askedRoll2: 2,
+  askedRoll3: 3,
+} as const;
+
+/** The roll index (0..2) a non-idle stage is asking about. */
+export function askedIndex(stage: number | bigint): number {
+  const s = Number(stage);
+  return s === STAGE.askedRoll1 ? 0 : s === STAGE.askedRoll2 ? 1 : 2;
+}
+
+/**
+ * Where `vrfAnswer` holds the operator's answer for `rollIndex` of `seat`'s current turn:
+ * `seat * 3 + rollIndex`. One cell per roll, overwritten round after round.
+ */
+export function answerKey(seat: number | bigint, rollIndex: number | bigint): bigint {
+  return BigInt(seat) * 3n + BigInt(rollIndex);
+}
+
+/** The never-written cell an idle seat's move reads; the constructor fills it once. */
+export const NO_ANSWER_KEY = 255n;
+
+/** The `round` of an answer cell nobody has answered into. */
+export const NO_ANSWER_ROUND = 255n;
+
+/**
+ * Has the operator answered the query `turn` is asking? False at idle. The cell must carry
+ * this turn's round and this turn's query -- an older answer, or one to a query this seat
+ * never committed, does not count. Exactly `answered` in table.compact.
+ */
+export function answered(
+  turn: { stage: bigint; round: bigint; blinded: JubjubPoint },
+  cell: { round: bigint; blinded: JubjubPoint } | undefined,
+): boolean {
+  if (Number(turn.stage) === STAGE.idle || cell === undefined) return false;
+  return cell.round === turn.round && samePoint(cell.blinded, turn.blinded);
+}
+
+/** Is the PLAYER the one who owes the next move? Idle, or asked and answered. */
+export function playerOwes(
+  turn: { stage: bigint; round: bigint; blinded: JubjubPoint },
+  cell: { round: bigint; blinded: JubjubPoint } | undefined,
+): boolean {
+  return Number(turn.stage) === STAGE.idle || answered(turn, cell);
+}
