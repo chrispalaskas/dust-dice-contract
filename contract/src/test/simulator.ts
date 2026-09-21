@@ -696,16 +696,8 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    */
   #answer(seat: number): { response: JubjubPoint; proof: vrf.DleqProof } {
     const t = this.getLedger().seatTurn.lookup(BigInt(seat));
-    this.nonceCounter += 1n;
-    const nonce = vrf.randomScalar(
-      Uint8Array.from(
-        { length: 48 },
-        (_, i) => Number((this.nonceCounter * 2654435761n + BigInt(i * 13 + 3)) % 251n) + 1,
-      ),
-    );
-    return vrf.evaluate(this.config.vrfSecret, t.blinded, nonce);
+    return vrf.evaluate(this.config.vrfSecret, t.blinded);
   }
-  nonceCounter = 0n;
 
   /**
    * Rolls 2 AND 3, from one circuit.

@@ -108,6 +108,47 @@ describe('a turn played through the blind VRF', () => {
     }
   });
 
+  it('never reuses a DLEQ nonce, so the key cannot be extracted from two answers', () => {
+    // WHY THIS MATTERS. Two proofs under the SAME nonce k, over different challenges, give
+    // z1 - z2 = (c1 - c2)*x, so x falls out by one modular division — and a leaked x lets any
+    // player compute its own future rolls for every candidate hold and choose with
+    // foreknowledge. On-chain query counting does not catch that, because nothing is asked.
+    const pk = vrf.vrfPublicKeyOf(SECRET);
+    const q1 = vrf.blindQuery({
+      tableId: bytes32(0x11),
+      round: 0n,
+      rollIndex: 0n,
+      holdMask: 0n,
+      seatSecret: bytes32(0xa1),
+      blinding: 12345n,
+    }).blinded;
+    const q2 = vrf.blindQuery({
+      tableId: bytes32(0x11),
+      round: 0n,
+      rollIndex: 1n,
+      holdMask: 5n,
+      seatSecret: bytes32(0xa1),
+      blinding: 67890n,
+    }).blinded;
+
+    const e1 = vrf.evaluate(SECRET, q1);
+    const e2 = vrf.evaluate(SECRET, q2);
+    assert.ok(vrf.verifyDleq(pk, q1, e1.response, e1.proof), 'first answer must verify');
+    assert.ok(vrf.verifyDleq(pk, q2, e2.response, e2.proof), 'second answer must verify');
+
+    // Different queries must not share a1 = k*G — sharing it IS sharing the nonce.
+    assert.ok(
+      !vrf.samePoint(e1.proof.a1, e2.proof.a1),
+      'two different queries produced the same nonce commitment — x is extractable',
+    );
+
+    // The same query answered twice reproduces the identical proof. That is the harmless case:
+    // it is the same answer to the same question, and it is what makes the derivation safe.
+    const again = vrf.evaluate(SECRET, q1);
+    assert.ok(vrf.samePoint(again.proof.a1, e1.proof.a1), 'same query must be deterministic');
+    assert.equal(again.proof.z, e1.proof.z, 'same query must reproduce the same z');
+  });
+
   it("refuses an answer that is not this table's VRF", async () => {
     const sim = await TableSimulator.create(config());
     const skA = bytes32(0xa1);

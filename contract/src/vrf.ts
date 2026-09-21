@@ -93,16 +93,25 @@ export interface DleqProof {
  *
  * `c` is NOT part of the proof. It is a function of the transcript, so shipping it would let a
  * verifier that trusted it accept anything; the contract recomputes it, and so does `verifyDleq`
- * below. `nonce` must be fresh per answer — reusing one across two answers leaks `x`.
+ * below.
+ *
+ * THERE IS NO NONCE PARAMETER, deliberately. Reusing a nonce across two answers reveals `x`
+ * outright — two proofs with the same `k` give `z1 - z2 = (c1 - c2)*x` — and a leaked `x` lets
+ * any player compute its OWN future rolls for every candidate hold and pick with foreknowledge.
+ * On-chain query counting cannot catch that, because nothing is being asked. Leaving it to a
+ * caller, or to the quality of an RNG, is not good enough for the key that guards every roll on
+ * the table. `vrfNonce` derives it from the secret and the query instead: reuse across two
+ * different queries is impossible by construction, and reuse on the same query reproduces the
+ * identical proof — the same answer to the same question.
  */
 export function evaluate(
   secret: bigint,
   blinded: JubjubPoint,
-  nonce: bigint,
 ): {
   response: JubjubPoint;
   proof: DleqProof;
 } {
+  const nonce = mod(pureCircuits.vrfNonce(secret, blinded));
   const response = pureCircuits.vrfScalarMul(blinded, secret);
   const a1 = pureCircuits.vrfGeneratorMul(nonce);
   const a2 = pureCircuits.vrfScalarMul(blinded, nonce);
