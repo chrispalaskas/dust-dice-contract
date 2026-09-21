@@ -67,7 +67,6 @@ import {
 import {
   Contract as TableContract,
   ledger as tableLedger,
-  type Dice as TableDice,
   type Ledger as TableLedgerType,
   type UserAddress,
 } from '../managed/table/contract/index.js';
