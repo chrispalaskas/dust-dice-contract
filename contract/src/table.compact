@@ -1695,9 +1695,11 @@ export circuit playerMove(
                              ? HoldMask { bits: m }
                              : pend.hold2),
                // The dice this move revealed, so the next reroll knows what was kept and the
-               // score that follows is made on a roll the chain can see. Cleared on open,
-               // where there is nothing revealed yet.
-               roll: opening ? default<Dice> : revealedDice, }
+               // score that follows is made on a roll the chain can see. On an open there is
+               // nothing revealed yet, and the placeholder is all-ones — the same "no roll"
+               // sentinel `join` writes, NOT `default<Dice>`: zero is not a die face, and one
+               // invalid-looking representation is worse than none.
+               roll: opening ? Dice { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1 } : revealedDice, }
     );
 
   padTransaction();

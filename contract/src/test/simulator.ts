@@ -39,6 +39,7 @@ import {
   sampleContractAddress,
   type ChargedState,
   type ContractAddress,
+  type JubjubPoint,
 } from '@midnight-ntwrk/compact-runtime';
 import {
   Contract as DiceContract,
@@ -82,9 +83,11 @@ import {
   createTablePrivateState,
   lobbyWitnesses,
   tableWitnesses,
+  NO_GAMMA,
   type LobbyPrivateState,
   type TablePrivateState,
 } from '../table-witnesses.ts';
+import * as vrf from '../vrf.ts';
 
 export type { Scorecard, ScoreOutcome, TurnOutcome, TableLedgerType, UserAddress };
 
@@ -440,10 +443,10 @@ export type TableConfig = {
   tier: bigint;
   seats: bigint;
   rakeAddress: UserAddress;
-  /** The operator's roll seed. Its commitment is what reaches the constructor. */
-  seed: Uint8Array;
-  /** Committed seed hash. Defaults to `seedCommitmentTs(tableId, seed)`; override to reject. */
-  seedCommitment: Uint8Array;
+  /** The operator's VRF secret `x`. Its PUBLIC KEY is what reaches the constructor. */
+  vrfSecret: bigint;
+  /** Sealed public key. Defaults to `x*G`; override to make every answer unverifiable. */
+  vrfPublicKey: JubjubPoint;
   turnTimeoutSecs: bigint;
   tableTimeoutSecs: bigint;
   /** The table's play mode (docs/fast-turn-design.md): false = every roll on-chain. */
@@ -470,14 +473,18 @@ export type TableConfig = {
  * `blockTime` is still explicit everywhere. `createCircuitContext` defaults it to wall clock,
  * which makes any block-time-dependent test non-reproducible (docs/bugs-found.md #12).
  */
+/** The contract's `packHoldMask`, for building a query off chain. Position i is bit i. */
+const packMask = (mask: boolean[]): number =>
+  mask.reduce((acc, held, i) => acc + (held ? 1 << i : 0), 0);
+
 export class TableSimulator extends BaseSimulator<TablePrivateState> {
   table: TableContract<TablePrivateState>;
   config: TableConfig;
 
   constructor(config: TableConfig) {
-    // The constructor is the operator's transaction: it holds the seed, and no player exists
-    // yet.
-    super(createTablePrivateState({ rollSeed: config.seed }));
+    // The constructor is the operator's transaction, and it now needs NO secret at all: the
+    // VRF public key is a public argument and the operator holds `x` outside the contract.
+    super(createTablePrivateState({}));
     this.table = new TableContract<TablePrivateState>(tableWitnesses);
     this.config = config;
   }
@@ -495,7 +502,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         config.tier,
         config.seats,
         config.rakeAddress,
-        config.seedCommitment,
+        config.vrfPublicKey,
         config.turnTimeoutSecs,
         config.tableTimeoutSecs,
         config.fastMode,
@@ -511,13 +518,75 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   }
 
   /** Act as the operator: the seed is available, no player secret is. */
+  /**
+   * The operator has no witness left. Kept so the tests still read as "who is acting", and so
+   * that acting as the operator DROPS whatever player secret was loaded — which is what makes
+   * "the operator cannot make a player's move" a real test rather than an assumed one.
+   */
   asOperator(): void {
-    this.privateState = createTablePrivateState({ rollSeed: this.config.seed });
+    this.privateState = createTablePrivateState({});
   }
 
   /** Act as the player holding `sk` (and, on a private table, knowing `inviteCode`). */
   asPlayer(sk: Uint8Array, inviteCode?: Uint8Array): void {
     this.privateState = createTablePrivateState({ playerSecret: sk, inviteCode });
+    this.actingSecret = sk;
+  }
+
+  /**
+   * The blinding factor behind each seat's outstanding query, by seat.
+   *
+   * The real client keeps this in the browser between the move that asks and the move that
+   * reveals; the simulator keeps it here because one process plays every party. Losing it
+   * means losing the roll — the response on chain cannot be unblinded without it, which is
+   * the whole point.
+   */
+  blindings = new Map<number, bigint>();
+  /** The secret of whoever `asPlayer` last made current. */
+  actingSecret: Uint8Array = new Uint8Array(32);
+
+  /** A fresh blinding. Deterministic per call so a failing test replays identically. */
+  #nextBlinding(): bigint {
+    this.blindingCounter += 1n;
+    return vrf.randomScalar(
+      Uint8Array.from(
+        { length: 48 },
+        (_, i) => Number((this.blindingCounter * 1315423911n + BigInt(i * 7 + 1)) % 251n) + 1,
+      ),
+    );
+  }
+  blindingCounter = 0n;
+
+  /**
+   * The query for the roll a move is about to unlock, and the blinding kept to unblind it.
+   *
+   * `holdMask` is the hold the coming roll is taken UNDER, which for roll 1 is empty. The
+   * contract rebuilds this same point when the roll is revealed, so a query built on anything
+   * else is simply refused.
+   */
+  #query(seat: number, round: bigint, rollIndex: bigint, holdMask: boolean[]): JubjubPoint {
+    const rho = this.#nextBlinding();
+    this.blindings.set(seat, rho);
+    return vrf.blindQuery({
+      tableId: this.config.tableId,
+      round,
+      rollIndex,
+      holdMask: BigInt(packMask(holdMask)),
+      seatSecret: this.actingSecret,
+      blinding: rho,
+    }).blinded;
+  }
+
+  /** Unblind the answer on chain for `seat`, so the next move can reveal it. */
+  #reveal(seat: number): void {
+    const t = this.getLedger().seatTurn.lookup(BigInt(seat));
+    const rho = this.blindings.get(seat);
+    if (rho === undefined) throw new Error(`no blinding kept for seat ${seat}`);
+    this.privateState = {
+      ...this.privateState,
+      vrfBlinding: rho,
+      vrfGamma: vrf.unblind(t.response, rho),
+    };
   }
 
   join(payoutTo: UserAddress, now: number, blockTime = now): Promise<bigint> {
@@ -540,6 +609,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     entropy: Uint8Array,
     mask: boolean[],
     category: number,
+    nextBlinded: JubjubPoint,
     blockTime = DEFAULT_BLOCK_TIME,
   ): Promise<bigint> {
     this.blockTime = blockTime;
@@ -551,23 +621,51 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         entropy,
         mask,
         BigInt(category),
+        nextBlinded,
       ),
     );
   }
 
-  /** `playerMove(open)`: prove the secret, declare the forced entropy, await roll 1. */
+  /**
+   * `playerMove(open)`: prove the secret, declare the forced entropy, ASK FOR ROLL 1.
+   *
+   * The query rides along here because roll 1 is taken under no hold, so it is formable the
+   * moment the turn opens.
+   */
   openTurn(seat: number, entropy: Uint8Array, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
-    return this.playerMove(seat, MOVE_OPEN, entropy, NO_MASK(), 0, blockTime);
+    const round = this.getLedger().openRound;
+    const q = this.#query(seat, round, 0n, NO_MASK());
+    return this.playerMove(seat, MOVE_OPEN, entropy, NO_MASK(), 0, q, blockTime);
   }
 
-  /** `playerMove(hold)`: keep these dice and roll again. */
+  /**
+   * `playerMove(hold)`: reveal the roll just answered, keep these dice, and ask for the next.
+   *
+   * Both halves are one transaction, and that is the ordering guarantee: the query for the
+   * next roll is formed from the mask being written in this very move, so it cannot have been
+   * asked before the hold was fixed.
+   */
   hold(seat: number, mask: boolean[], blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
-    return this.playerMove(seat, MOVE_HOLD, ZERO_BYTES32(), mask, 0, blockTime);
+    this.#reveal(seat);
+    const t = this.getLedger().seatTurn.lookup(BigInt(seat));
+    const nextIndex = t.stage === 2n ? 1n : 2n;
+    const q = this.#query(seat, t.round, nextIndex, mask);
+    return this.playerMove(seat, MOVE_HOLD, ZERO_BYTES32(), mask, 0, q, blockTime);
   }
 
-  /** `playerMove(score)`: score the dice as they stand and end the turn. */
+  /** `playerMove(score)`: reveal the roll, score it, end the turn. */
   score(seat: number, category: number, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
-    return this.playerMove(seat, MOVE_SCORE, ZERO_BYTES32(), NO_MASK(), category, blockTime);
+    this.#reveal(seat);
+    // The turn ends here, so nothing will read this query. It still has to be a point.
+    return this.playerMove(
+      seat,
+      MOVE_SCORE,
+      ZERO_BYTES32(),
+      NO_MASK(),
+      category,
+      NO_GAMMA,
+      blockTime,
+    );
   }
 
   /**
@@ -575,12 +673,39 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * asserts the `stage` it is the successor of, so a skipped or repeated step is refused on
    * chain. Six seats have six independent pipelines and may be interleaved freely.
    */
-  resolveRoll1(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<TableDice> {
+  resolveRoll1(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<[]> {
     this.blockTime = blockTime;
+    const { response, proof } = this.#answer(seat);
     return this.run('resolveRoll1', (ctx) =>
-      this.table.impureCircuits.resolveRoll1(ctx, BigInt(seat)),
+      this.table.impureCircuits.resolveRoll1(
+        ctx,
+        BigInt(seat),
+        response,
+        proof.a1,
+        proof.a2,
+        proof.z,
+      ),
     );
   }
+
+  /**
+   * The operator's answer to the query already on chain for `seat`.
+   *
+   * It reads `blinded` off the ledger rather than being told it: the operator answers the
+   * question that was ASKED, and the contract admits one per (seat, round, rollIndex).
+   */
+  #answer(seat: number): { response: JubjubPoint; proof: vrf.DleqProof } {
+    const t = this.getLedger().seatTurn.lookup(BigInt(seat));
+    this.nonceCounter += 1n;
+    const nonce = vrf.randomScalar(
+      Uint8Array.from(
+        { length: 48 },
+        (_, i) => Number((this.nonceCounter * 2654435761n + BigInt(i * 13 + 3)) % 251n) + 1,
+      ),
+    );
+    return vrf.evaluate(this.config.vrfSecret, t.blinded, nonce);
+  }
+  nonceCounter = 0n;
 
   /**
    * Rolls 2 AND 3, from one circuit.
@@ -589,10 +714,18 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * no way for a caller to ask for the wrong one. The merge is forced by the deploy ceiling; see
    * section 8 of table.compact's header.
    */
-  resolveReroll(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<TableDice> {
+  resolveReroll(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<[]> {
     this.blockTime = blockTime;
+    const { response, proof } = this.#answer(seat);
     return this.run('resolveReroll', (ctx) =>
-      this.table.impureCircuits.resolveReroll(ctx, BigInt(seat)),
+      this.table.impureCircuits.resolveReroll(
+        ctx,
+        BigInt(seat),
+        response,
+        proof.a1,
+        proof.a2,
+        proof.z,
+      ),
     );
   }
 
@@ -635,10 +768,10 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     );
   }
 
-  /** `settle` declares no time: the seed-waiver deadline is a kernel predicate. */
-  settle(seed: Uint8Array, q: bigint, r: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+  /** `settle` declares no time: the key-waiver deadline is a kernel predicate. */
+  settle(vrfSecret: bigint, q: bigint, r: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('settle', (ctx) => this.table.impureCircuits.settle(ctx, seed, q, r));
+    return this.run('settle', (ctx) => this.table.impureCircuits.settle(ctx, vrfSecret, q, r));
   }
 
   /** Pay one seat what it is personally owed. Legal only once the table is terminal. */

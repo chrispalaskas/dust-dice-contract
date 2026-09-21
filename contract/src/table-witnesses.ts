@@ -23,7 +23,8 @@
  *   modalFaceHint         derived, not stored. Computed from `rollSeed` on demand.
  *
  * `TablePrivateState` carries all three fields because the simulator drives every party from
- * one process. A real client populates only the fields it owns and leaves the others zeroed;
+ * one process. A real client populates only the fields it owns and leaves the others at their
+ * defaults;
  * a circuit that needs a secret the caller does not have simply fails its assert, which is the
  * intended behaviour and is what src/test/table.test.ts exercises.
  *
@@ -31,19 +32,27 @@
  * the level-backed private-state provider silently drops those (bugs-found.md §0, #12/#18).
  */
 
-import type { WitnessContext } from '@midnight-ntwrk/compact-runtime';
-import { deriveDiceTs, rollContext } from './dice-mirror.ts';
-import { modalFace } from './policy-mirror.ts';
+import type { JubjubPoint, WitnessContext } from '@midnight-ntwrk/compact-runtime';
 
 /** Everything a prover might hold locally for one table. */
 export type TablePrivateState = {
-  /** The operator's roll seed for this table. 32 bytes. Operator only. */
-  readonly rollSeed: Uint8Array;
   /** The acting player's entropy secret `sk_s`. 32 bytes. Player only. */
   readonly playerSecret: Uint8Array;
   /** A private table's invite code. 32 bytes. Joiner only; zeros on a public table. */
   readonly inviteCode: Uint8Array;
+  /**
+   * The blinding factor for the roll the player is about to reveal. Player only.
+   *
+   * UNLIKE THE OTHER TWO, THIS ROTATES. A fresh one per roll — reusing a blinding across two
+   * rolls would let the operator link the two queries. The client sets it before each reveal.
+   */
+  readonly vrfBlinding: bigint;
+  /** The unblinded VRF output for the roll being revealed, `Gamma = rho^-1 * S`. Player only. */
+  readonly vrfGamma: JubjubPoint;
 };
+
+/** The point a private state carries when no roll is being revealed. */
+export const NO_GAMMA: JubjubPoint = { x: 0n, y: 1n };
 
 const THIRTY_TWO_ZEROS = (): Uint8Array => new Uint8Array(32);
 
@@ -53,12 +62,18 @@ function requireBytes32(name: string, value: Uint8Array): Uint8Array {
 }
 
 export function createTablePrivateState(
-  parts: { rollSeed?: Uint8Array; playerSecret?: Uint8Array; inviteCode?: Uint8Array } = {},
+  parts: {
+    playerSecret?: Uint8Array;
+    inviteCode?: Uint8Array;
+    vrfBlinding?: bigint;
+    vrfGamma?: JubjubPoint;
+  } = {},
 ): TablePrivateState {
   return {
-    rollSeed: requireBytes32('rollSeed', parts.rollSeed ?? THIRTY_TWO_ZEROS()),
     playerSecret: requireBytes32('playerSecret', parts.playerSecret ?? THIRTY_TWO_ZEROS()),
     inviteCode: requireBytes32('inviteCode', parts.inviteCode ?? THIRTY_TWO_ZEROS()),
+    vrfBlinding: parts.vrfBlinding ?? 1n,
+    vrfGamma: parts.vrfGamma ?? NO_GAMMA,
   };
 }
 
@@ -85,35 +100,31 @@ export const tableWitnesses = {
     privateState.playerSecret,
   ],
 
-  rollSeed: <L>({
+  /**
+   * The blinding factor for the roll this move reveals.
+   *
+   * The operator has NO witness here any more. It used to hold `rollSeed`, and knowledge of
+   * that preimage was its authority; its authority is now the DLEQ it publishes with each
+   * answer, which is checked on chain against the sealed public key.
+   */
+  vrfBlinding: <L>({
     privateState,
-  }: WitnessContext<L, TablePrivateState>): [TablePrivateState, Uint8Array] => [
+  }: WitnessContext<L, TablePrivateState>): [TablePrivateState, bigint] => [
     privateState,
-    privateState.rollSeed,
+    privateState.vrfBlinding,
   ],
 
   /**
-   * The modal face of this turn's roll 1 -- the witness-the-answer half of `KeepModal`.
+   * The unblinded VRF output for the roll this move reveals.
    *
-   * Re-derives roll 1 from the seed with the TypeScript dice mirror. It takes the roll's PUBLIC
-   * determinants as arguments (`tableId`, the digest-mixed entropy, the round) rather than the
-   * dice themselves, so the circuit derives roll 1 exactly once instead of deriving it a second
-   * time purely to feed this witness.
-   *
-   * Returning a wrong face here does not corrupt a game: `resolveDiceChecked` proves the value
-   * is THE modal face of roll 1 under api/src/policies.ts's tie-break, so a wrong answer
-   * produces no transaction. This function is a convenience, not a trusted input, which is why
-   * it can afford to be unconditional -- it computes a modal face even for the five policies
-   * that ignore it, and the circuit's check is likewise guarded on the policy.
+   * A wrong value here does not corrupt a game, it produces no transaction: the circuit proves
+   * `S == rho*Gamma` against the response the operator already put on chain.
    */
-  modalFaceHint: <L>(
-    { privateState }: WitnessContext<L, TablePrivateState>,
-    tableId: Uint8Array,
-    mixed: Uint8Array,
-    round: bigint,
-  ): [TablePrivateState, bigint] => [
+  vrfGamma: <L>({
     privateState,
-    BigInt(modalFace(deriveDiceTs(rollContext(tableId, privateState.rollSeed, mixed, round, 0)))),
+  }: WitnessContext<L, TablePrivateState>): [TablePrivateState, JubjubPoint] => [
+    privateState,
+    privateState.vrfGamma,
   ],
 };
 

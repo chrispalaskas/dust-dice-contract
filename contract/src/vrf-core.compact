@@ -109,3 +109,29 @@ export pure circuit packHoldMask(mask: Vector<5, Boolean>): Uint<8> {
   const b4 = mask[4] ? 16 : 0;
   return (b0 + b1 + b2 + b3 + b4) as Uint<8>;
 }
+
+// ---------------------------------------------------------------------------------------
+// The curve operations, exported so the OFF-CHAIN halves can be built from the contract's own
+// arithmetic rather than a second implementation of Jubjub.
+//
+// The operator needs `S = x*B`, `A1 = k*G` and `A2 = k*B`; the player needs `B = rho*P` and
+// `Gamma = rho^-1 * S`. Reimplementing those in TypeScript is how this class of protocol
+// usually dies — a curve detail differs, and the failure surfaces as "invalid proof" with
+// nothing pointing at the arithmetic. These are pure circuits, so they carry no verifier key
+// and do not count against the nine-circuit deploy ceiling (bugs-found.md #16).
+// ---------------------------------------------------------------------------------------
+
+/** `s * p`. The scalar is reduced mod r, as everything else here does. */
+export pure circuit vrfScalarMul(p: JubjubPoint, s: Field): JubjubPoint {
+  return ecMul(p, s as JubjubScalar);
+}
+
+/** `s * G`. Used for the public key and for the DLEQ's first commitment. */
+export pure circuit vrfGeneratorMul(s: Field): JubjubPoint {
+  return ecMulGenerator(s as JubjubScalar);
+}
+
+/** `a + b`. */
+export pure circuit vrfPointAdd(a: JubjubPoint, b: JubjubPoint): JubjubPoint {
+  return ecAdd(a, b);
+}
