@@ -161,3 +161,42 @@ export pure circuit vrfNonce(secret: Field, blinded: JubjubPoint): Field {
     jubjubPointY(blinded),
   ]);
 }
+
+/**
+ * The player's blinding for one roll, DERIVED from the seat secret rather than drawn.
+ *
+ * `rho` must be unpredictable to the operator and distinct per query; deriving it from `sk_s`
+ * and the roll's position gives both, and it removes the one piece of state the browser would
+ * otherwise have to keep between the move that asks and the move that reveals. A player who
+ * reloads, or opens the table on another device, recomputes exactly the blinding it used; a
+ * lost blinding would otherwise mean an answer on chain that nobody can ever unblind, and a
+ * seat stuck until it times out. The domain tag keeps it apart from `vrfChallenge` (no tag),
+ * `vrfNonce` (17) and the entropy/commitment hashes.
+ */
+export pure circuit vrfBlindingFor(
+  sk: Bytes<32>,
+  tableId: Bytes<32>,
+  round: Uint<8>,
+  rollIndex: Uint<8>,
+  holdMask: Uint<8>,
+): Field {
+  const meta = (round as Field) * 65536 + (rollIndex as Field) * 256 + (holdMask as Field);
+  return transientHash<Vector<4, Bytes<32>>>([
+    pad(32, "dust-dice:v2:vrf-blinding"),
+    tableId,
+    meta as Bytes<32>,
+    sk,
+  ]);
+}
+
+/**
+ * The table's VRF secret `x`, derived from the operator's 32 random bytes.
+ *
+ * The operator already generates, fsyncs and guards one 32-byte secret per table (it was the
+ * roll seed); this keeps that material and its handling unchanged and derives the scalar from
+ * it, so nothing about how the secret is stored or protected has to move. Reduced mod r by the
+ * `as JubjubScalar` cast at every use.
+ */
+export pure circuit vrfSecretFromSeed(seed: Bytes<32>): Field {
+  return transientHash<Vector<2, Bytes<32>>>([pad(32, "dust-dice:v2:vrf-secret"), seed]);
+}

@@ -171,3 +171,35 @@ export function rollDigestFor(args: {
 /** The contract's `packHoldMask`: position i is bit i. */
 export const packHoldMask = (mask: readonly boolean[]): bigint =>
   mask.reduce<bigint>((acc, held, i) => acc + (held ? 1n << BigInt(i) : 0n), 0n);
+
+/**
+ * The blinding for one roll, derived from the seat secret and the roll's position.
+ *
+ * Nothing to store, nothing to lose: a reload or another device recomputes exactly the value
+ * used. Unpredictable to the operator because `sk_s` is in it; distinct per query because the
+ * position is. See `vrfBlindingFor` in vrf-core.compact for why this beats a random draw here.
+ */
+export function deriveBlinding(args: {
+  seatSecret: Uint8Array;
+  tableId: Uint8Array;
+  round: bigint;
+  rollIndex: bigint;
+  holdMask: bigint;
+}): bigint {
+  return mod(
+    pureCircuits.vrfBlindingFor(
+      args.seatSecret,
+      args.tableId,
+      args.round,
+      args.rollIndex,
+      args.holdMask,
+    ),
+  );
+}
+
+/**
+ * The table's VRF secret `x` from the operator's 32 random bytes -- the same material the
+ * operator already generates, fsyncs and guards per table.
+ */
+export const vrfSecretFromSeed = (seed: Uint8Array): bigint =>
+  mod(pureCircuits.vrfSecretFromSeed(seed));
