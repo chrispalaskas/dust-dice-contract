@@ -1,0 +1,111 @@
+// Blind-VRF primitives, shared by `table.compact` and the measurement contracts.
+//
+// The protocol is docs/vrf-dice.md; `probes/vrf` in the private repo implements the same thing
+// in TypeScript over these very circuits and attacks it, including the forgery that a
+// witnessed challenge would admit. Everything here is the on-chain half.
+//
+// THE CHALLENGE IS DERIVED, NEVER SUPPLIED. A prover free to choose `c` alongside `a1` and `a2`
+// satisfies both DLEQ equations for ANY response: pick z and c, set a1 = z*G - c*PK and
+// a2 = z*B - c*S, and they hold identically. That is precisely the operator-player collusion
+// the DLEQ exists to stop, so `vrfChallenge` hashes the transcript the equations are about.
+//
+// WHY THIS NEEDS COMPILER 0.34. A transcript hash is a `Field` (~2^255) and Jubjub's scalar
+// order is ~2^252, so most hashes are out of range and must be reduced before they can be a
+// scalar. `as JubjubScalar` is that reduction. Measured: 245 of 300 real transcript hashes
+// exceed r; on 0.31.1 every one was rejected by `ecMul` ("failed to decode for built-in type
+// EmbeddedFr") and there was nothing in that toolchain to reduce them.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+/**
+ * The VRF input point for one roll: `P = hashToCurve(tableId, round, rollIndex, holdMask, sk)`.
+ *
+ * `sk` is what makes `P` unformable by anyone but this seat. Everything else in it is public,
+ * and a public input would let the operator evaluate the VRF for every seat in advance — the
+ * blinding would then protect the wire and nothing else. `holdMask` is the PREVIOUS roll's
+ * holds, which is what stops a query for roll i+1 being formed before hold i is fixed.
+ *
+ * HASHED IN THE BYTES DOMAIN, deliberately. `tableId as Field` and `sk as Field` are traps: a
+ * Bytes<32> is a 256-bit value and the Field modulus is ~2^255, so roughly half of all real
+ * values are out of range and the cast fails AT RUNTIME with "exceeds maximum value of Field
+ * type" — on half the tables, and only once one is played. Field to Bytes<32> is always
+ * defined, so `meta` goes that way instead. The three counters pack into one Field injectively
+ * because each is a Uint<8>.
+ */
+export pure circuit vrfInputPoint(
+  tableId: Bytes<32>,
+  round: Uint<8>,
+  rollIndex: Uint<8>,
+  holdMask: Uint<8>,
+  sk: Bytes<32>,
+): JubjubPoint {
+  const meta = (round as Field) * 65536 + (rollIndex as Field) * 256 + (holdMask as Field);
+  return hashToCurve<Bytes<32>>(persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "dust-dice:v2:vrf-input"),
+    tableId,
+    meta as Bytes<32>,
+    sk,
+  ]));
+}
+
+/** The Fiat-Shamir challenge over the whole DLEQ transcript. See the header. */
+export pure circuit vrfChallenge(
+  pk: JubjubPoint,
+  blinded: JubjubPoint,
+  response: JubjubPoint,
+  a1: JubjubPoint,
+  a2: JubjubPoint,
+): Field {
+  return transientHash<Vector<10, Field>>([
+    jubjubPointX(pk), jubjubPointY(pk),
+    jubjubPointX(blinded), jubjubPointY(blinded),
+    jubjubPointX(response), jubjubPointY(response),
+    jubjubPointX(a1), jubjubPointY(a1),
+    jubjubPointX(a2), jubjubPointY(a2),
+  ]);
+}
+
+/**
+ * Chaum-Pedersen: the key behind `pk` is the one that produced `response` from `blinded`.
+ *
+ * Written as `z*G == A1 + c*PK` rather than `A1 == z*G - c*PK` so that no negation is needed.
+ * Returns true/false rather than asserting, so the caller words the failure in its own terms.
+ */
+export pure circuit vrfDleqHolds(
+  pk: JubjubPoint,
+  blinded: JubjubPoint,
+  response: JubjubPoint,
+  a1: JubjubPoint,
+  a2: JubjubPoint,
+  z: Field,
+): Boolean {
+  const c = vrfChallenge(pk, blinded, response, a1, a2);
+  const first = ecMulGenerator(z as JubjubScalar) == ecAdd(a1, ecMul(pk, c as JubjubScalar));
+  const second = ecMul(blinded, z as JubjubScalar) == ecAdd(a2, ecMul(response, c as JubjubScalar));
+  return first && second;
+}
+
+/**
+ * The 32 bytes a roll's dice are expanded from: `H("dust-dice:v2:roll", H(gamma.x, gamma.y))`.
+ *
+ * Deliberately the same shape as the seed-era digest so the ladder in `dice-core` is unchanged
+ * — only where the 32 bytes come from moves.
+ */
+export pure circuit vrfRollDigest(gamma: JubjubPoint): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([
+    pad(32, "dust-dice:v2:roll"),
+    persistentHash<Vector<2, Field>>([jubjubPointX(gamma), jubjubPointY(gamma)]),
+  ]);
+}
+
+/** Pack a hold mask into the byte the VRF input commits to. Position i is bit i. */
+export pure circuit packHoldMask(mask: Vector<5, Boolean>): Uint<8> {
+  const b0 = mask[0] ? 1 : 0;
+  const b1 = mask[1] ? 2 : 0;
+  const b2 = mask[2] ? 4 : 0;
+  const b3 = mask[3] ? 8 : 0;
+  const b4 = mask[4] ? 16 : 0;
+  return (b0 + b1 + b2 + b3 + b4) as Uint<8>;
+}

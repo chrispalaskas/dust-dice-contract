@@ -293,6 +293,7 @@ pragma language_version >= 0.26;
 import CompactStandardLibrary;
 
 include "dice-core";
+include "vrf-core";
 
 include "scoring-core";
 
@@ -536,7 +537,7 @@ export sealed ledger rakeAddress: UserAddress;
  *
  * Checked by all three `resolveRoll` steps and -- before the table deadline -- by `settle`.
  */
-export sealed ledger seedCommitment: Bytes<32>;
+export sealed ledger vrfPublicKey: JubjubPoint;
 
 /**
  * How long a whole round gets, in seconds. Past it, seats that owe a move can be eliminated.
@@ -631,13 +632,15 @@ export ledger roundDeadline: Uint<64>;
 export ledger pot: Uint<64>;
 
 /**
- * The seed, once `settle` has revealed it. Zeros before -- and zeros forever on a force-settle.
+ * The table's VRF secret `x`, once `settle` has revealed it. Zero before -- and zero forever on
+ * a force-settle.
  *
- * A non-zero value is the game's certificate of verifiability: it opens `seedCommitment`, so
- * anyone can replay every roll from the public log. `revealedSeed == 0` on a settled table is a
- * meaningful state ("paid but unverifiable"), not a "not settled yet" state.
+ * A non-zero value is the game's certificate of verifiability: `x*G == vrfPublicKey`, so anyone
+ * can recompute every seat's `Gamma = x*P` from the public log and replay every roll.
+ * `revealedVrfSecret == 0` on a settled table is a meaningful state ("paid but unverifiable"),
+ * not a "not settled yet" state.
  */
-export ledger revealedSeed: Bytes<32>;
+export ledger revealedVrfSecret: Field;
 
 /** Winning seat, once settled. Meaningless before. */
 export ledger winnerSeatIndex: Uint<8>;
@@ -733,6 +736,24 @@ export struct SeatTurn {
   round: Uint<8>,
   /** `H(sk_s, tableId, round)`, proven against the seat's join-time commitment when opened. */
   entropy: Bytes<32>,
+  /**
+   * `B = rho*P`, the blinded VRF query for the roll this seat is WAITING on.
+   *
+   * Written by the player, in the same transaction that fixes the hold the query commits to —
+   * which is what makes the ordering real rather than witnessed. It is ON CHAIN, and that is
+   * the load-bearing part: the contract admits one query per (seat, round, rollIndex), so a
+   * player cannot ask for several candidate holds and keep the best. Move this exchange
+   * off-chain and that guarantee goes with it.
+   */
+  blinded: JubjubPoint,
+  /**
+   * `S = x*B`, the operator's answer, with its DLEQ already verified against `vrfPublicKey`.
+   *
+   * The dice are NOT derivable from this by anyone but the seat: unblinding needs `rho`. So a
+   * resolve no longer publishes the roll — it publishes an answer only the player can read,
+   * and the player reveals the dice with its next move.
+   */
+  response: JubjubPoint,
   /**
    * `mixEntropy(entropy, roundDigest)`, latched by `resolveRoll1`.
    *
@@ -899,13 +920,21 @@ witness playerEntropySecret(): Bytes<32>;
 witness inviteCode(): Bytes<32>;
 
 /**
- * The operator's roll seed, held off-chain until settlement.
+ * The player's blinding factor for the roll it is about to reveal.
  *
- * Knowledge of it IS the resolve circuits' authority: each checks it against the committed
- * `H(tableId, seed)`, and only the operator can produce a preimage. The seed is never disclosed
- * mid-game -- a resolve reveals only the resulting dice.
+ * Fresh and random per roll, chosen in the browser and never sent anywhere. It is what stops
+ * the operator recognising the point it was asked to evaluate: it sees `B = rho*P` and, with
+ * `rho` uniform, that tells it nothing about `P`.
  */
-witness rollSeed(): Bytes<32>;
+witness vrfBlinding(): Field;
+
+/**
+ * The unblinded VRF output for the roll being revealed: `Gamma = rho^-1 * S = x * P`.
+ *
+ * Computed in the browser from the operator's on-chain response. The contract never inverts a
+ * scalar — it checks `S == rho*Gamma`, which says the same thing.
+ */
+witness vrfGamma(): JubjubPoint;
 
 // ===========================================================================================
 // Domain-separated event hashing
@@ -1206,7 +1235,7 @@ constructor(id: Bytes<32>,
             stake: Uint<64>,
             seats: Uint<8>,
             rakeTo: UserAddress,
-            seedCommit: Bytes<32>,
+            vrfPk: JubjubPoint,
             turnTimeout: Uint<64>,
             tableTimeout: Uint<64>,
             fast: Boolean,
@@ -1235,7 +1264,7 @@ constructor(id: Bytes<32>,
   tier = disclose(stake);
   seatLimit = disclose(seats);
   rakeAddress = disclose(rakeTo);
-  seedCommitment = disclose(seedCommit);
+  vrfPublicKey = disclose(vrfPk);
   turnTimeoutSecs = disclose(turnTimeout);
   tableTimeoutSecs = disclose(tableTimeout);
   fastMode = disclose(fast);
@@ -1252,7 +1281,7 @@ constructor(id: Bytes<32>,
   // changes behaviour -- it is here so the initial value of a field is a statement in the source
   // rather than an inference about Compact's defaults (docs/security-review.md §5). Two are
   // load-bearing enough to say out loud: `roundDeadline` STAYS 0 so an empty table has no fill
-  // clock and cannot be aborted, and `revealedSeed` STAYS zero until a settlement that actually
+  // clock and cannot be aborted, and `revealedVrfSecret` STAYS zero until a settlement that actually
   // opened the commitment writes it.
   //
   // `padStore` is deliberately NOT initialised: it is a transaction-padding sink, not state, and
@@ -1262,7 +1291,7 @@ constructor(id: Bytes<32>,
   openRound = 0;
   roundDeadline = 0;
   pot = 0;
-  revealedSeed = default<Bytes<32>>;
+  revealedVrfSecret = 0 as Field;
   winnerSeatIndex = 0;
   finalDigest = default<Bytes<32>>;
   started = false;
@@ -1298,6 +1327,9 @@ constructor(id: Bytes<32>,
       SeatTurn { stage: stageIdle(),
                  round: 0,
                  entropy: default<Bytes<32>>,
+                 // No query outstanding and no answer to spend: an idle seat has asked nothing.
+                 blinded: default<JubjubPoint>,
+                 response: default<JubjubPoint>,
                  mixed: default<Bytes<32>>,
                  hold1: default<HoldMask>,
                  hold2: default<HoldMask>,
@@ -1475,6 +1507,7 @@ export circuit playerMove(
                  entropy: Bytes<32>,
                  mask: Vector<5, Boolean>,
                  category: Uint<8>,
+                 nextBlinded: JubjubPoint,
                  ): Uint<8> {
   assert(phase == Phase.playing, "playerMove: table is not playing");
 
@@ -1534,9 +1567,56 @@ export circuit playerMove(
          );
   assert(!scoring || between, "playerMove: nothing has been rolled to score");
 
+  // ---- reveal the roll this move acts on ------------------------------------------------
+  //
+  // The operator's resolve published `S = x*B` and learned nothing from it; the dice appear
+  // here, in the PLAYER's transaction, because unblinding needs `rho`. Three things are
+  // checked and they are not interchangeable:
+  //
+  //   1. `P` is rebuilt from ledger state — this table, this round, this roll index, and the
+  //      hold that PRECEDED this roll — plus the seat's own secret. A player cannot point the
+  //      VRF at an input of its choosing; every field but `sk` is one the contract already
+  //      knows, and `sk` is the one the join commitment pinned.
+  //   2. `B == rho*P` ties the query the operator actually answered to that `P`.
+  //   3. `S == rho*Gamma` unblinds it, stated that way so no scalar inverse is needed here.
+  //
+  // Together they say: this Gamma is `x*P` for this exact roll, and the operator's DLEQ at
+  // resolve time already said the `x` was the sealed one. The dice follow from Gamma alone.
+  const rho = vrfBlinding();
+  const gamma = vrfGamma();
+  const revealIndex = (pend.stage == stageRolled1() ? 0 : (pend.stage == stageRolled2() ? 1 : 2))
+                        as Uint<8>;
+  // The hold that the roll being revealed was taken UNDER. Roll 1 is taken under no hold, so
+  // the mask is empty — which is also what makes roll 1's query formable at open time.
+  const priorHold = pend.stage == stageRolled1()
+                      ? default<Vector<5, Boolean>>
+                      : (pend.stage == stageRolled2() ? pend.hold1.bits : pend.hold2.bits);
+  const inputPoint = vrfInputPoint(tableId, pend.round, revealIndex, packHoldMask(priorHold), sk);
+  assert(disclose(!between || ecMul(inputPoint, rho as JubjubScalar) == pend.blinded),
+         "playerMove: the blinded query on chain is not this seat's input point blinded"
+         );
+  assert(disclose(!between || ecMul(gamma, rho as JubjubScalar) == pend.response),
+         "playerMove: gamma does not unblind the operator's response"
+         );
+
+  // The ladder is UNCHANGED — only where its 32 bytes come from moves, from the seed to the
+  // VRF output. Same domain tags, same rejection thresholds, same distribution, so every
+  // property the dice tests pin still holds.
+  const freshDice = deriveDice(rollContext(tableId, vrfRollDigest(gamma), pend.mixed,
+                                           pend.round, revealIndex));
+  // ONE disclosure point for the roll, and it is the whole of what this transaction makes
+  // public about `gamma`. The dice are meant to be public — every roll lands on chain, which
+  // is what lets a spectator follow the game and a replay check it. What stays private is
+  // `rho` and `gamma` themselves, and with them the operator's ability to have known the dice
+  // before the player did.
+  const revealed = disclose(revealIndex == 0
+                              ? freshDice
+                              : mergeStream(priorHold, fromDice(pend.roll), freshDice));
+  const revealedDice = toDice(revealed);
+
   // ---- score ---------------------------------------------------------------------------
   const card = seatCard.lookup(s);
-  const d = fromDice(pend.roll);
+  const d = revealed;
   const outcome = applyScore(cat, d, card.filled, card.scores[11]);
   assert(!scoring || outcome.validPlacement,
          "playerMove: illegal placement -- box taken, or joker rules violated"
@@ -1564,8 +1644,10 @@ export circuit playerMove(
                      // here (asserted above), but writing the invariant down is cheaper than
                      // relying on it.
                      eliminated: prog.eliminated,
-                     // What `closeRound` folds into the round digest.
-                     dice: pend.roll, }
+                     // What `closeRound` folds into the round digest. The roll this score is
+                     // being made on, which is the one revealed above rather than a cell the
+                     // operator wrote.
+                     dice: revealedDice, }
       );
   }
 
@@ -1584,6 +1666,16 @@ export circuit playerMove(
     s,
     SeatTurn { stage: nextStage,
                round: r,
+               // The query for the roll this move unlocks. On an open that is roll 1, taken
+               // under no hold; on a hold it is the next reroll, taken under the mask being
+               // written in this very transaction — which is what makes "the hold was fixed
+               // before the roll was asked for" a fact about the chain rather than a promise.
+               // A score ends the turn, so its value is never read; the sentinel assert below
+               // still pins it so the public log has one representation.
+               blinded: disclose(nextBlinded),
+               // Cleared: the answer to the previous query has been spent by the reveal above,
+               // and leaving it would let a later move re-check against a stale response.
+               response: default<JubjubPoint>,
                // Written on open, carried afterwards. A hold or a score cannot change it -- the
                // sentinel assert above already forces `e` to zeros for those kinds.
                entropy: opening ? e : pend.entropy,
@@ -1602,7 +1694,10 @@ export circuit playerMove(
                         : (holding && pend.stage == stageRolled2()
                              ? HoldMask { bits: m }
                              : pend.hold2),
-               roll: pend.roll, }
+               // The dice this move revealed, so the next reroll knows what was kept and the
+               // score that follows is made on a roll the chain can see. Cleared on open,
+               // where there is nothing revealed yet.
+               roll: opening ? default<Dice> : revealedDice, }
     );
 
   padTransaction();
@@ -1652,7 +1747,12 @@ export circuit playerMove(
  *
  * Touches exactly ONE map, and that is deliberate -- this circuit is at k=15 with no headroom.
  */
-export circuit resolveRoll1(seat: Uint<8>): Dice {
+export circuit resolveRoll1(seat: Uint<8>,
+                            response: JubjubPoint,
+                            dleqA1: JubjubPoint,
+                            dleqA2: JubjubPoint,
+                            dleqZ: Field,
+                            ): [] {
   assert(phase == Phase.playing, "resolveRoll1: table is not playing");
 
   const s = disclose(seat);
@@ -1663,30 +1763,34 @@ export circuit resolveRoll1(seat: Uint<8>): Dice {
   // own guard to have held. Reading `openRound` is free: it cannot move while a roll is pending.
   assert(t.round == openRound, "resolveRoll1: pending turn is not in the open round");
 
-  const seed = rollSeed();
-  assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
-         "resolveRoll1: seed does not open the table's seed commitment"
+  // THE OPERATOR NO LONGER LEARNS THE DICE. It applies the table key to a point it cannot
+  // interpret and proves it used that key; `Gamma`, and so the roll, needs `rho`, which only
+  // the player has. What the operator's authority now rests on is the DLEQ rather than a seed
+  // preimage: exactly one `S` has a valid proof for a given `B`, so it can neither choose the
+  // answer nor aim it.
+  assert(disclose(vrfDleqHolds(vrfPublicKey, t.blinded, disclose(response), disclose(dleqA1),
+                               disclose(dleqA2), disclose(dleqZ))),
+         "resolveRoll1: the response is not this table's VRF applied to the seat's query"
          );
 
-  // `mixed` needs NO `disclose`, and the asymmetry is the point: it is a hash of the seat's
-  // entropy and the round digest, both public ledger reads, so anyone could already compute it.
-  // The dice below DO need one, because they depend on `seed`.
+  // `mixed` needs NO `disclose`: it is a hash of the seat's entropy and the round digest, both
+  // public ledger reads, so anyone could already compute it.
   const mixed = mixEntropy(t.entropy, roundDigest);
-  const dice = disclose(toDice(firstRoll(tableId, seed, mixed, t.round)));
 
   seatTurn.insert(
     s,
     SeatTurn { stage: stageRolled1(),
                round: t.round,
                entropy: t.entropy,
+               blinded: t.blinded,
+               response: disclose(response),
                mixed: mixed,
                hold1: t.hold1,
                hold2: t.hold2,
-               roll: dice, }
+               roll: t.roll, }
     );
 
   padTransaction();
-  return dice;
 }
 
 /**
@@ -1714,7 +1818,12 @@ export circuit resolveRoll1(seat: Uint<8>): Dice {
  * policy-core.compact. Writes no seat progress: the turn is still in progress and the player may
  * still stop and score after either reroll.
  */
-export circuit resolveReroll(seat: Uint<8>): Dice {
+export circuit resolveReroll(seat: Uint<8>,
+                             response: JubjubPoint,
+                             dleqA1: JubjubPoint,
+                             dleqA2: JubjubPoint,
+                             dleqZ: Field,
+                             ): [] {
   assert(phase == Phase.playing, "resolveReroll: table is not playing");
 
   const s = disclose(seat);
@@ -1723,40 +1832,29 @@ export circuit resolveReroll(seat: Uint<8>): Dice {
   const third = t.stage == stageAwaitRoll3();
   assert(second || third, "resolveReroll: this seat is not awaiting a reroll");
 
-  const seed = rollSeed();
-  assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
-         "resolveReroll: seed does not open the table's seed commitment"
+  // Same as roll 1: answer the query on chain, prove the key, learn nothing. Which roll this
+  // is comes from the seat's own stage, and the query it answers was fixed by the player in
+  // the transaction that set the hold — so the operator cannot be asked a second question for
+  // the same (seat, round, rollIndex) without another on-chain move.
+  assert(disclose(vrfDleqHolds(vrfPublicKey, t.blinded, disclose(response), disclose(dleqA1),
+                               disclose(dleqA2), disclose(dleqZ))),
+         "resolveReroll: the response is not this table's VRF applied to the seat's query"
          );
-
-  // Which mask and which roll hash, decided by the seat's own stage and by nothing else. The
-  // two hold cells exist precisely so that this selection is a read rather than a rewrite.
-  const hold = second ? t.hold1.bits : t.hold2.bits;
-  const rollIndex = (second ? 1 : 2) as Uint<8>;
-
-  const dice = disclose(toDice(rerollUnderMask(
-                                 tableId,
-                                 seed,
-                                 t.mixed,
-                                 t.round,
-                                 rollIndex,
-                                 hold,
-                                 fromDice(t.roll)
-                                 )
-                               ));
 
   seatTurn.insert(
     s,
     SeatTurn { stage: second ? stageRolled2() : stageRolled3(),
                round: t.round,
                entropy: t.entropy,
+               blinded: t.blinded,
+               response: disclose(response),
                mixed: t.mixed,
                hold1: t.hold1,
                hold2: t.hold2,
-               roll: dice, }
+               roll: t.roll, }
     );
 
   padTransaction();
-  return dice;
 }
 
 // ===========================================================================================
@@ -2002,6 +2100,10 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
     SeatTurn { stage: stageIdle(),
                round: pend.round,
                entropy: pend.entropy,
+               // An eliminated seat's outstanding query and unspent answer are cleared: there
+               // is no move left that could reveal against them.
+               blinded: default<JubjubPoint>,
+               response: default<JubjubPoint>,
                mixed: pend.mixed,
                hold1: pend.hold1,
                hold2: pend.hold2,
@@ -2071,7 +2173,7 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
  * addresses were recorded at `join`. The seed reveal was never load-bearing for SOUNDNESS -- it
  * is load-bearing for VERIFIABILITY.
  *
- * WHAT IS LOST. A force-settled game is unverifiable after the fact: `revealedSeed` stays zero,
+ * WHAT IS LOST. A force-settled game is unverifiable after the fact: `revealedVrfSecret` stays zero,
  * so nobody -- including the players -- can re-derive the rolls, and the verifier must report
  * the game as unverified rather than as verification-failed. The dice were still proven correct
  * one transaction at a time while the game was live.
@@ -2100,17 +2202,22 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
  * policy (service/src/lifecycle.ts) decides which applies. `activeSeats` was already read and
  * asserted below, so this adds no ledger binding that was not here before.
  */
-export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
+export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
   assert(phase == Phase.playing, "settle: table is not playing");
   assert(openRound >= roundCount() || activeSeats == 1,
          "settle: the game is not finished and more than one seat is still playing"
          );
   assert(activeSeats > 0, "settle: no seat is left to pay");
 
-  const s = disclose(seed);
-  const opens = seedCommitmentOf(tableId, s) == seedCommitment;
+  // THE VRF KEY IS REVEALED HERE, exactly as the roll seed was. `x` is what lets anyone replay
+  // the whole game offline: recompute each seat's `P` from its revealed `sk`, then `Gamma =
+  // x*P`, then the dice — no DLEQ needed after the fact, because the key itself is now public.
+  // Publishing it costs nothing: the table is terminal, and a VRF key that can no longer be
+  // asked anything guards nothing.
+  const x = disclose(vrfSecret);
+  const opens = ecMulGenerator(x as JubjubScalar) == vrfPublicKey;
   const graceExpired = blockTimeGt((roundDeadline + tableTimeoutSecs) as Uint<64>);
-  assert(opens || graceExpired, "settle: seed does not open the table's seed commitment");
+  assert(opens || graceExpired, "settle: the secret does not match the table's VRF public key");
 
   assertCustody();
 
@@ -2140,7 +2247,7 @@ export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
   // Zero on a force-settle, and that zero is the game's "unverified" marker. A seed that did NOT
   // open the commitment must never be written here: it would look exactly like a reveal while
   // opening nothing, which is worse than an honest blank.
-  revealedSeed = opens ? s : default<Bytes<32>>;
+  revealedVrfSecret = opens ? x : (0 as Field);
   winnerSeatIndex = winner;
   finalDigest =
     finalDigestOf(
