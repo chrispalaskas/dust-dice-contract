@@ -38,6 +38,8 @@
  * freely inside a round and only jumps the clock when a test wants an elimination.
  */
 
+import type { JubjubPoint } from '@midnight-ntwrk/compact-runtime';
+import * as vrf from '../vrf.ts';
 import assert from 'node:assert/strict';
 import {
   applyScore as refApplyScore,
@@ -60,7 +62,6 @@ import {
   mixEntropyTs,
   modalFace,
   rerollUnderMaskTs,
-  seedCommitmentTs,
 } from '../policy-mirror.ts';
 import {
   emptyRoundResult,
@@ -148,9 +149,10 @@ export type TableOptions = {
   seats: number;
   tier?: bigint;
   tableId?: Uint8Array;
-  seed?: Uint8Array;
-  /** Override the committed hash to make the resolves and `settle` unopenable. */
-  seedCommitment?: Uint8Array;
+  /** The table's VRF secret `x`. A scalar, not 32 bytes. */
+  vrfSecret?: bigint;
+  /** Override the sealed public key so no answer can ever verify, and `settle` cannot open. */
+  vrfPublicKey?: JubjubPoint;
   turnTimeoutSecs?: bigint;
   tableTimeoutSecs?: bigint;
   rakeAddress?: UserAddress;
@@ -163,7 +165,8 @@ export type TableOptions = {
 };
 
 export function tableConfig(opts: TableOptions): TableConfig {
-  const seed = opts.seed ?? bytes32(0x11);
+  // A fixed key, so a failing test replays identically. It is a scalar now, not 32 bytes.
+  const vrfSecret = opts.vrfSecret ?? 0x11_2233_4455_6677n * 1_000_003n + 7n;
   const tableId = opts.tableId ?? bytes32(0x22);
   return {
     tableId,
@@ -172,8 +175,8 @@ export function tableConfig(opts: TableOptions): TableConfig {
     tier: opts.tier ?? 1_000_000n,
     seats: BigInt(opts.seats),
     rakeAddress: opts.rakeAddress ?? userAddress(0xee),
-    seed,
-    seedCommitment: opts.seedCommitment ?? seedCommitmentTs(tableId, seed),
+    vrfSecret,
+    vrfPublicKey: opts.vrfPublicKey ?? vrf.vrfPublicKeyOf(vrfSecret),
     // Both defaults must clear the constructor's floor of `timeSlackSecs() * 2` = 240 s, and
     // must also cover a whole round: six seats x up to seven transactions each, at TICK apart.
     // Anything at or below the floor is refused at construction, which is itself covered by a
@@ -282,10 +285,26 @@ export function planTurn(
   mixed: Uint8Array,
   seat: number,
   round: number,
+  seatSecret: Uint8Array,
   chooser: HoldChooser,
 ): { holds: Mask[]; rolls: number[][]; final: number[] } {
+  // ONE DIGEST PER ROLL, not one seed per table. Under the VRF a roll comes from
+  // `Gamma = x*P`, and `P` commits to the roll index and to the hold the roll is taken under —
+  // so the thing that plays the seed's old role changes at every step. What it does NOT depend
+  // on is the blinding: that cancels, which is exactly why this function can still predict a
+  // roll before it is played.
+  const digest = (rollIndex: number, holdMask: readonly boolean[]): Uint8Array =>
+    vrf.rollDigestFor({
+      secret: config.vrfSecret,
+      tableId: config.tableId,
+      round: BigInt(round),
+      rollIndex: BigInt(rollIndex),
+      holdMask: vrf.packHoldMask(holdMask),
+      seatSecret,
+    });
+
   const holds: Mask[] = [];
-  const rolls: number[][] = [firstRollTs(config.tableId, config.seed, mixed, round)];
+  const rolls: number[][] = [firstRollTs(config.tableId, digest(0, NO_HOLD), mixed, round)];
   for (let step = 0; step < 2; step++) {
     const decision = chooser({ seat, round, step: step as 0 | 1, dice: rolls[step]! });
     if (decision === 'score') break;
@@ -293,7 +312,7 @@ export function planTurn(
     rolls.push(
       rerollUnderMaskTs(
         config.tableId,
-        config.seed,
+        digest(step + 1, decision),
         mixed,
         round,
         step + 1,
@@ -304,6 +323,9 @@ export function planTurn(
   }
   return { holds, rolls, final: rolls[rolls.length - 1]! };
 }
+
+/** Roll 1 is taken under no hold. */
+const NO_HOLD: readonly boolean[] = [false, false, false, false, false];
 
 /** "Eliminate this seat at this round" -- the round it fails to move in. */
 export type EliminateAt = { seat: number; round: number };
@@ -646,7 +668,14 @@ export class GameDriver {
     const mixed = mixEntropyTs(entropy, digestBefore);
     // Plan the whole turn against the MIRROR first, then play exactly that plan on chain and
     // assert every roll matches. One description of the turn, two independent executions.
-    const expected = planTurn(this.config, mixed, seat, round, chooserOverride ?? this.chooser());
+    const expected = planTurn(
+      this.config,
+      mixed,
+      seat,
+      round,
+      this.players[seat]!.sk,
+      chooserOverride ?? this.chooser(),
+    );
     const holds = expected.holds;
 
     // ---- open ---------------------------------------------------------------------------
@@ -662,13 +691,19 @@ export class GameDriver {
       'opening a turn must NOT advance the round cursor -- only scoring does',
     );
 
-    // ---- roll 1 -------------------------------------------------------------------------
+    // ---- roll 1: the operator answers, and learns nothing -------------------------------
+    //
+    // Under the VRF a resolve publishes `S = x*B`, not the dice. The dice appear when the
+    // PLAYER's next move unblinds it, so every roll is asserted one step later than it used to
+    // be — which is itself the property worth pinning.
     this.sim.asOperator();
-    const rolls: number[][] = [];
-    const roll0 = diceToArray(await this.sim.resolveRoll1(seat, this.tick()));
+    await this.sim.resolveRoll1(seat, this.tick());
     this.operatorTx += 1;
-    rolls.push(roll0);
-    assert.deepEqual(roll0, expected.rolls[0], `roll 1 diverged at seat ${seat} round ${round}`);
+    assert.deepEqual(
+      diceToArray(this.ledger().seatTurn.lookup(BigInt(seat)).roll),
+      [1, 1, 1, 1, 1],
+      'the operator answered and the roll cell moved -- its transaction must not contain dice',
+    );
     assert.deepEqual(
       this.ledger().seatTurn.lookup(BigInt(seat)).mixed,
       mixed,
@@ -681,13 +716,32 @@ export class GameDriver {
     );
 
     // ---- holds and rerolls --------------------------------------------------------------
+    const rolls: number[][] = [];
     for (let i = 0; i < holds.length; i++) {
       this.sim.asPlayer(player.sk);
       const expectStage = i === 0 ? STAGE.awaitRoll2 : STAGE.awaitRoll3;
       assert.equal(await this.sim.hold(seat, holds[i]!, this.tick()), BigInt(expectStage));
       this.playerTx += 1;
-      // The mask must land in the cell the NEXT roll reads, and only that one.
+
+      // This hold REVEALED the roll it was chosen on.
       const cell = this.ledger().seatTurn.lookup(BigInt(seat));
+      const revealed = diceToArray(cell.roll);
+      rolls.push(revealed);
+      assert.deepEqual(
+        revealed,
+        expected.rolls[i],
+        `roll ${i + 1} diverged at seat ${seat} round ${round}`,
+      );
+      // A held die must survive the reroll untouched -- the property the mask exists for.
+      if (i > 0) {
+        const previous = rolls[i - 1]!;
+        for (let d = 0; d < 5; d++) {
+          if (holds[i - 1]![d] === true) {
+            assert.equal(revealed[d], previous[d], `held die ${d} changed on roll ${i + 1}`);
+          }
+        }
+      }
+      // The mask must land in the cell the NEXT roll reads, and only that one.
       assert.deepEqual(
         i === 0 ? cell.hold1.bits : cell.hold2.bits,
         holds[i],
@@ -695,29 +749,20 @@ export class GameDriver {
       );
 
       this.sim.asOperator();
-      const rolled =
-        i === 0
-          ? diceToArray(await this.sim.resolveReroll(seat, this.tick()))
-          : diceToArray(await this.sim.resolveReroll(seat, this.tick()));
+      await this.sim.resolveReroll(seat, this.tick());
       this.operatorTx += 1;
-      rolls.push(rolled);
-      assert.deepEqual(
-        rolled,
-        expected.rolls[i + 1],
-        `roll ${i + 2} diverged at seat ${seat} round ${round}`,
-      );
-      // A held die must survive the reroll untouched -- the property the mask exists for.
-      const previous = rolls[rolls.length - 2]!;
-      for (let d = 0; d < 5; d++) {
-        if (holds[i]![d] === true) {
-          assert.equal(rolled[d], previous[d], `held die ${d} changed on roll ${i + 2}`);
-        }
-      }
     }
 
-    const dice = rolls[rolls.length - 1]!;
-    assert.deepEqual(dice, expected.final, 'the turn ended on the wrong dice');
+    // The LAST roll is revealed by the score itself, so the player knows it locally before the
+    // chain does -- which is exactly the real situation: it unblinded the answer in its own
+    // browser. `prog.dice` is asserted against this after scoring, and that assertion is what
+    // proves the reveal produced the roll the mirror predicted.
+    const dice = expected.final;
     for (const d of dice) assert.ok(d >= 1 && d <= 6, `die out of range: ${d}`);
+    // The turn's full roll list, final roll included: the holds above revealed every roll but
+    // the last, and the last is what the score is made on. `turns[].rolls` is read by tests as
+    // "every roll this turn took", and the held-die checks above index into it by position.
+    rolls.push(dice);
 
     // ---- score --------------------------------------------------------------------------
     if (this.plan.probeIllegal === true) await this.probeIllegalPlacement(seat, round, dice);
@@ -1045,7 +1090,7 @@ export function replayGame(
       const player = players[seat]!;
       const entropy = forcedEntropyTs(player.sk, config.tableId, round);
       const mixed = mixEntropyTs(entropy, digest);
-      const { holds, rolls, final } = planTurn(config, mixed, seat, round, chooser);
+      const { holds, rolls, final } = planTurn(config, mixed, seat, round, player.sk, chooser);
 
       const category = chooseCategoryFor(cards[seat]!, final, strategy);
       cards[seat] = refApplyScore(cards[seat]!, category as Category, final as unknown as RefDice);

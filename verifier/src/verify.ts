@@ -77,9 +77,12 @@ import {
   genesisDigestTs,
   joinDigestTs,
   mixEntropyTs,
+  packHoldMask,
   rerollUnderMaskTs,
+  rollDigestFor,
   roundDigestTs,
-  seedCommitmentTs,
+  samePoint,
+  vrfPublicKeyOf,
   type RoundResultTs,
 } from '@dust-dice/contract';
 
@@ -265,10 +268,21 @@ interface SeatReplay {
   mixed?: Uint8Array;
   /** The dice as the replay believes them, after each resolved roll. */
   roll: number[];
-  /** How many rolls the current turn has resolved. */
+  /** How many rolls the current turn has revealed. */
   rolls: number;
   eliminated: boolean;
   finishedAtRound: number;
+  /**
+   * The seat's `sk_s`, as its final score revealed it -- `undefined` for a seat that never got
+   * there. Without it no roll of this seat can be re-derived: every roll is `x*P` and `P` is
+   * built from this secret. The DLEQs and the key still verify; the dice themselves do not.
+   */
+  secret?: Uint8Array;
+  /**
+   * The roll the operator has answered but the player has not yet revealed: its index in the
+   * turn and the hold it was taken under. Set by a resolve, consumed by the next playerMove.
+   */
+  pending?: { index: number; mask: boolean[] };
 }
 
 async function verify(address: string, verbose: boolean): Promise<number> {
@@ -285,7 +299,9 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   console.log('── table, as deployed ──');
   console.log(`  tableId        ${hex(tableId)}`);
   console.log(`  tier           ${final.tier}   seats ${final.seatLimit}`);
-  console.log(`  seedCommitment ${hex(final.seedCommitment)}`);
+  console.log(
+    `  vrfPublicKey   (${final.vrfPublicKey.x.toString(16)}, ${final.vrfPublicKey.y.toString(16)})`,
+  );
   console.log(`  phase          ${Table.Phase[final.phase]}`);
   // The mode changes what "verified" covers (docs/fast-turn-design.md): dice and payouts verify
   // identically in both, but hold-before-reveal ORDERING is chain-proven only on an on-chain-mode
@@ -301,38 +317,38 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   if (final.phase !== Table.Phase.settled) {
     console.log(
       `\nNOT VERIFIABLE YET: this table is ${Table.Phase[final.phase]}. Only a settled table ` +
-        'reveals the seed,\nand without the seed no roll can be re-derived. Nothing here says ' +
-        'the game was dishonest.',
+        'reveals its VRF key,\nand without the key no roll can be re-derived. Nothing here ' +
+        'says the game was dishonest.',
     );
     return 3;
   }
 
-  // ---------------------------------------------------------------- 1. the seed opens the commit
-  console.log('\n── the revealed seed ──');
-  const seed = final.revealedSeed;
-  console.log(`  seed ${hex(seed)}`);
+  // --------------------------------------------------------------- 1. the key matches the seal
+  console.log('\n── the revealed VRF key ──');
+  const x = final.revealedVrfSecret;
+  console.log(`  x ${x.toString(16)}`);
 
-  // An all-zero `revealedSeed` on a SETTLED table is not a missing field -- it is the contract's
-  // marker for a game that was force-settled past the table deadline with no valid seed. The
-  // payout was still fully determined by public state and every roll was proven in its own
-  // transaction while the game was live, but the game cannot be REPLAYED offline, which is
-  // exactly what this tool does. Say so and stop, rather than reporting a failure that suggests
-  // the chain did something wrong.
-  if (seed.every((b) => b === 0)) {
+  // Zero on a SETTLED table is not a missing field -- it is the contract's marker for a game
+  // force-settled past the table deadline with no valid key. The payout was still fully
+  // determined by public state and every roll was proven in its own transaction while the game
+  // was live, but the game cannot be REPLAYED offline, which is exactly what this tool does. Say
+  // so and stop, rather than reporting a failure that suggests the chain did something wrong.
+  if (x === 0n) {
     console.log(
-      '\n  This table was FORCE-SETTLED: the operator never revealed a valid seed before the\n' +
+      '\n  This table was FORCE-SETTLED: the operator never revealed a valid key before the\n' +
         '  table deadline, so `settle` paid the winner computed from public state and left\n' +
-        '  `revealedSeed` at zero. The rolls cannot be re-derived offline. Nothing here is\n' +
+        '  `revealedVrfSecret` at zero. The rolls cannot be re-derived offline. Nothing here is\n' +
         '  wrong; this game is simply unverifiable after the fact.',
     );
     c.summary();
     return 1;
   }
 
+  const pk = vrfPublicKeyOf(x);
   c.ok(
-    'the revealed seed opens the commitment the table was deployed with',
-    same(seedCommitmentTs(tableId, seed), final.seedCommitment),
-    `H(tableId, seed) = ${hex(seedCommitmentTs(tableId, seed))}`,
+    'the revealed key is the one behind the public key the table was deployed with',
+    samePoint(pk, final.vrfPublicKey),
+    `x*G = (${pk.x.toString(16)}, ${pk.y.toString(16)})`,
   );
 
   // ------------------------------------------------------------------------- walk the public log
@@ -341,13 +357,108 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   console.log(`\n── the public log: ${callCount} calls in ${groups.length} transaction(s) ──`);
 
   let digest = genesisDigestTs(tableId);
-  const seats: SeatReplay[] = Array.from({ length: seatCount }, () => ({
+  const seats: SeatReplay[] = Array.from({ length: seatCount }, (_, s) => ({
     card: emptyScorecard(),
     roll: [1, 1, 1, 1, 1],
     rolls: 0,
     eliminated: false,
     finishedAtRound: Number.POSITIVE_INFINITY,
+    secret: final.seatSecretRevealed.member(BigInt(s))
+      ? final.seatSecretRevealed.lookup(BigInt(s))
+      : undefined,
   }));
+  const unreplayable = seats.map((r, i) => (r.secret === undefined ? i : -1)).filter((i) => i >= 0);
+  if (unreplayable.length > 0) {
+    console.log(
+      `  seat(s) ${unreplayable.join(', ')} never reached a final score and revealed no secret: ` +
+        'their answers are checked against the key, but their dice cannot be re-derived offline.',
+    );
+  }
+
+  /** Roll 1 is taken under no hold. */
+  const NO_HOLD: boolean[] = [false, false, false, false, false];
+  /**
+   * The 32 bytes ONE roll's dice come from -- what the seed used to be, per roll. It does not
+   * depend on the player's blinding, which cancels; that is exactly why a replay can recompute
+   * a roll knowing only the key, the seat's secret and the public position in the game.
+   */
+  const digestFor = (seat: number, round: number, rollIndex: number, mask: readonly boolean[]) =>
+    rollDigestFor({
+      secret: x,
+      tableId,
+      round: BigInt(round),
+      rollIndex: BigInt(rollIndex),
+      holdMask: packHoldMask(mask),
+      seatSecret: seats[seat]!.secret!,
+    });
+  const replayable = (seat: number): boolean => seats[seat]!.secret !== undefined;
+
+  /**
+   * Check the roll a player's move just revealed against the one the replay derives, then
+   * advance the seat's replay state. Called from the HOLD and the SCORE branches of playerMove,
+   * because that is where the dice land now -- a resolve publishes only the operator's answer.
+   */
+  const revealPending = (seat: number, round: number, r: SeatReplay, chainDice: number[]) => {
+    const pending = r.pending;
+    if (!pending) {
+      c.ok(`seat ${seat} r${round}: a move revealed a roll the operator had answered`, false);
+      return;
+    }
+    r.pending = undefined;
+    c.ok(
+      `seat ${seat} r${round}: dice are all in 1..6`,
+      chainDice.every((d) => d >= 1 && d <= 6),
+      chainDice.join(','),
+    );
+    if (!replayable(seat)) {
+      // Proven live, in the player's own transaction; not re-derivable here. Track the chain's
+      // dice so the score and the digest checks below still line up.
+      r.roll = chainDice;
+      r.rolls += 1;
+      return;
+    }
+    if (!r.mixed) {
+      c.ok(`seat ${seat} r${round}: roll ${pending.index + 1} has a latched mix`, false);
+      return;
+    }
+    const expected =
+      pending.index === 0
+        ? firstRollTs(tableId, digestFor(seat, round, 0, NO_HOLD), r.mixed, round)
+        : rerollUnderMaskTs(
+            tableId,
+            digestFor(seat, round, pending.index, pending.mask),
+            r.mixed,
+            round,
+            pending.index,
+            pending.mask,
+            r.roll,
+          );
+    const label =
+      pending.index === 0
+        ? `roll 1`
+        : `roll ${pending.index + 1} under mask ${pending.mask.map((b) => (b ? 1 : 0)).join('')}`;
+    c.ok(
+      `seat ${seat} r${round}: ${label}`,
+      arrayEq(chainDice, expected),
+      `chain ${chainDice} vs replay ${expected}`,
+    );
+    if (pending.index > 0) {
+      // A held die must be byte-identical across the reroll -- the property the mask exists
+      // for, checked independently of the derivation above.
+      for (let d = 0; d < 5; d++) {
+        if (pending.mask[d] === true) {
+          c.ok(
+            `seat ${seat} r${round}: held die ${d} survived roll ${pending.index + 1}`,
+            chainDice[d] === r.roll[d],
+            `${r.roll[d]} -> ${chainDice[d]}`,
+          );
+        }
+      }
+    }
+    r.roll = expected;
+    r.rolls += 1;
+    rollChecks += 1;
+  };
   let joins = 0;
   let opens = 0;
   let holds = 0;
@@ -450,13 +561,22 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     const deriveFor = (
       seat: number,
     ): { round: number; mixed: Uint8Array; dice: number[] } | null => {
+      if (!replayable(seat)) return null;
       const turn = led.seatTurn.lookup(BigInt(seat));
       const round = Number(turn.round);
       const mixed = mixEntropyTs(turn.entropy, digest);
-      let dice = firstRollTs(tableId, seed, mixed, round);
+      let dice = firstRollTs(tableId, digestFor(seat, round, 0, NO_HOLD), mixed, round);
       for (let step = 1; step <= rerolls; step++) {
         const mask = [...(step === 1 ? turn.hold1 : turn.hold2).bits];
-        dice = rerollUnderMaskTs(tableId, seed, mixed, round, step, mask, dice);
+        dice = rerollUnderMaskTs(
+          tableId,
+          digestFor(seat, round, step, mask),
+          mixed,
+          round,
+          step,
+          mask,
+          dice,
+        );
       }
       return arrayEq(diceToArray(turn.roll), dice) ? { round, mixed, dice } : null;
     };
@@ -635,6 +755,9 @@ async function verify(address: string, verbose: boolean): Promise<number> {
             mask.length === 5,
             `mask ${mask.map((b) => (b ? 1 : 0)).join('')}`,
           );
+          // THE HOLD REVEALS THE ROLL it was chosen on. The operator's answer carried no dice;
+          // they appear here, in the player's transaction, and this is where they are checked.
+          revealPending(seat, round, r, diceToArray(led.seatTurn.lookup(BigInt(seat)).roll));
         } else if (nowStage === STAGE.idle) {
           // SCORE. The category is recovered by diffing the card, then recomputed.
           scores += 1;
@@ -650,6 +773,8 @@ async function verify(address: string, verbose: boolean): Promise<number> {
                 chainBefore.scores.filter((s) => s !== null).length + 1,
             `category index ${category}`,
           );
+          // THE SCORE REVEALS THE LAST ROLL, into the progress record the digest folds.
+          revealPending(seat, round, r, diceToArray(led.seatProgress.lookup(BigInt(seat)).dice));
           if (category >= 0) {
             // The dice scored are the ones the replay derived for this turn -- NOT read from the
             // chain. That is what makes this a check of the dice rather than of the bookkeeping.
@@ -701,73 +826,47 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         }
         const round = Number(prev.openRound);
         const r = seats[seat]!;
+        const before = prev.seatTurn.lookup(BigInt(seat));
         const turn = led.seatTurn.lookup(BigInt(seat));
-        const chainDice = diceToArray(turn.roll);
+
+        // THE OPERATOR'S TRANSACTION CONTAINS NO DICE. It answers the query the player put on
+        // chain, `S = x*B`, and the contract checked its DLEQ against the sealed key. With `x`
+        // now public the replay does something stronger than re-checking that proof: it
+        // recomputes `S` itself. A response that is not `x*B` is an operator that did not use
+        // the table's key -- which the DLEQ would also have caught, but this says so directly.
+        const expectedResponse = Table.pureCircuits.vrfScalarMul(before.blinded, x);
+        c.ok(
+          `seat ${seat} r${round}: the operator's answer is the table key applied to the query`,
+          samePoint(turn.response, expectedResponse),
+          `S = (${turn.response.x.toString(16).slice(0, 12)}…)`,
+        );
+        c.ok(
+          `seat ${seat} r${round}: a resolve reveals no dice`,
+          arrayEq(diceToArray(turn.roll), diceToArray(before.roll)),
+          'the roll cell must not move until the player unblinds',
+        );
 
         if (g.entryPoints[0] === 'resolveRoll1') {
           // Roll 1 hashes the seat's declared entropy against the digest FROZEN AT ROUND OPEN --
           // which is the digest the replay is holding right now, because it only advances at a
           // closeRound. Getting that ordering wrong is the easiest way to make an unverifiable
           // game, so the latched value is checked too.
-          const entropy = prev.seatTurn.lookup(BigInt(seat)).entropy;
-          const mixed = mixEntropyTs(entropy, digest);
+          const mixed = mixEntropyTs(before.entropy, digest);
           r.mixed = mixed;
           c.ok(
             `seat ${seat} r${round}: mixed entropy`,
             same(turn.mixed, mixed),
             `chain ${hex(turn.mixed)} vs replay ${hex(mixed)}`,
           );
-          const expected = firstRollTs(tableId, seed, mixed, round);
-          c.ok(
-            `seat ${seat} r${round}: roll 1`,
-            arrayEq(chainDice, expected),
-            `chain ${chainDice} vs replay ${expected}`,
-          );
-          r.roll = expected;
-          r.rolls = 1;
+          r.pending = { index: 0, mask: NO_HOLD };
         } else {
           // WHICH reroll this is comes from the seat's stage before the call -- the same place
           // the circuit reads it. There is one entry point for both rerolls, so the log does not
           // say, and inferring it from the stage is both necessary and a stronger check.
-          const step =
-            Number(prev.seatTurn.lookup(BigInt(seat)).stage) === STAGE.awaitRoll2 ? 1 : 2;
-          const mask = (
-            step === 1
-              ? prev.seatTurn.lookup(BigInt(seat)).hold1
-              : prev.seatTurn.lookup(BigInt(seat)).hold2
-          ).bits;
-          if (!r.mixed) {
-            c.ok(`seat ${seat} r${round}: roll ${step + 1} has a latched mix`, false);
-            break;
-          }
-          // THE reroll check: the fresh roll is consumed LEFT TO RIGHT over the positions the
-          // mask does not keep. A verifier that merged positionally would agree on every mask
-          // whose held set is a prefix and diverge on every other one.
-          const expected = rerollUnderMaskTs(tableId, seed, r.mixed, round, step, mask, r.roll);
-          c.ok(
-            `seat ${seat} r${round}: roll ${step + 1} under mask ${mask.map((b) => (b ? 1 : 0)).join('')}`,
-            arrayEq(chainDice, expected),
-            `chain ${chainDice} vs replay ${expected}`,
-          );
-          // A held die must be byte-identical across the reroll -- the property the mask exists
-          // for, checked independently of the derivation above.
-          for (let d = 0; d < 5; d++) {
-            if (mask[d] === true) {
-              c.ok(
-                `seat ${seat} r${round}: held die ${d} survived roll ${step + 1}`,
-                chainDice[d] === r.roll[d],
-                `${r.roll[d]} -> ${chainDice[d]}`,
-              );
-            }
-          }
-          r.roll = expected;
-          r.rolls += 1;
+          const step = Number(before.stage) === STAGE.awaitRoll2 ? 1 : 2;
+          const mask = [...(step === 1 ? before.hold1 : before.hold2).bits];
+          r.pending = { index: step, mask };
         }
-        c.ok(
-          `seat ${seat} r${round}: dice are all in 1..6`,
-          chainDice.every((d) => d >= 1 && d <= 6),
-          chainDice.join(','),
-        );
         c.ok(
           `seat ${seat} r${round}: no resolve moved the round digest`,
           same(led.roundDigest, digest),

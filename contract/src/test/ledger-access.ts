@@ -117,6 +117,12 @@ const ADT_FIELDS: ReadonlyArray<readonly [PathKey, string]> = [
   // Declared after `padStore` (2,9) with the other late fields, between `started` and
   // `fillOpenedAt`.
   ['2,12', 'seatPaid'],
+  // The VRF: `seatSecretRevealed` is declared right after `revealedVrfSecret` and lands as the
+  // last cell of bucket 1. Its arrival took the field count from 31 to 32, and the compiler
+  // rebalanced by sliding `tier` into bucket 0 -- so every bucket-1 address moved down by one
+  // (`phase` 1,7 -> 1,6) while bucket 2 did not move at all. Re-derived from the generated
+  // accessor on 2026-09-21, reading the Map's own method paths rather than by arithmetic.
+  ['1,14', 'seatSecretRevealed'],
 ];
 for (const [key, name] of ADT_FIELDS) FIELDS.set(key, name);
 
@@ -144,7 +150,10 @@ export function assertFieldMapIsComplete(): void {
   // 0,0, the rest of the plain fields in bucket 1, and bucket 2 holding winnerSeatIndex,
   // finalDigest, the ADT block (2,2..2,8), padStore and the late fields. Re-derived from the
   // generated accessor on 2026-09-04.
-  expect('1,7', 'phase');
+  // Bucket 1 begins at `seatLimit` since the VRF field count pushed `tier` into bucket 0; see
+  // the `seatSecretRevealed` entry above.
+  expect('1,6', 'phase');
+  expect('1,14', 'seatSecretRevealed');
   expect('2,1', 'finalDigest');
   expect('2,9', 'padStore');
   expect('2,10', 'startAfterSecs');

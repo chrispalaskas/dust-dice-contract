@@ -114,6 +114,41 @@ import {
   type Player,
   type TableOptions,
 } from './table-harness.ts';
+import * as vrf from '../vrf.ts';
+
+/**
+ * A stand-in blinded query for moves that are REFUSED before the VRF is consulted at all —
+ * the sentinel and unknown-kind checks. The identity is a point like any other here: those
+ * asserts fire first, so nothing ever multiplies by it.
+ */
+const NO_QUERY = { x: 0n, y: 1n };
+
+/** A key that is NOT the table's. Any scalar but `x` fails `x*G == vrfPublicKey`. */
+const WRONG_KEY = 0x99n * 1_000_003n + 11n;
+
+/**
+ * The 32 bytes ONE roll's dice come from -- the seed's replacement in every mirror call below.
+ *
+ * Under the VRF there is no single seed: `Gamma = x*P` and `P` commits to the seat, the round,
+ * the roll index and the hold the roll is taken under, so what plays the seed's part changes at
+ * every step. It does not depend on the blinding, which cancels -- that is what lets a test
+ * predict a roll before it is played.
+ */
+const digestFor = (
+  g: GameDriver,
+  seat: number,
+  round: number,
+  rollIndex: number,
+  holdMask: readonly boolean[] = NO_MASK(),
+): Uint8Array =>
+  vrf.rollDigestFor({
+    secret: g.config.vrfSecret,
+    tableId: g.config.tableId,
+    round: BigInt(round),
+    rollIndex: BigInt(rollIndex),
+    holdMask: vrf.packHoldMask(holdMask),
+    seatSecret: g.players[seat]!.sk,
+  });
 
 /** `noFinish()` -- the sentinel standing in for `rules.ts`'s `Infinity`. */
 const NO_FINISH = 65535n;
@@ -125,12 +160,18 @@ async function seated(opts: TableOptions, plan: GamePlan = {}): Promise<GameDriv
   return g;
 }
 
-/** Open a seat's turn and resolve roll 1, leaving it at `rolled1` with the player to move. */
+/**
+ * Open a seat's turn and have the operator answer roll 1, leaving it at `rolled1` with the
+ * player to move. Returns the roll the PLAYER will see once it unblinds -- the operator's
+ * transaction carries no dice, so there is nothing to read back from it.
+ */
 async function rolledOnce(g: GameDriver, seat: number, round = 0): Promise<number[]> {
   g.sim.asPlayer(g.players[seat]!.sk);
   await g.sim.openTurn(seat, g.entropyFor(seat, round), g.tick());
   g.sim.asOperator();
-  return diceToArray(await g.sim.resolveRoll1(seat, g.tick()));
+  await g.sim.resolveRoll1(seat, g.tick());
+  const mixed = g.ledger().seatTurn.lookup(BigInt(seat)).mixed;
+  return firstRollTs(g.config.tableId, digestFor(g, seat, round, 0), mixed, round);
 }
 
 // =========================================================================================
@@ -167,10 +208,13 @@ describe('conflict-freedom', () => {
   });
 
   it('lets playerMove write only its own seat and the padding sink', () => {
+    // `seatSecretRevealed` is keyed by seat and written only by the seat's own final score, so
+    // it is still "its own seat": no shared cell, no serialisation against the other seats.
     assert.deepEqual(sorted(ledgerWrites('playerMove')), [
       'padStore',
       'seatCard',
       'seatProgress',
+      'seatSecretRevealed',
       'seatTurn',
     ]);
   });
@@ -187,14 +231,15 @@ describe('conflict-freedom', () => {
       }
     }
     // resolveRoll1 is the one exception and it is deliberate: it reads `roundDigest`, which is
-    // frozen for the duration of a round precisely so that it can.
+    // frozen for the duration of a round precisely so that it can. It reads the sealed VRF
+    // public key for the DLEQ, and NOT `tableId` any more -- there is no seed commitment left to
+    // recompute, and the query it answers already commits to the table.
     assert.deepEqual(sorted(ledgerReads('resolveRoll1')), [
       'openRound',
       'phase',
       'roundDigest',
       'seatTurn',
-      'seedCommitment',
-      'tableId',
+      'vrfPublicKey',
     ]);
   });
 
@@ -349,14 +394,18 @@ describe('a full two-seat game', () => {
 
     const potBefore = led.pot;
     const [q, r] = g.rakeSplit();
-    const winner = await g.sim.settle(g.config.seed, q, r);
+    const winner = await g.sim.settle(g.config.vrfSecret, q, r);
     assert.equal(winner, BigInt(g.expectedWinner()));
 
     const after = g.ledger();
     assert.equal(after.phase, PHASE.settled);
     assert.equal(after.pot, 0n, 'settle drains the pot exactly');
     assert.equal(after.winnerSeatIndex, winner);
-    assert.deepEqual(after.revealedSeed, g.config.seed, 'an honest settle publishes the seed');
+    assert.equal(
+      after.revealedVrfSecret,
+      g.config.vrfSecret,
+      'an honest settle publishes the seed',
+    );
     assert.equal(q, potBefore / 100n);
     assert.deepEqual(
       after.finalDigest,
@@ -384,7 +433,7 @@ describe('a full two-seat game', () => {
     const [q, r] = g.rakeSplit();
     assert.equal(q, 10n);
     assert.equal(r, 2n);
-    await g.sim.settle(g.config.seed, q, r);
+    await g.sim.settle(g.config.vrfSecret, q, r);
     assert.equal(g.ledger().pot, 0n);
   });
 
@@ -398,7 +447,7 @@ describe('a full two-seat game', () => {
       [0n, pot],
       [pot, 0n],
     ]) {
-      await assert.rejects(() => g.sim.settle(g.config.seed, q!, r!), /rake split/);
+      await assert.rejects(() => g.sim.settle(g.config.vrfSecret, q!, r!), /rake split/);
     }
     assert.equal(g.ledger().phase, PHASE.playing, 'a refused settle changes nothing');
   });
@@ -503,7 +552,7 @@ describe('the interactive turn', () => {
         step < plannedHolds.length ? plannedHolds[step++]! : 'score',
       );
       const mixed = mixEntropyTs(g.entropyFor(seat, 0), genesisDigestAfterJoins(g));
-      const expected = planTurn(g.config, mixed, seat, 0, () =>
+      const expected = planTurn(g.config, mixed, seat, 0, g.players[seat]!.sk, () =>
         stops[seat]!.length > 0 ? stops[seat]![0]! : 'score',
       );
       void expected;
@@ -550,7 +599,7 @@ describe('the interactive turn', () => {
     const g = await seated({ seats: 2 });
     const digest = g.ledger().roundDigest;
     const mixed = mixEntropyTs(g.entropyFor(0, 0), digest);
-    const roll0 = firstRollTs(g.config.tableId, g.config.seed, mixed, 0);
+    const roll0 = firstRollTs(g.config.tableId, digestFor(g, 0, 0, 0), mixed, 0);
     for (const mask of allMasks()) {
       assert.deepEqual(
         tablePure.mergeStream(mask, roll0.map(BigInt), [1n, 2n, 3n, 4n, 5n]).map(Number),
@@ -564,15 +613,26 @@ describe('the interactive turn', () => {
     const g = await seated({ seats: 2 });
     const roll0 = await rolledOnce(g, 0);
     const mask = maskOf(0, 2, 4);
+    // Every roll surfaces in the PLAYER's next move, one step after the operator answered it.
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, mask, g.tick());
+    assert.deepEqual(
+      diceToArray(g.ledger().seatTurn.lookup(0n).roll),
+      roll0,
+      'the hold revealed a different roll 1 than the mirror predicted',
+    );
     g.sim.asOperator();
-    const roll1 = diceToArray(await g.sim.resolveReroll(0, g.tick()));
+    await g.sim.resolveReroll(0, g.tick());
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.hold(0, mask, g.tick());
+    const roll1 = diceToArray(g.ledger().seatTurn.lookup(0n).roll);
     for (const i of [0, 2, 4]) assert.equal(roll1[i], roll0[i], `held die ${i} moved`);
-    g.sim.asPlayer(g.players[0]!.sk);
-    await g.sim.hold(0, mask, g.tick());
     g.sim.asOperator();
-    const roll2 = diceToArray(await g.sim.resolveReroll(0, g.tick()));
+    await g.sim.resolveReroll(0, g.tick());
+    // Roll 3 is revealed by the score, into the progress record the digest folds.
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.score(0, 6, g.tick());
+    const roll2 = diceToArray(g.ledger().seatProgress.lookup(0n).dice);
     for (const i of [0, 2, 4]) assert.equal(roll2[i], roll0[i], `held die ${i} moved on roll 3`);
   });
 
@@ -618,20 +678,20 @@ describe('the interactive turn', () => {
 
     // An open carries entropy and nothing else.
     await assert.rejects(
-      () => g.sim.playerMove(0, MOVE_OPEN, e, maskOf(0), 0, g.clock),
+      () => g.sim.playerMove(0, MOVE_OPEN, e, maskOf(0), 0, NO_QUERY, g.clock),
       /only a hold declares a mask/,
     );
     await assert.rejects(
-      () => g.sim.playerMove(0, MOVE_OPEN, e, NO_MASK(), 3, g.clock),
+      () => g.sim.playerMove(0, MOVE_OPEN, e, NO_MASK(), 3, NO_QUERY, g.clock),
       /only a score declares a category/,
     );
     // An unknown kind is refused outright.
     await assert.rejects(
-      () => g.sim.playerMove(0, 3, ZERO_BYTES32(), NO_MASK(), 0, g.clock),
+      () => g.sim.playerMove(0, 3, ZERO_BYTES32(), NO_MASK(), 0, NO_QUERY, g.clock),
       /unknown move kind/,
     );
     await assert.rejects(
-      () => g.sim.playerMove(0, 200, ZERO_BYTES32(), NO_MASK(), 0, g.clock),
+      () => g.sim.playerMove(0, 200, ZERO_BYTES32(), NO_MASK(), 0, NO_QUERY, g.clock),
       /unknown move kind/,
     );
 
@@ -639,20 +699,20 @@ describe('the interactive turn', () => {
     g.sim.asPlayer(g.players[0]!.sk);
     // A hold carries a mask and nothing else.
     await assert.rejects(
-      () => g.sim.playerMove(0, MOVE_HOLD, e, maskOf(0), 0, g.clock),
+      () => g.sim.playerMove(0, MOVE_HOLD, e, maskOf(0), 0, NO_QUERY, g.clock),
       /only an open declares entropy/,
     );
     await assert.rejects(
-      () => g.sim.playerMove(0, MOVE_HOLD, ZERO_BYTES32(), maskOf(0), 4, g.clock),
+      () => g.sim.playerMove(0, MOVE_HOLD, ZERO_BYTES32(), maskOf(0), 4, NO_QUERY, g.clock),
       /only a score declares a category/,
     );
     // A score carries a category and nothing else.
     await assert.rejects(
-      () => g.sim.playerMove(0, MOVE_SCORE, e, NO_MASK(), 0, g.clock),
+      () => g.sim.playerMove(0, MOVE_SCORE, e, NO_MASK(), 0, NO_QUERY, g.clock),
       /only an open declares entropy/,
     );
     await assert.rejects(
-      () => g.sim.playerMove(0, MOVE_SCORE, ZERO_BYTES32(), maskOf(2), 0, g.clock),
+      () => g.sim.playerMove(0, MOVE_SCORE, ZERO_BYTES32(), maskOf(2), 0, NO_QUERY, g.clock),
       /only a hold declares a mask/,
     );
   });
@@ -663,11 +723,23 @@ describe('the interactive turn', () => {
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, REROLL_ALL(), g.tick());
     g.sim.asOperator();
-    const roll1 = diceToArray(await g.sim.resolveReroll(0, g.tick()));
+    await g.sim.resolveReroll(0, g.tick());
+    // The answer carries no dice; a second hold reveals roll 2 (and asks for roll 3).
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.hold(0, REROLL_ALL(), g.tick());
+    const roll1 = diceToArray(g.ledger().seatTurn.lookup(0n).roll);
     const mixed = g.ledger().seatTurn.lookup(0n).mixed;
     assert.deepEqual(
       roll1,
-      rerollUnderMaskTs(g.config.tableId, g.config.seed, mixed, 0, 1, REROLL_ALL(), roll0),
+      rerollUnderMaskTs(
+        g.config.tableId,
+        digestFor(g, 0, 0, 1, REROLL_ALL()),
+        mixed,
+        0,
+        1,
+        REROLL_ALL(),
+        roll0,
+      ),
     );
   });
 });
@@ -716,15 +788,21 @@ describe('simultaneous rounds', () => {
     g.sim.asOperator();
     for (let seat = 0; seat < 6; seat++) await g.sim.resolveReroll(seat, g.tick());
 
-    // Every seat's dice must still be its own -- i.e. what the mirror derives from ITS entropy
+    // The answers carry no dice: a second round-robin of holds reveals every seat's roll 2.
+    for (let seat = 0; seat < 6; seat++) {
+      g.sim.asPlayer(g.players[seat]!.sk);
+      await g.sim.hold(seat, masks[seat]!, g.tick());
+    }
+
+    // Every seat's dice must still be its own -- i.e. what the mirror derives from ITS secret
     // under ITS mask.
     const led = g.ledger();
     for (let seat = 0; seat < 6; seat++) {
       const mixed = mixEntropyTs(g.entropyFor(seat, 0), digest);
-      const roll0 = firstRollTs(g.config.tableId, g.config.seed, mixed, 0);
+      const roll0 = firstRollTs(g.config.tableId, digestFor(g, seat, 0, 0), mixed, 0);
       const roll1 = rerollUnderMaskTs(
         g.config.tableId,
-        g.config.seed,
+        digestFor(g, seat, 0, 1, masks[seat]!),
         mixed,
         0,
         1,
@@ -971,13 +1049,13 @@ describe('the frozen round digest', () => {
     const digest = g.ledger().roundDigest;
     const a = firstRollTs(
       g.config.tableId,
-      g.config.seed,
+      digestFor(g, 0, 0, 0),
       mixEntropyTs(g.entropyFor(0, 0), digest),
       0,
     );
     const b = firstRollTs(
       g.config.tableId,
-      g.config.seed,
+      digestFor(g, 1, 0, 0),
       mixEntropyTs(g.entropyFor(1, 0), digest),
       0,
     );
@@ -1088,35 +1166,34 @@ describe('entropy and authorisation', () => {
 describe('the three-transaction resolve', () => {
   // =======================================================================================
 
-  it('checks the seed at every step, not only the first', async () => {
-    // Each step derives a roll from the seed, so a step that skipped the check would accept dice
-    // derived from a different preimage.
+  it('checks the key at every step, not only the first', async () => {
+    // Each answer is `S = x*B` with a DLEQ against the SEALED public key. A step that skipped
+    // the check would accept an answer computed under some other key -- internally consistent,
+    // just not a proof about this table.
     const g = await seated({ seats: 2 });
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.openTurn(0, g.entropyFor(0, 0), g.tick());
-    const wrong = bytes32(0x99);
 
-    const withWrongSeed = async (fn: () => Promise<unknown>): Promise<void> => {
-      g.sim.privateState = {
-        rollSeed: wrong,
-        playerSecret: new Uint8Array(32),
-        inviteCode: new Uint8Array(32),
-      };
-      await assert.rejects(fn, /does not open the table's seed/);
+    const honest = g.sim.config;
+    const withWrongKey = async (fn: () => Promise<unknown>): Promise<void> => {
       g.sim.asOperator();
+      g.sim.config = { ...honest, vrfSecret: WRONG_KEY };
+      try {
+        await assert.rejects(fn, /VRF applied to the seat's query/);
+      } finally {
+        g.sim.config = honest;
+      }
     };
 
-    await withWrongSeed(() => g.sim.resolveRoll1(0, g.clock));
+    await withWrongKey(() => g.sim.resolveRoll1(0, g.clock));
     await g.sim.resolveRoll1(0, g.tick());
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, maskOf(0), g.tick());
-    g.sim.asOperator();
-    await withWrongSeed(() => g.sim.resolveReroll(0, g.clock));
+    await withWrongKey(() => g.sim.resolveReroll(0, g.clock));
     await g.sim.resolveReroll(0, g.tick());
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, maskOf(1), g.tick());
-    g.sim.asOperator();
-    await withWrongSeed(() => g.sim.resolveReroll(0, g.clock));
+    await withWrongKey(() => g.sim.resolveReroll(0, g.clock));
     await g.sim.resolveReroll(0, g.tick());
   });
 
@@ -1156,7 +1233,9 @@ describe('joker rules at table level', () => {
     // joker rules; `probeIllegal` then attacks every scoring move with a category the reference
     // refuses, which in a joker situation is exactly what forced placement forbids.
     const g = await seated(
-      { seats: 4, tableId: bytes32(14) },
+      // Key swept offline for a game in which some seat rolls five of a kind twice, so the
+      // second lands with the box already filled and the joker rules engage.
+      { seats: 4, tableId: bytes32(14), vrfSecret: 4822692657239678623259n },
       { strategy: 'bestScore', probeIllegal: true, holds: keepModal },
     );
     await g.playToEnd();
@@ -1430,7 +1509,11 @@ describe('elimination', () => {
     // in which the ELIMINATED seat ends with the strictly highest total. Under the cursor model
     // it would have won; under simultaneous rounds elimination is permanent and economic, and it
     // has already been handed back `tier - penalty`, so paying it the pot would pay it twice.
-    const opts: TableOptions = { seats: 3, tableId: bytes32(11) };
+    const opts: TableOptions = {
+      seats: 3,
+      tableId: bytes32(11),
+      vrfSecret: 4822692657239678639097n,
+    };
     const plan: GamePlan = { strategy: 'bestScore', eliminations: [{ seat: 0, round: 10 }] };
     const preview = replayGame(tableConfig(opts), makePlayers(3), plan);
     assert.ok(preview.totals[0]! > preview.totals[1]!, 'this scenario was chosen for it');
@@ -1444,8 +1527,12 @@ describe('elimination', () => {
     assert.ok(led.seatProgress.lookup(0n).total > led.seatProgress.lookup(1n).total);
 
     const [q, r] = g.rakeSplit();
-    const winner = await g.sim.settle(g.config.seed, q, r);
-    assert.equal(winner, 1n, 'the eliminated seat must not win despite the highest total');
+    const winner = await g.sim.settle(g.config.vrfSecret, q, r);
+    // The property is that seat 0 -- eliminated, and holding the strictly highest total -- is
+    // NOT the winner. WHICH survivor wins is whatever the dice made of seats 1 and 2, and the
+    // reference engine's answer is asserted next; pinning it to a seat number here would pin
+    // the dice, not the rule.
+    assert.notEqual(winner, 0n, 'the eliminated seat must not win despite the highest total');
     assert.equal(winner, BigInt(g.expectedWinner()));
   });
 
@@ -1589,7 +1676,7 @@ describe('redeem', () => {
     for (let r = 7; r < ROUND_COUNT; r++) await g.playRound(r);
 
     const [q, r] = g.rakeSplit();
-    await g.sim.settle(g.config.seed, q, r);
+    await g.sim.settle(g.config.vrfSecret, q, r);
     assert.equal(g.ledger().pot, 0n);
 
     assert.equal(await g.sim.redeem(1), refund);
@@ -1605,7 +1692,7 @@ describe('redeem', () => {
     const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
     await g.playToEnd();
     const [q, r] = g.rakeSplit();
-    await g.sim.settle(g.config.seed, q, r);
+    await g.sim.settle(g.config.vrfSecret, q, r);
     await assert.rejects(() => g.sim.redeem(2), /no such seat/);
     await assert.rejects(() => g.sim.redeem(200), /no such seat/);
   });
@@ -1620,7 +1707,7 @@ describe('redeem', () => {
     await g.closeRound(4);
     for (let r = 5; r < ROUND_COUNT; r++) await g.playRound(r);
     const [q, r] = g.rakeSplit();
-    await g.sim.settle(g.config.seed, q, r);
+    await g.sim.settle(g.config.vrfSecret, q, r);
 
     const owed = g.ledger().seatRedeemable.lookup(0n);
     const card = g.ledger().seatCard.lookup(0n);
@@ -2002,7 +2089,7 @@ describe('settlement guards', () => {
   it('refuses to settle before the game is finished while several seats still play', async () => {
     const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
     await g.playRound(0);
-    await assert.rejects(() => g.sim.settle(g.config.seed, 0n, 0n), /not finished/);
+    await assert.rejects(() => g.sim.settle(g.config.vrfSecret, 0n, 0n), /not finished/);
   });
 
   it('settles a walkover: one active seat left ends the game right there', async () => {
@@ -2023,13 +2110,17 @@ describe('settlement guards', () => {
     assert.ok(owedSeat0 > 0n, 'the eliminated seat is owed its stake minus the penalty');
 
     const [q, r] = g.rakeSplit();
-    const winner = await g.sim.settle(g.config.seed, q, r);
+    const winner = await g.sim.settle(g.config.vrfSecret, q, r);
     assert.equal(winner, 1n, 'the sole survivor wins the walkover');
 
     const after = g.ledger();
     assert.equal(after.phase, PHASE.settled);
     assert.equal(after.pot, 0n, 'settle drains the pot exactly');
-    assert.deepEqual(after.revealedSeed, g.config.seed, 'a walkover settle still reveals the seed');
+    assert.equal(
+      after.revealedVrfSecret,
+      g.config.vrfSecret,
+      'a walkover settle still reveals the seed',
+    );
 
     // The whole point: the eliminated seat can now collect without waiting out eleven rounds.
     const refunded = await g.sim.redeem(0);
@@ -2068,7 +2159,7 @@ describe('settlement guards', () => {
     // The walkover follows: the survivor is paid, and the resigner's redeem unlocks.
     const [sq, sr] = g.rakeSplit();
     g.sim.asOperator();
-    const winner = await g.sim.settle(g.config.seed, sq, sr);
+    const winner = await g.sim.settle(g.config.vrfSecret, sq, sr);
     assert.equal(winner, 1n);
     assert.equal(await g.sim.redeem(0), refund);
   });
@@ -2127,7 +2218,7 @@ describe('settlement guards', () => {
 
     assert.equal(g.ledger().activeSeats, 1n);
     const [q, r] = g.rakeSplit();
-    const winner = await g.sim.settle(g.config.seed, q, r);
+    const winner = await g.sim.settle(g.config.vrfSecret, q, r);
     assert.equal(winner, 5n);
   });
 
@@ -2136,8 +2227,8 @@ describe('settlement guards', () => {
     await g.playToEnd();
     const [q, r] = g.rakeSplit();
     await assert.rejects(
-      () => g.sim.settle(bytes32(0x99), q, r),
-      /does not open the table's seed commitment/,
+      () => g.sim.settle(WRONG_KEY, q, r),
+      /does not match the table's VRF public key/,
     );
     assert.equal(g.ledger().phase, PHASE.playing);
   });
@@ -2146,9 +2237,9 @@ describe('settlement guards', () => {
     const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
     await g.playToEnd();
     const [q, r] = g.rakeSplit();
-    await g.sim.settle(g.config.seed, q, r);
+    await g.sim.settle(g.config.vrfSecret, q, r);
 
-    await assert.rejects(() => g.sim.settle(g.config.seed, 0n, 0n), /table is not playing/);
+    await assert.rejects(() => g.sim.settle(g.config.vrfSecret, 0n, 0n), /table is not playing/);
     await assert.rejects(() => g.sim.closeRound(g.tick()), /table is not playing/);
     g.sim.asPlayer(g.players[0]!.sk);
     await assert.rejects(() => g.sim.openTurn(0, g.entropyFor(0, 0), g.clock), /not playing/);
@@ -2227,8 +2318,8 @@ describe('the settle deadline bypass', () => {
     const [q, r] = g.rakeSplit();
     const deadline = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs);
     await assert.rejects(
-      () => g.sim.settle(bytes32(0x99), q, r, deadline),
-      /does not open the table's seed commitment/,
+      () => g.sim.settle(WRONG_KEY, q, r, deadline),
+      /does not match the table's VRF public key/,
       'the predicate is strict: at the deadline exactly the seed is still required',
     );
   });
@@ -2237,15 +2328,15 @@ describe('the settle deadline bypass', () => {
     const g = await finished();
     const [q, r] = g.rakeSplit();
     const past = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs) + 1;
-    const winner = await g.sim.settle(bytes32(0x99), q, r, past);
+    const winner = await g.sim.settle(WRONG_KEY, q, r, past);
     assert.equal(winner, BigInt(g.expectedWinner()), 'the winner is unchanged by the waiver');
 
     const led = g.ledger();
     assert.equal(led.phase, PHASE.settled);
     assert.equal(led.pot, 0n);
-    assert.deepEqual(
-      led.revealedSeed,
-      new Uint8Array(32),
+    assert.equal(
+      led.revealedVrfSecret,
+      0n,
       'a force-settled game must be marked unverifiable, not falsely verifiable',
     );
     assert.deepEqual(
@@ -2269,15 +2360,15 @@ describe('the settle deadline bypass', () => {
     const g = await finished();
     const [q, r] = g.rakeSplit();
     const past = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs) + 1;
-    await g.sim.settle(g.config.seed, q, r, past);
-    assert.deepEqual(g.ledger().revealedSeed, g.config.seed);
+    await g.sim.settle(g.config.vrfSecret, q, r, past);
+    assert.equal(g.ledger().revealedVrfSecret, g.config.vrfSecret);
   });
 
   it('does not let the bypass settle an unfinished game', async () => {
     const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
     await g.playRound(0);
     const far = DEFAULT_BLOCK_TIME + 100_000_000;
-    await assert.rejects(() => g.sim.settle(bytes32(0x99), 0n, 0n, far), /not finished/);
+    await assert.rejects(() => g.sim.settle(WRONG_KEY, 0n, 0n, far), /not finished/);
   });
 });
 
@@ -2326,7 +2417,7 @@ describe('the stall matrix: every reachable state has a permissionless exit', ()
       await g.closeRound(4);
       for (let r = 5; r < ROUND_COUNT; r++) await g.playRound(r);
       const [q, r] = g.rakeSplit();
-      await g.sim.settle(g.config.seed, q, r);
+      await g.sim.settle(g.config.vrfSecret, q, r);
       assert.equal(g.ledger().pot, 0n, `rolls=${rolls}`);
       await g.sim.redeem(0);
       g.assertFullyDrained();
@@ -2380,7 +2471,7 @@ describe('the stall matrix: every reachable state has a permissionless exit', ()
     await g.playToEnd();
     const [q, r] = g.rakeSplit();
     const past = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs) + 1;
-    await g.sim.settle(bytes32(0), q, r, past);
+    await g.sim.settle(0n, q, r, past);
     assert.equal(g.ledger().pot, 0n);
     g.assertFullyDrained();
   });
@@ -2489,7 +2580,11 @@ describe('tie-break at table level', () => {
   // is the inputs that no longer reach its second leg.
 
   it('breaks a tie between two finishers by seat order', async () => {
-    const opts: TableOptions = { seats: 2, tableId: bytes32(84) };
+    const opts: TableOptions = {
+      seats: 2,
+      tableId: bytes32(84),
+      vrfSecret: 4822692657239678639097n,
+    };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(2), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');
@@ -2505,11 +2600,15 @@ describe('tie-break at table level', () => {
     );
 
     const [q, r] = g.rakeSplit();
-    assert.equal(await g.sim.settle(g.config.seed, q, r), 0n);
+    assert.equal(await g.sim.settle(g.config.vrfSecret, q, r), 0n);
   });
 
   it('falls back to the lowest seat at a four-seat table', async () => {
-    const opts: TableOptions = { seats: 4, tableId: bytes32(107) };
+    const opts: TableOptions = {
+      seats: 4,
+      tableId: bytes32(107),
+      vrfSecret: 4822692657239681276124n,
+    };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(4), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');
@@ -2519,7 +2618,11 @@ describe('tie-break at table level', () => {
     const g = await seated(opts, plan);
     await g.playToEnd();
     const [q, r] = g.rakeSplit();
-    assert.equal(await g.sim.settle(g.config.seed, q, r), 0n, 'lowest seat takes the last tie');
+    assert.equal(
+      await g.sim.settle(g.config.vrfSecret, q, r),
+      0n,
+      'lowest seat takes the last tie',
+    );
     assert.equal(g.ledger().pot, 0n);
   });
 });
@@ -2545,7 +2648,7 @@ describe('a six-seat table', () => {
     assert.equal(g.operatorTx, rep.operatorTx);
 
     const [q, r] = g.rakeSplit();
-    assert.equal(await g.sim.settle(g.config.seed, q, r), BigInt(g.expectedWinner()));
+    assert.equal(await g.sim.settle(g.config.vrfSecret, q, r), BigInt(g.expectedWinner()));
     assert.equal(g.ledger().pot, 0n);
   });
 
@@ -2578,7 +2681,7 @@ describe('a six-seat table', () => {
     g.assertCustody();
 
     const [q, r] = g.rakeSplit();
-    const winner = await g.sim.settle(g.config.seed, q, r);
+    const winner = await g.sim.settle(g.config.vrfSecret, q, r);
     assert.equal(winner, BigInt(g.expectedWinner()));
     assert.ok(winner !== 2n && winner !== 4n, 'an eliminated seat cannot win');
     for (const s of [2, 4]) assert.ok((await g.sim.redeem(s)) > 0n);
@@ -2642,7 +2745,7 @@ describe('token custody, as far as the simulator can see it', () => {
     await g.playToEnd();
     const pot = g.ledger().pot;
     const [q, r] = g.rakeSplit();
-    await g.sim.settle(g.config.seed, q, r);
+    await g.sim.settle(g.config.vrfSecret, q, r);
     assert.equal(g.ledger().pot, 0n);
     assert.equal(q + (pot - q), pot, 'the two payments must sum to the whole pot');
   });
@@ -2664,7 +2767,7 @@ describe('token custody, as far as the simulator can see it', () => {
     g.assertCustody();
 
     const [q, r] = g.rakeSplit();
-    await g.sim.settle(g.config.seed, q, r);
+    await g.sim.settle(g.config.vrfSecret, q, r);
     assert.equal(g.ledger().pot, 0n);
     // After settle the whole obligation is seat 2's refund, and redeeming it clears the books.
     let owed = 0n;
@@ -2689,7 +2792,7 @@ describe('token custody, as far as the simulator can see it', () => {
     }
     await g.playToEnd();
     const [q, r] = g.rakeSplit();
-    const winner = await g.sim.settle(g.config.seed, q, r);
+    const winner = await g.sim.settle(g.config.vrfSecret, q, r);
     assert.deepEqual(
       g.ledger().seatIdentity.lookup(winner).addr.bytes,
       players[Number(winner)]!.addr.bytes,

@@ -563,28 +563,56 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * contract rebuilds this same point when the roll is revealed, so a query built on anything
    * else is simply refused.
    */
-  #query(seat: number, round: bigint, rollIndex: bigint, holdMask: boolean[]): JubjubPoint {
+  #query(
+    seat: number,
+    round: bigint,
+    rollIndex: bigint,
+    holdMask: boolean[],
+  ): { blinded: JubjubPoint; rho: bigint } {
+    void seat;
     const rho = this.#nextBlinding();
-    this.blindings.set(seat, rho);
-    return vrf.blindQuery({
+    const { blinded } = vrf.blindQuery({
       tableId: this.config.tableId,
       round,
       rollIndex,
       holdMask: BigInt(packMask(holdMask)),
       seatSecret: this.actingSecret,
       blinding: rho,
-    }).blinded;
+    });
+    return { blinded, rho };
   }
 
-  /** Unblind the answer on chain for `seat`, so the next move can reveal it. */
+  /**
+   * Submit a move that asks a query, and keep its blinding ONLY IF THE CHAIN ACCEPTED IT.
+   *
+   * The blinding must match the query the contract actually holds. Committing it before the
+   * move lands means a REFUSED move -- and the stage-machine tests refuse moves on purpose --
+   * overwrites the blinding of the query still on chain, and the next legitimate reveal
+   * unblinds with the wrong rho. The real client has the same invariant: it stores rho when the
+   * transaction is confirmed, not when it is built.
+   */
+  async #ask(seat: number, rho: bigint, submit: () => Promise<bigint>): Promise<bigint> {
+    const stage = await submit();
+    this.blindings.set(seat, rho);
+    return stage;
+  }
+
+  /**
+   * Unblind the answer on chain for `seat`, so the next move can reveal it.
+   *
+   * A seat with NO blinding kept -- one that never asked, or whose turn is not between rolls --
+   * does not throw here. It loads a placeholder and lets the CONTRACT refuse the move with its
+   * own message. The stage-machine tests call `hold` and `score` out of order on purpose and
+   * assert on the contract's wording; a simulator error thrown first would be the wrong
+   * rejection for the right reason.
+   */
   #reveal(seat: number): void {
     const t = this.getLedger().seatTurn.lookup(BigInt(seat));
     const rho = this.blindings.get(seat);
-    if (rho === undefined) throw new Error(`no blinding kept for seat ${seat}`);
     this.privateState = {
       ...this.privateState,
-      vrfBlinding: rho,
-      vrfGamma: vrf.unblind(t.response, rho),
+      vrfBlinding: rho ?? 1n,
+      vrfGamma: rho === undefined ? NO_GAMMA : vrf.unblind(t.response, rho),
     };
   }
 
@@ -634,7 +662,9 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   openTurn(seat: number, entropy: Uint8Array, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     const round = this.getLedger().openRound;
     const q = this.#query(seat, round, 0n, NO_MASK());
-    return this.playerMove(seat, MOVE_OPEN, entropy, NO_MASK(), 0, q, blockTime);
+    return this.#ask(seat, q.rho, () =>
+      this.playerMove(seat, MOVE_OPEN, entropy, NO_MASK(), 0, q.blinded, blockTime),
+    );
   }
 
   /**
@@ -649,7 +679,9 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     const t = this.getLedger().seatTurn.lookup(BigInt(seat));
     const nextIndex = t.stage === 2n ? 1n : 2n;
     const q = this.#query(seat, t.round, nextIndex, mask);
-    return this.playerMove(seat, MOVE_HOLD, ZERO_BYTES32(), mask, 0, q, blockTime);
+    return this.#ask(seat, q.rho, () =>
+      this.playerMove(seat, MOVE_HOLD, ZERO_BYTES32(), mask, 0, q.blinded, blockTime),
+    );
   }
 
   /** `playerMove(score)`: reveal the roll, score it, end the turn. */

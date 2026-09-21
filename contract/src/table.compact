@@ -642,6 +642,25 @@ export ledger pot: Uint<64>;
  */
 export ledger revealedVrfSecret: Field;
 
+/**
+ * Each seat's entropy secret `sk_s`, revealed by its FINAL score.
+ *
+ * This is the other half of what a public replay needs. `x` alone recomputes nothing: every
+ * roll is `Gamma = x*P` and `P` is built from the seat's secret, so without `sk_s` a verifier
+ * can check the DLEQs and the key but cannot re-derive a single die. With it, anyone recomputes
+ * `P`, then `Gamma`, then the dice, for every roll the seat ever took — no proof needed after
+ * the fact.
+ *
+ * WHY THE FINAL SCORE IS THE RIGHT MOMENT. `sk_s` is the seat's authorisation to move and the
+ * input to its own future rolls. After round 13's score it has no future rolls and no moves
+ * left, so the secret guards nothing; `redeem` is permissionless and pays the address recorded
+ * at join. Revealing it any earlier would let anyone who also learned `x` predict that seat's
+ * remaining dice. A seat that is eliminated or aborted before its final score never reveals,
+ * and its rolls stay verifiable only by the proofs that landed while it was live — the
+ * verifier says so rather than pretending otherwise.
+ */
+export ledger seatSecretRevealed: Map<Uint<8>, Bytes<32>>;
+
 /** Winning seat, once settled. Meaningless before. */
 export ledger winnerSeatIndex: Uint<8>;
 
@@ -1649,6 +1668,11 @@ export circuit playerMove(
                      // operator wrote.
                      dice: revealedDice, }
       );
+    // The seat's last move. Its secret has nothing left to guard, and a public replay cannot
+    // recompute a single one of its rolls without it. See `seatSecretRevealed`.
+    if (finishing) {
+      seatSecretRevealed.insert(s, disclose(sk));
+    }
   }
 
   // ---- the turn's next stage -----------------------------------------------------------

@@ -18,7 +18,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { nextRescueStep } from '../rescue.ts';
-import { GameDriver, PHASE, alwaysStopEarly, bytes32, penaltySplit } from './table-harness.ts';
+import { GameDriver, PHASE, alwaysStopEarly, penaltySplit } from './table-harness.ts';
+
+/** A key that is NOT the table's, for the force-settle paths. */
+const WRONG_KEY = 0x99n * 1_000_003n + 11n;
 
 /** Open a table and seat everyone, the way table.test.ts does. */
 const seated = async (seats: number, fastMode = true): Promise<GameDriver> => {
@@ -147,7 +150,7 @@ describe('rescuing a stuck table: what to offer, and does the chain accept it', 
     // And the one it proposes now, proven accepted — with a seed that opens nothing, which is
     // the whole point: an operator that lost its seed file cannot lock the stakes.
     const [q, r] = g.rakeSplit();
-    const winner = await g.sim.settle(bytes32(0x99), q, r, Number(past));
+    const winner = await g.sim.settle(WRONG_KEY, q, r, Number(past));
     assert.equal(Number(winner), 1, 'the survivor takes the pot');
     assert.equal(Number(g.ledger().phase), PHASE.settled);
     assert.equal(g.ledger().seatRedeemable.lookup(0n) > 0n, true, 'seat 1 can now redeem');
@@ -170,7 +173,7 @@ describe('rescuing a stuck table: what to offer, and does the chain accept it', 
     assert.match(step.why, /cannot be re-verified/);
 
     const [q, r] = g.rakeSplit();
-    await g.sim.settle(bytes32(0x99), q, r, Number(past));
+    await g.sim.settle(WRONG_KEY, q, r, Number(past));
     assert.equal(Number(g.ledger().phase), PHASE.settled);
   });
 

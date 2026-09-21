@@ -139,3 +139,35 @@ export const unblind = (response: JubjubPoint, blinding: bigint): JubjubPoint =>
 
 /** The 32 bytes this roll's dice are derived from. */
 export const rollDigest = (gamma: JubjubPoint): Uint8Array => pureCircuits.vrfRollDigest(gamma);
+
+/**
+ * The 32 bytes THIS roll's dice come from, computed the way a replay computes them.
+ *
+ * Note what is absent: `rho`. The blinding cancels — `Gamma = rho^-1 * x * rho * P = x * P` —
+ * so a roll is a function of the table key, the seat secret and the public position in the
+ * game, and nothing else. That is what lets a test predict a roll before it is played, and a
+ * verifier recompute one after the fact, neither of them knowing any blinding.
+ *
+ * Drop-in for the old `seed` in `rollContext`: the ladder below it is unchanged.
+ */
+export function rollDigestFor(args: {
+  secret: bigint;
+  tableId: Uint8Array;
+  round: bigint;
+  rollIndex: bigint;
+  holdMask: bigint;
+  seatSecret: Uint8Array;
+}): Uint8Array {
+  const inputPoint = pureCircuits.vrfInputPoint(
+    args.tableId,
+    args.round,
+    args.rollIndex,
+    args.holdMask,
+    args.seatSecret,
+  );
+  return pureCircuits.vrfRollDigest(pureCircuits.vrfScalarMul(inputPoint, args.secret));
+}
+
+/** The contract's `packHoldMask`: position i is bit i. */
+export const packHoldMask = (mask: readonly boolean[]): bigint =>
+  mask.reduce<bigint>((acc, held, i) => acc + (held ? 1n << BigInt(i) : 0n), 0n);
