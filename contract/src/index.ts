@@ -41,6 +41,7 @@ export * from './table-mirror.ts';
 export * from './witnesses.ts';
 export * from './table-witnesses.ts';
 export * from './vrf.ts';
+export * from './reveal.ts';
 
 export * as Dice from './managed/dice/contract/index.js';
 export * as Turn from './managed/turn/contract/index.js';
