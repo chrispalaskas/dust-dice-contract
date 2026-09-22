@@ -282,3 +282,41 @@ result. The attack that matters:
 Also covered: a response computed under a different key is refused; the operator's transaction
 demonstrably contains no dice; a held die survives a reroll; and two different queries never
 share a nonce commitment.
+
+---
+
+## Update, 2026-09-21 evening — the resolve became an oracle post
+
+Nothing above about the cryptography changed: the input point, the blinding, the DLEQ with the
+in-circuit Fiat–Shamir challenge and the deterministic nonce are exactly as written. What changed
+is _where the answer lands_, forced by a ledger rule rather than by the VRF.
+
+**The rule.** Ledger 9 executes every call's guaranteed transcript before any call's fallible one
+and rejects a merged transaction in which a guaranteed call follows a fallible one, in (segment,
+position) order. The ledger classes each whole call itself by size: a resolve is small enough to
+be guaranteed, `playerMove` is not. A fast table settles a turn as ONE transaction of up to seven
+merged calls, so its three resolves must be able to run first, against a state none of the turn's
+moves has touched — which is only sound if a resolve reads nothing a move writes.
+
+**The shape now.** One circuit, `resolveRoll(seat, rollIndex, round, blinded, response, dleqA1,
+dleqA2, dleqZ)`: it reads `phase`, `seatCount` and the sealed `vrfPublicKey`, verifies the DLEQ
+for the `blinded` it was _given_, and writes `vrfAnswer[seat*3 + rollIndex] = {round, blinded,
+response}`. It does not read the seat's turn and does not advance its stage. The player's next
+move reads that cell and asserts, before anything else, that `cell.round == turn.round` and
+`cell.blinded == turn.blinded` — the query this seat actually committed — and only then checks
+`B = ρ·P` and `S = ρ·Γ` as before. So the binding "the operator answered THIS seat's THIS query"
+moved from the resolve to the move that spends the answer, one call later, where it is asserted by
+the party the answer is for.
+
+**A sixth question for you.** The resolve now proves a DLEQ for _any_ point it is handed. An
+operator can post `S = x·B'` for a `B'` nobody asked; no move will ever match it, and the cell is
+overwritten by the next honest answer. I believe this is harmless — the DLEQ's soundness is
+per-point, `x` is never exposed by answering arbitrary points (that is the OPRF's blindness in the
+other direction), and one query per (seat, round, rollIndex) is still enforced by the move that
+committed it. Is there an argument I am missing for why an oracle that answers unsolicited points
+weakens anything?
+
+Verified on a local ledger-9 devnet: a two-seat 13-round game replays 1148/1148 checks from the
+revealed key and the revealed seat secrets, including, per roll, that the answer cell holds the
+seat's re-derived query and `x` applied to it; a fast table settled two seven-call turns in one
+transaction each.
