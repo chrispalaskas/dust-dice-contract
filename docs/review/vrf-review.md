@@ -320,3 +320,38 @@ Verified on a local ledger-9 devnet: a two-seat 13-round game replays 1148/1148 
 revealed key and the revealed seat secrets, including, per roll, that the answer cell holds the
 seat's re-derived query and `x` applied to it; a fast table settled two seven-call turns in one
 transaction each.
+
+## Update 2, same day — the resolve now carries deliberate ballast
+
+One more consequence of the move above, and the least pleasant thing in this contract.
+
+A merged fast turn is seven calls. `partitionTranscripts` sizes each call's `Transcript.gas` as
+if it ran alone, so at least one call in a multi-call transaction is under-budgeted and fails
+`Transcript(Execution(OutOfGas))` — intermittently, and worse the more calls ride along. The
+remedy is to inflate the declared budget, and it works on the **fallible** half only: inflating
+the guaranteed half is refused at admission with `OutsideTimeToDismiss`.
+
+The oracle-map resolve is small — it verifies a DLEQ and writes one map cell — so the ledger
+classed it _wholly guaranteed_, which is exactly where no headroom can be bought. A real player's
+settlement was rejected three times and the seat timed out of the game.
+
+So `resolveRoll` now ends with `resolveBallast()`: ten reads of the one `vrfAnswer` cell the
+constructor writes and nothing else ever touches, placed before the padding's checkpoint. That
+takes the call from ~10e9 to ~31e9 of Impact gas, past `playerMove`'s ~26e9, which moves it into
+the _wholly fallible_ class. Every call of a turn is then fallible: the causality rule of Update 1
+holds trivially, because no guaranteed transcript exists anywhere in the transaction, and the gas
+remedy covers every call. The reads are conflict-free (a `Map` lookup binds to the cell), cannot
+be folded away, and add no circuit constraints — `resolveRoll` is still k=12 with a 1.35 MB
+prover key.
+
+The observed classification tiers, for what they are worth, since no specification I can find
+states them: **light → wholly guaranteed** (an explicit `kernel.checkpoint()` is ignored),
+**middling → split at the checkpoint**, **heavy → wholly fallible**.
+
+**A seventh question, and the one I would most like your view on.** Deliberately wasting
+execution budget to buy a classification is obviously a hack, and it is pinned to a threshold
+nobody has published — `buildResolve` asserts the resolve comes back fallible so a ledger release
+that moves the boundary fails loudly rather than silently. Is there a supported way to ask for a
+call to be placed in the fallible phase, or to raise a guaranteed budget, that I have missed? If
+not, is the split-at-checkpoint behaviour stable enough to build on, or is the honest answer that
+multi-call transactions should not be used until `partition_transcripts` budgets them correctly?
