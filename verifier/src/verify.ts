@@ -755,8 +755,11 @@ async function verify(address: string, verbose: boolean): Promise<number> {
           break;
         }
         const round = Number(prev.openRound);
-        const wasStage = Number(prev.seatTurn.lookup(BigInt(seat)).stage);
-        const nowStage = Number(led.seatTurn.lookup(BigInt(seat)).stage);
+        // EFFECTIVE stages (0..6), like `STAGE` -- the ledger's own 0..3 says nothing about
+        // whether the roll was answered, and an open happens to read 0 -> 1 in both numberings,
+        // which is how a raw read here passed the opens and misread every hold (2026-09-21).
+        const wasStage = effectiveStage(prev, seat);
+        const nowStage = effectiveStage(led, seat);
         const r = seats[seat]!;
 
         if (wasStage === STAGE.idle && nowStage === STAGE.awaitRoll1) {
