@@ -1221,6 +1221,45 @@ circuit padTransaction(): [] {
 }
 
 /**
+ * BALLAST: make `resolveRoll` too heavy for the ledger to run it in the guaranteed phase.
+ *
+ * This is deliberate waste, and it is load-bearing. Two ledger-9 rules meet here:
+ *
+ *   1. A merged transaction is refused (`Malformed(SequencingCheck(CausalityConstraintViolation))`)
+ *      if a call with a GUARANTEED transcript follows one with a FALLIBLE transcript in
+ *      (segment, position) order -- bugs-found #35, which the oracle-map resolve was built for.
+ *   2. `partitionTranscripts` under-budgets `Transcript.gas` for every call of a multi-call
+ *      transaction, sizing each as if it ran alone; the shortfall is intermittent and worsens
+ *      with call count -- inherited bug #21. The known remedy is to inflate the budget, and it
+ *      works on the FALLIBLE half only: inflating the guaranteed half is refused at admission
+ *      with `OutsideTimeToDismiss`.
+ *
+ * A fast turn merges seven calls. Left alone the ledger classes each WHOLE call by weight --
+ * light ones wholly guaranteed, middling ones split at the checkpoint, heavy ones wholly
+ * fallible -- and a resolve at ~10e9 was light enough to land guaranteed, where its budget
+ * cannot be topped up. That is what rejected a real player's settlement with
+ * `guaranteed execution would fail: Transcript(Execution(OutOfGas))` (2026-09-22).
+ *
+ * So the resolve is made heavy enough to be classed wholly fallible, like every `playerMove`,
+ * putting all seven calls of a turn in one phase: rule 1 is satisfied trivially (no guaranteed
+ * call anywhere) and rule 2's remedy covers every call. The weight is ten reads of the one
+ * `vrfAnswer` cell nothing ever writes after the constructor -- so it is conflict-free, cannot
+ * be folded away (each is a real ledger read, measured to cost ~2.1e9 apiece and to scale
+ * linearly), and costs no proving time worth the name.
+ *
+ * MUST STAY ABOVE THE THRESHOLD, which no specification publishes. `service/src/index.ts`
+ * refuses to start if a resolve is not classed fallible, so a ledger release that moves the
+ * boundary stops the operator loudly instead of returning it to coin-flip settlements.
+ */
+circuit resolveBallast(): [] {
+  for (const _i of 0..10) {
+    assert(vrfAnswer.lookup(noAnswerKey()).round == noAnswerRound(),
+           "resolveRoll: the never-answered cell was written"
+           );
+  }
+}
+
+/**
  * Pin a declared `now` to real block time. See section 5 of the header.
  *
  * `now` must already be `disclose`d by the caller: it arrives as an exported circuit's
@@ -1842,6 +1881,9 @@ export circuit resolveRoll(seat: Uint<8>,
   vrfAnswer.insert(answerKey(s, i),
                    VrfAnswer { round: disclose(round), blinded: b, response: answer, });
 
+  // Before the padding's checkpoint, so it weighs the part the ledger would otherwise run in
+  // the guaranteed phase. See `resolveBallast`.
+  resolveBallast();
   padTransaction();
 }
 

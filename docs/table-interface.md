@@ -162,6 +162,14 @@ by the next honest answer.
 not); with the latch moved to the open nothing distinguishes them, and the merge frees a slot
 under the nine-circuit deploy ceiling (§11) — eight are exported now.
 
+**It carries deliberate ballast** (`resolveBallast`): ten reads of the one `vrfAnswer` cell the
+constructor writes and nothing else touches, which take the call from ~10e9 to ~31e9 of Impact
+gas. That is what makes the ledger class it **wholly fallible** rather than guaranteed, so a
+merged fast turn has no guaranteed transcript anywhere — satisfying the causality rule of §1 and
+letting every call's gas budget be topped up, which the guaranteed half does not allow
+([bugs-found.md #36](bugs-found.md)). The reads are conflict-free and add no circuit
+constraints. `buildResolve` refuses to build a resolve that comes back guaranteed.
+
 The operator's entire authority is knowledge of `x` — there is no operator address in the
 contract. **The seat, roll index, round and query are arguments**: the operator reads them off
 the seat's `seatTurn` (on-chain tables) or receives them over the fast channel (fast tables).

@@ -177,12 +177,21 @@ class BaseSimulator<PS> {
     );
   }
 
+  /**
+   * What the LAST circuit run cost the on-chain VM, by circuit id -- the Impact transcript's
+   * running cost, not the proving cost. The ledger classes a call guaranteed or fallible by how
+   * heavy it is (bugs-found #35, #36), so this is what a change to that classification is aimed
+   * at, and measuring it here costs a test run rather than a full key build.
+   */
+  readonly gasCost = new Map<string, unknown>();
+
   /** Run a generated circuit and commit its resulting ledger and private state. */
   async run<R>(
     circuitId: string,
     call: (ctx: ReturnType<BaseSimulator<PS>['context']>) => Promise<CircuitResult<PS, R>>,
   ): Promise<R> {
     const res = await call(this.context(circuitId));
+    if ('gasCost' in res) this.gasCost.set(circuitId, (res as { gasCost: unknown }).gasCost);
     this.state = res.context.callContext.currentQueryContext.state;
     if (res.context.callContext.currentPrivateState !== undefined) {
       this.privateState = res.context.callContext.currentPrivateState;

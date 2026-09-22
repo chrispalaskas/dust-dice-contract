@@ -244,7 +244,16 @@ describe('conflict-freedom', () => {
     // guaranteed while a player move is not. So the three resolves of a turn execute FIRST,
     // against a state none of the turn's moves has touched -- and that is only sound if a
     // resolve reads nothing a move writes. Not the stage, not the query, not the turn at all.
-    assert.deepEqual(sorted(ledgerReads('resolveRoll')), ['phase', 'seatCount', 'vrfPublicKey']);
+    // `vrfAnswer` is read as well as written, and that is still conflict-free: a Map lookup
+    // binds to the CELL, as the six-seat tests above rely on, and the cells in play are this
+    // seat's own plus `noAnswerKey()` -- which nothing writes after the constructor. The reads
+    // of that one cell are `resolveBallast`, weighing the call into the fallible phase.
+    assert.deepEqual(sorted(ledgerReads('resolveRoll')), [
+      'phase',
+      'seatCount',
+      'vrfAnswer',
+      'vrfPublicKey',
+    ]);
     assert.deepEqual(sorted(ledgerWrites('resolveRoll')), ['padStore', 'vrfAnswer']);
   });
 
