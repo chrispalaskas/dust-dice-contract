@@ -24,7 +24,8 @@
     "format": "prettier --check .",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "verify": "npm run verify -w verifier --"
+    "verify": "npm run verify -w verifier --",
+    "postinstall": "node scripts/patch-gas-factor.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
