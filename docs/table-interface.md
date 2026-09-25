@@ -259,9 +259,9 @@ on an on-chain table an elimination re-stamps the phase schedule, see below.
     | 6    | score on roll 3      | revealed, and every contribution to roll 3 is in                                                      |
 
     A seat blocked behind another's silence owes nothing; the silent one does. **The elimination
-    re-stamps `roundOpenedAt = now` and `roundDeadline = now + turnTimeoutSecs`**, so whoever it
-    unblocks gets a whole slot rather than being due at once. Mirror: `seatObligation` /
-    `eliminableSeats` in `@dust-dice/contract` — use them, never a hand-rolled rule.
+    re-stamps `roundOpenedAt = now + 120` and `roundDeadline = now + turnTimeoutSecs`**, so
+    whoever it unblocks gets a whole slot rather than being due at once. Mirror: `seatObligation`
+    / `eliminableSeats` in `@dust-dice/contract` — use them, never a hand-rolled rule.
 
   Penalty split in both modes: `q * 13 + rem == tier * (openRound + 1)`, `rem < 13`.
 
@@ -504,10 +504,12 @@ refuses any timeout at or below `120 * 2 = 240 s` (the factor was 4 until fast t
 five-minute rounds; a 300 s round survives the worst 120 s shave with 180 s left).
 
 **(on-chain) The phase schedule.** `roundOpenedAt` (stamped by `join`'s last seat, `abortTable`'s
-early start, `closeRound`, and re-stamped by `eliminate`) plus `n * phaseSecs` is the end of slot
-`n`, 1..6 as in the `eliminate` table; `phaseSecs` is sealed, must exceed 240 s, and six slots
-must fit inside `turnTimeoutSecs` (`0` on a fast table). Show the player the end of the slot of
-the obligation `seatObligation` reports, and "waiting for …" when it reports none.
+early start, `closeRound`, and re-stamped by `eliminate`, each at its declared `now` **plus the
+120 s slack**, so no caller can start a round's clock in the past) plus `n * phaseSecs` is the end
+of slot `n`, 1..6 as in the `eliminate` table; `phaseSecs` is sealed, must exceed 120 s, and six
+slots must fit inside `turnTimeoutSecs` (`0` on a fast table). The operator's default is 180 s:
+three minutes per move. Show the player the end of the slot of the obligation `seatObligation`
+reports, and "waiting for …" when it reports none.
 
 ---
 

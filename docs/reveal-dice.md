@@ -111,11 +111,30 @@ nothing; the silent one does. The rule, as `eliminate` computes it and `seatObli
 **An elimination re-stamps the schedule.** Whoever was blocked behind the eliminated seat is
 unblocked by it and must get a whole slot, not be due at once — otherwise one silence would
 cascade through the table. That is why `eliminate` now declares a `now` (pinned like
-`closeRound`'s); an under-declaration shortens the fresh slot 1 by at most the slack, which the
-constructor's floor already prices in (`phaseSecs > 240 s`, six slots inside `turnTimeoutSecs`).
+`closeRound`'s).
 
-A straggler costs the others at most one slot per phase, and a slot is a maximum: a table of
-attentive players moves at transaction speed.
+**No caller can start the clock in the past.** Every writer of `roundOpenedAt` declares its time,
+and the sandwich lets a declaration trail block time by up to the slack (120 s). Stamped at the
+declared time, a hostile `closeRound` or `eliminate` — both permissionless — could start the next
+round two minutes early and eliminate whoever had not opened in what was left of the slot. So
+the origin is stamped a slack AHEAD of the declared time (`scheduleOrigin`), which puts it in
+`(blockTime, blockTime + slack]` whatever the caller declares: the worst case is a full slot, and
+an honest stamp gives the table a minute or so extra at the start of each round. The round
+deadline prices the same attack in with a 240 s floor; a slot no longer has to. Its floor is the
+slack itself — the time a move is budgeted to land in — so `phaseSecs > 120 s`, six slots inside
+`turnTimeoutSecs`.
+
+**The house rule is three minutes** (`DEFAULT_PHASE_SECS` in the operator): a seat that does
+not make the move it owes within three minutes of that move becoming possible is out, and
+forfeits the elimination penalty, `tier * (round + 1) / 13`. A straggler costs the others at
+most one slot per phase, and a slot is a maximum: a table of attentive players moves at
+transaction speed, and a round then takes a few minutes; the eighteen-minute budget is reached
+only by a seat stalling in every phase.
+
+The one trade-off of a fixed schedule: deadlines are absolute from the origin, so a seat that
+moves _after_ its own slot has ended, before anyone eliminates it, eats into the next seat's
+slot. It is always eliminable at that point — by any player, not only the operator — which is
+what keeps the trick from paying.
 
 ## Cost
 

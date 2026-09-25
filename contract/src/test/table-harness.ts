@@ -89,6 +89,13 @@ import {
 /** Rounds per seat: 0..12, thirteen in total, one category each. */
 export const ROUND_COUNT = 13;
 
+/**
+ * `timeSlackSecs()`: how far a declared `now` may trail block time -- and how far AHEAD of the
+ * declared time every phase schedule is stamped (`scheduleOrigin`), so no caller can start a
+ * round's clock in the past.
+ */
+export const TIME_SLACK_SECS = 120;
+
 /** The last round a seat plays. Completing it completes the scorecard. */
 export const FINAL_ROUND = 12;
 
@@ -912,8 +919,8 @@ export class GameDriver {
     if (!this.config.fastMode && after.phase === PHASE.playing) {
       assert.equal(
         after.roundOpenedAt,
-        BigInt(this.clock),
-        'an on-chain elimination must restart the phase schedule',
+        BigInt(this.clock + TIME_SLACK_SECS),
+        'an on-chain elimination must restart the phase schedule, a slack ahead',
       );
     }
     assert.equal(
@@ -1195,7 +1202,11 @@ export class GameDriver {
       BigInt(at) + this.config.turnTimeoutSecs,
       'closeRound must stamp the next round’s deadline',
     );
-    assert.equal(led.roundOpenedAt, BigInt(at), 'closeRound must stamp the phase schedule origin');
+    assert.equal(
+      led.roundOpenedAt,
+      BigInt(at + TIME_SLACK_SECS),
+      'closeRound must stamp the phase schedule origin, a slack ahead of its declared time',
+    );
     this.assertCustody();
   }
 

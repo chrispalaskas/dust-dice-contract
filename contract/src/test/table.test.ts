@@ -128,6 +128,7 @@ import {
   REROLL_ALL,
   ROUND_COUNT,
   STAGE,
+  TIME_SLACK_SECS,
   tableConfig,
   type GamePlan,
   type Mask,
@@ -3145,7 +3146,11 @@ describe("the reveal scheme: an on-chain table rolls from the seats' contributio
     g.clock = at;
     let led = g.ledger();
     assert.equal(led.seatProgress.lookup(1n).eliminated, true);
-    assert.equal(Number(led.roundOpenedAt), at, 'an elimination restamps the schedule origin');
+    assert.equal(
+      Number(led.roundOpenedAt),
+      at + TIME_SLACK_SECS,
+      'an elimination restamps the schedule origin, a slack ahead of its declared time',
+    );
     assert.equal(led.roundDeadline, BigInt(at) + g.config.turnTimeoutSecs);
     assert.equal(led.seatReveal.lookup(revealKey(1, 1)).out, true);
     assert.equal(
@@ -3156,7 +3161,7 @@ describe("the reveal scheme: an on-chain table rolls from the seats' contributio
     // Seat 0 is unblocked: it owes a decision on roll 2, due a whole slot from the NEW origin,
     // and roll 2 is public with seat 1's slot contributing the fixed zero.
     assert.deepEqual([owed(0)?.kind, owed(0)?.slot], ['decide', SLOT.decide2]);
-    assert.equal(Number(owed(0)!.dueAt), at + SLOT.decide2 * P);
+    assert.equal(Number(owed(0)!.dueAt), at + TIME_SLACK_SECS + SLOT.decide2 * P);
     const turn = led.seatTurn.lookup(0n);
     const digest = chainDigestFor(g.config.tableId, 0, 1, six(g.players[0]!.sk, null));
     assert.deepEqual(
@@ -3244,14 +3249,62 @@ describe("the reveal scheme: an on-chain table rolls from the seats' contributio
     );
   });
 
-  it('needs a phase slot above the floor with six inside the round, and none on a fast table', async () => {
+  it('needs a phase slot above the slack with six inside the round, and none on a fast table', async () => {
+    // The floor is the declared-time slack (120 s), not the round's 240 s: a slot's origin
+    // cannot be stamped in the past, so there is no shave to price in. Three-minute slots --
+    // the operator's default -- are legal; a 120 s slot, no longer than the time a move is
+    // allowed to take to land, is not.
     const base = tableConfig({ seats: 2 }); // 600 s slots in a 3 600 s round
-    await assert.rejects(() => TableSimulator.create({ ...base, phaseSecs: 240n }), /phase slot/);
+    await assert.rejects(() => TableSimulator.create({ ...base, phaseSecs: 120n }), /phase slot/);
     await assert.rejects(() => TableSimulator.create({ ...base, phaseSecs: 601n }), /phase slot/);
-    await TableSimulator.create({ ...base, phaseSecs: 241n });
+    await TableSimulator.create({ ...base, phaseSecs: 121n });
+    await TableSimulator.create({ ...base, phaseSecs: 180n, turnTimeoutSecs: 1_080n });
     await TableSimulator.create({ ...base, phaseSecs: 600n });
+    await assert.rejects(
+      () => TableSimulator.create({ ...base, phaseSecs: 180n, turnTimeoutSecs: 1_079n }),
+      /phase slot/,
+      'six three-minute slots need an 18-minute round budget',
+    );
     const fast = tableConfig({ seats: 2, ...VRF });
-    await assert.rejects(() => TableSimulator.create({ ...fast, phaseSecs: 241n }), /phase slot/);
+    await assert.rejects(() => TableSimulator.create({ ...fast, phaseSecs: 121n }), /phase slot/);
     await TableSimulator.create({ ...fast, phaseSecs: 0n });
+  });
+
+  it("an under-declared close cannot shorten anyone's first slot", async () => {
+    // THE SHAVE. `closeRound` is permissionless and declares its time; the sandwich lets the
+    // declaration trail block time by up to the slack. Were the origin stamped at the declared
+    // time, a hostile closer could start the next round's clock two minutes in the past and
+    // eliminate whoever had not opened in the rest of a three-minute slot. Stamped a slack
+    // ahead, the origin is never before the block the close lands in.
+    const h = await seated(
+      { seats: 2, phaseSecs: 180n, turnTimeoutSecs: 1_080n },
+      { holds: alwaysStopEarly },
+    );
+    for (const seat of [0, 1]) {
+      h.sim.asPlayer(h.players[seat]!.sk);
+      await h.sim.openTurn(seat, h.entropyFor(seat, 0), h.tick());
+    }
+    for (const seat of [0, 1]) {
+      const seen = chainRevealFor(h.ledger(), seat)!;
+      h.sim.asPlayer(h.players[seat]!.sk);
+      await h.sim.score(seat, h.chooseCategory(seat, seen.dice), h.tick());
+    }
+    const T = h.clock + 1_000;
+    const worst = T - TIME_SLACK_SECS + 1; // the earliest time the sandwich accepts
+    await h.sim.closeRound(worst, T);
+    const led = h.ledger();
+    assert.ok(led.roundOpenedAt > BigInt(T), 'the origin must not be in the past');
+    const owed = seatObligation(led, 0)!;
+    assert.equal(owed.kind, 'open');
+    assert.ok(
+      owed.dueAt - BigInt(T) >= 180n,
+      `a hostile close left seat 0 ${owed.dueAt - BigInt(T)} s to open, less than a slot`,
+    );
+    const { q, rem } = penaltySplit(h.config.tier, 1);
+    await assert.rejects(
+      () => h.sim.eliminate(0, q, rem, T + 180, T + 180),
+      /phase deadline has not passed/,
+      'three minutes after the close landed, the first slot is still open',
+    );
   });
 });

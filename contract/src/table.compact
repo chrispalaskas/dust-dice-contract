@@ -982,9 +982,29 @@ export sealed ledger phaseSecs: Uint<64>;
  * ON-CHAIN TABLES: the origin of the open round's phase schedule. Stamped by whatever opens a
  * round (`join`, `abortTable`'s early start, `closeRound`) and RE-STAMPED by `eliminate`, so
  * that a seat whose obligation was blocked behind the eliminated one gets a fresh slot rather
- * than being due the instant it is unblocked. A blind write in every writer.
+ * than being due the instant it is unblocked. A blind write in every writer, always through
+ * `scheduleOrigin`, which is what makes the stamp safe to leave to any caller.
  */
 export ledger roundOpenedAt: Uint<64>;
+
+/**
+ * Where a phase schedule starts, from a declared `now`: `now + timeSlackSecs()`.
+ *
+ * THE SHAVE, AND WHY THIS CLOSES IT. Every writer of `roundOpenedAt` is told the time, and the
+ * sandwich traps a declared `now` in `(blockTime - slack, blockTime]` -- so a hostile caller of
+ * `closeRound` or `eliminate` (both permissionless) could stamp the origin up to 120 s in the
+ * PAST and shorten every seat's first slot by that much, then eliminate whoever had not opened
+ * in the time left. The round deadline defends against the same thing by pricing it in, with a
+ * floor of twice the slack. The schedule does better: stamped a slack AHEAD of the declared
+ * time, the origin lands in `(blockTime, blockTime + slack]` -- never in the past, whatever the
+ * caller declares. The worst a declarer can do is the honest case; an honest one gives the
+ * table up to the slack extra at the start of each round (in practice the slack minus proving
+ * and inclusion, a minute or so). Which is why a slot needs no floor tied to the slack's abuse,
+ * only one tied to what a move takes to land.
+ */
+pure circuit scheduleOrigin(now: Uint<64>): Uint<64> {
+  return (now + timeSlackSecs()) as Uint<64>;
+}
 
 /**
  * The 4 KB of transaction padding, as a COMPILE-TIME CONSTANT.
@@ -1409,15 +1429,16 @@ constructor(id: Bytes<32>,
   assert(tableTimeout > timeoutFloor,
          "table timeout must exceed four times the declared-time slack"
          );
-  // The phase slot has the same floor as the round, for the same reason: the origin is a
-  // declared time, under-declarable by the slack, and only slot 1 is shortened by that -- the
-  // later slots are fixed offsets from the same origin. Six slots must fit the round budget,
-  // so the score's slot never outlives the round deadline the settle grace is measured from.
-  // A fast table has no phases and says so with a zero.
+  // The phase slot does NOT inherit the round's floor: its origin cannot be stamped in the
+  // past (`scheduleOrigin`), so there is no shave to price in. Its floor is the slack itself --
+  // the budget the contract already grants a transaction between reading the chain's time and
+  // landing (proving, a wallet prompt, inclusion) -- because a slot shorter than one move is a
+  // slot nobody can meet. Six slots must fit the round budget, so the score's slot never
+  // outlives the round deadline. A fast table has no phases and says so with a zero.
   assert(fast
            ? phaseSlot == 0
-           : (phaseSlot > timeoutFloor && turnTimeout >= (phaseSlot * 6) as Uint<64>),
-         "phase slot must be 0 on a fast table, else exceed the declared-time floor with six slots inside the turn timeout"
+           : (phaseSlot > timeSlackSecs() && turnTimeout >= (phaseSlot * 6) as Uint<64>),
+         "phase slot must be 0 on a fast table, else exceed the declared-time slack with six slots inside the turn timeout"
          );
 
   tableId = disclose(id);
@@ -1598,7 +1619,7 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
     // Round 0 opens now, and every seat gets a full turn timeout to play its first turn.
     phase = Phase.playing;
     openRound = 0;
-    roundOpenedAt = t;
+    roundOpenedAt = scheduleOrigin(t);
     roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
   } else {
     // The fill clock. Restarted by every join, so a table that is still attracting players is
@@ -2193,7 +2214,7 @@ export circuit closeRound(now: Uint<64>): Uint<8> {
   // Restamped even for the final close, because `settle`'s seed-waiver deadline is measured from
   // it: the operator gets one more table timeout past the end of the game to produce the seed
   // before anyone may force-settle without it.
-  roundOpenedAt = t;
+  roundOpenedAt = scheduleOrigin(t);
   roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
 
   padTransaction();
@@ -2300,8 +2321,8 @@ export circuit eliminate(
 
   const vol = disclose(voluntary);
   // Declared and pinned like `closeRound`'s, because on an on-chain table this circuit
-  // RE-STAMPS the phase schedule (see the end). Under-declaring shortens the fresh slot 1 by
-  // at most the slack, the bound the constructor's floor already prices in.
+  // RE-STAMPS the phase schedule (see the end). Under-declaring shortens nothing: the new
+  // origin is stamped a slack ahead of the declared time (`scheduleOrigin`).
   const t = disclose(now);
   pinTime(t);
   const playing = phase == Phase.playing;
@@ -2476,7 +2497,7 @@ export circuit eliminate(
   // and must get a whole slot rather than be due at once -- otherwise one silence would
   // cascade through the table. Blind writes, like every writer of these two.
   if (playing && !fastMode) {
-    roundOpenedAt = t;
+    roundOpenedAt = scheduleOrigin(t);
     roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
   }
 
@@ -2886,7 +2907,7 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
     phase = Phase.playing;
     started = true;
     openRound = 0;
-    roundOpenedAt = t;
+    roundOpenedAt = scheduleOrigin(t);
     roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
   } else {
     pot = 0;
