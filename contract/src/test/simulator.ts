@@ -87,6 +87,7 @@ import {
   type TablePrivateState,
 } from '../table-witnesses.ts';
 import * as vrf from '../vrf.ts';
+import { contributionTs } from '../contrib.ts';
 
 export type { Scorecard, ScoreOutcome, TurnOutcome, TableLedgerType, UserAddress };
 
@@ -463,6 +464,8 @@ export type TableConfig = {
   startAfterSecs: bigint;
   /** `inviteCommitment(code)` for a private table; 32 zero bytes for a public one. */
   inviteHash: Uint8Array;
+  /** ON-CHAIN: one phase slot of the round schedule; must be 0 on a fast table. */
+  phaseSecs: bigint;
 };
 
 /**
@@ -481,6 +484,12 @@ export type TableConfig = {
  * `blockTime` is still explicit everywhere. `createCircuitContext` defaults it to wall clock,
  * which makes any block-time-dependent test non-reproducible (docs/bugs-found.md #12).
  */
+/**
+ * `default<JubjubPoint>` -- the identity (0, 1), NOT (0, 0) -- which is what an on-chain
+ * table's move carries in place of a VRF query, and what the contract asserts it carries.
+ */
+export const NO_QUERY_POINT: JubjubPoint = { x: 0n, y: 1n };
+
 /** The contract's `packHoldMask`, for building a query off chain. Position i is bit i. */
 const packMask = (mask: boolean[]): number =>
   mask.reduce((acc, held, i) => acc + (held ? 1 << i : 0), 0);
@@ -516,6 +525,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         config.fastMode,
         config.startAfterSecs,
         config.inviteHash,
+        config.phaseSecs,
       ),
     );
     return sim;
@@ -677,6 +687,10 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * moment the turn opens.
    */
   openTurn(seat: number, entropy: Uint8Array, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+    // An ON-CHAIN table has no VRF and nothing to ask: the query is the canonical zero point.
+    if (!this.config.fastMode) {
+      return this.playerMove(seat, MOVE_OPEN, entropy, NO_MASK(), 0, NO_QUERY_POINT, blockTime);
+    }
     const round = this.getLedger().openRound;
     const q = this.#query(seat, round, 0n, NO_MASK());
     return this.#ask(seat, q.rho, () =>
@@ -693,6 +707,9 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    */
   hold(seat: number, mask: boolean[], blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.#reveal(seat);
+    if (!this.config.fastMode) {
+      return this.playerMove(seat, MOVE_HOLD, ZERO_BYTES32(), mask, 0, NO_QUERY_POINT, blockTime);
+    }
     const t = this.getLedger().seatTurn.lookup(BigInt(seat));
     const nextIndex = t.stage === 1n ? 1n : 2n;
     const q = this.#query(seat, t.round, nextIndex, mask);
@@ -704,15 +721,40 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   /** `playerMove(score)`: reveal the roll, score it, end the turn. */
   score(seat: number, category: number, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.#reveal(seat);
-    // The turn ends here, so nothing will read this query. It still has to be a point.
+    // The turn ends here, so nothing will read this query. It still has to be a point -- and
+    // on an on-chain table it has to be THE zero point, the canonical "no query".
     return this.playerMove(
       seat,
       MOVE_SCORE,
       ZERO_BYTES32(),
       NO_MASK(),
       category,
-      NO_GAMMA,
+      this.config.fastMode ? NO_GAMMA : NO_QUERY_POINT,
       blockTime,
+    );
+  }
+
+  /**
+   * ON-CHAIN: publish this seat's contribution to roll `rollIndex` (1 or 2) of the open round,
+   * derived from the acting player's secret exactly as the circuit re-derives it. Legal only
+   * once every seat still rolling has fixed the hold before that roll.
+   */
+  revealEntropy(seat: number, rollIndex: number, blockTime = DEFAULT_BLOCK_TIME): Promise<[]> {
+    const round = this.getLedger().openRound;
+    const value = contributionTs(this.actingSecret, this.config.tableId, round, rollIndex);
+    return this.revealEntropyRaw(seat, rollIndex, value, blockTime);
+  }
+
+  /** The raw reveal: any value, so a test can send a wrong one. */
+  revealEntropyRaw(
+    seat: number,
+    rollIndex: number,
+    value: Uint8Array,
+    blockTime = DEFAULT_BLOCK_TIME,
+  ): Promise<[]> {
+    this.blockTime = blockTime;
+    return this.run('revealEntropy', (ctx) =>
+      this.table.impureCircuits.revealEntropy(ctx, BigInt(seat), BigInt(rollIndex), value),
     );
   }
 
@@ -775,13 +817,21 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   }
 
   /**
-   * Knock out a seat that let the round deadline pass. Declares no time -- `roundDeadline` is
-   * compared against real block time by the kernel.
+   * Knock out a seat that let its deadline pass: the round deadline on a fast table, the phase
+   * slot of its unblocked obligation on an on-chain one. Declares `now` (pinned like
+   * `closeRound`'s) because on an on-chain table it re-stamps the schedule; defaults to
+   * `blockTime`, the honest case.
    */
-  eliminate(seat: number, q: bigint, rem: bigint, blockTime: number): Promise<bigint> {
+  eliminate(
+    seat: number,
+    q: bigint,
+    rem: bigint,
+    blockTime: number,
+    now: number = blockTime,
+  ): Promise<bigint> {
     this.blockTime = blockTime;
     return this.run('eliminate', (ctx) =>
-      this.table.impureCircuits.eliminate(ctx, BigInt(seat), q, rem, false),
+      this.table.impureCircuits.eliminate(ctx, BigInt(seat), q, rem, false, BigInt(now)),
     );
   }
 
@@ -790,10 +840,16 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * secret (call `asPlayer(sk)` first — the witness supplies it). Charged one round LESS than a
    * timeout: `q * 13 + rem == tier * openRound`.
    */
-  resign(seat: number, q: bigint, rem: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+  resign(
+    seat: number,
+    q: bigint,
+    rem: bigint,
+    blockTime = DEFAULT_BLOCK_TIME,
+    now: number = blockTime,
+  ): Promise<bigint> {
     this.blockTime = blockTime;
     return this.run('eliminate', (ctx) =>
-      this.table.impureCircuits.eliminate(ctx, BigInt(seat), q, rem, true),
+      this.table.impureCircuits.eliminate(ctx, BigInt(seat), q, rem, true, BigInt(now)),
     );
   }
 

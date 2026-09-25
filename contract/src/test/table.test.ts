@@ -50,7 +50,27 @@
  * Run: npm test -w @dust-dice/contract
  */
 
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
+import v8 from 'node:v8';
+import vm from 'node:vm';
+
+/**
+ * COLLECT AFTER EVERY TEST. `gc` is taken from V8 directly (`setFlagsFromString` plus a fresh
+ * context) rather than from `--expose-gc`: the test runner rebuilds each file's node flags from
+ * its own settings and does not pass that one through, which left the hook a no-op and the file
+ * crawling under `npm test` while passing in isolation (2026-09-24).
+ *
+ * The ledger's WASM wrappers (states, query contexts) free their Rust memory through a
+ * FinalizationRegistry, i.e. only after a garbage collection notices the wrapper is dead --
+ * the same shape as docs/bugs-found.md #29 in the operator. A test file that plays some thirty
+ * whole games leaves thousands of dead states behind, V8 sees a small steady JS heap and
+ * collects rarely, and every later circuit call gets slower: measured 2026-09-24, sixteen
+ * describe blocks took 160 s alone and never finished within 300 s once two more games were
+ * added; with this hook the same 111 tests take 180 s.
+ */
+v8.setFlagsFromString('--expose-gc');
+const collect = vm.runInNewContext('gc') as () => void;
+afterEach(() => collect());
 import assert from 'node:assert/strict';
 import {
   CATEGORY_COUNT,
@@ -115,6 +135,14 @@ import {
   type TableOptions,
 } from './table-harness.ts';
 import * as vrf from '../vrf.ts';
+import {
+  chainDigestFor,
+  chainRevealFor,
+  contributionTs,
+  revealKey,
+  seatObligation,
+  SLOT,
+} from '../contrib.ts';
 
 /**
  * A stand-in blinded query for moves that are REFUSED before the VRF is consulted at all —
@@ -152,6 +180,14 @@ const digestFor = (
 
 /** `noFinish()` -- the sentinel standing in for `rules.ts`'s `Infinity`. */
 const NO_FINISH = 65535n;
+
+/**
+ * A FAST table. The blind VRF -- the operator's resolves, the answer cells, the unblinding --
+ * is the fast table's randomness now; an on-chain table rolls from the seats' contributions
+ * (reveal-core.compact, `describe('the reveal scheme')`) and refuses a resolve outright. Every
+ * test that drives resolves by hand, or expects `playTurn`'s per-seat sequence, runs here.
+ */
+const VRF = { fastMode: true } as const;
 
 /** Open a table and seat everyone. */
 async function seated(opts: TableOptions, plan: GamePlan = {}): Promise<GameDriver> {
@@ -196,6 +232,7 @@ describe('conflict-freedom', () => {
   it('binds playerMove to nothing that can move while it is in flight', () => {
     assert.deepEqual(sorted(ledgerReads('playerMove')), [
       // Frozen for the whole game once the table is `playing`.
+      'fastMode', //      sealed
       'openRound', //     written ONLY by closeRound, which cannot run while a seat may move
       'phase', //         written only by join's last seat and by the terminal circuits
       'roundDigest', //   frozen for the round (closeRound-only); the open latches its mix from it
@@ -203,19 +240,43 @@ describe('conflict-freedom', () => {
       'seatCount', //     written only by join, and join only runs while `filling`
       'seatIdentity', //  this seat's own, written once at join
       'seatProgress', //  this seat's own
+      'seatReveal', //    six cells at ONE roll index -- written only in the reveal phase, which
+      //                  never overlaps a decide (the two barriers), or by eliminate; and the
+      //                  never-written sentinel on an open
       'seatTurn', //      this seat's own
       'tableId', //       sealed
       'vrfAnswer', //     this seat's own three answer cells, or the never-written sentinel
     ]);
   });
 
+  it("keeps the reveal off every other seat's decide, and reads only what a reveal phase freezes", () => {
+    // ON-CHAIN, the ninth circuit. It binds to every seat's turn AND progress -- the barrier --
+    // which is exactly what `playerMove` must never do, and it is sound here because a reveal is
+    // legal only when no decide is: every seat still rolling has fixed its hold, so nothing
+    // writes those entries until the reveals are in. It writes ONE cell, its own seat's, so six
+    // seats reveal in one block.
+    assert.deepEqual(sorted(ledgerReads('revealEntropy')), [
+      'fastMode',
+      'openRound',
+      'phase',
+      'seatCount',
+      'seatIdentity',
+      'seatProgress',
+      'seatTurn',
+      'tableId',
+    ]);
+    assert.deepEqual(sorted(ledgerWrites('revealEntropy')), ['padStore', 'seatReveal']);
+  });
+
   it('lets playerMove write only its own seat and the padding sink', () => {
     // `seatSecretRevealed` is keyed by seat and written only by the seat's own final score, so
     // it is still "its own seat": no shared cell, no serialisation against the other seats.
+    // `seatReveal`: the open publishes the seat's contribution to roll 1 into its OWN cell.
     assert.deepEqual(sorted(ledgerWrites('playerMove')), [
       'padStore',
       'seatCard',
       'seatProgress',
+      'seatReveal',
       'seatSecretRevealed',
       'seatTurn',
     ]);
@@ -249,6 +310,7 @@ describe('conflict-freedom', () => {
     // seat's own plus `noAnswerKey()` -- which nothing writes after the constructor. The reads
     // of that one cell are `resolveBallast`, weighing the call into the fallible phase.
     assert.deepEqual(sorted(ledgerReads('resolveRoll')), [
+      'fastMode',
       'phase',
       'seatCount',
       'vrfAnswer',
@@ -270,6 +332,7 @@ describe('conflict-freedom', () => {
       'padStore',
       'roundDeadline',
       'roundDigest',
+      'roundOpenedAt',
     ]);
     // `roundDeadline` has the same rule with one exception: `join` opens round 0.
     assert.ok(ledgerWrites('join').has('roundDeadline'));
@@ -460,7 +523,7 @@ describe('the interactive turn', () => {
   // =======================================================================================
 
   it('walks the whole stage machine and refuses every out-of-order move', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const seat = 0;
     const cell = () => g.ledger().seatTurn.lookup(BigInt(seat));
     const NOT_ANSWERED = /has not answered this seat's query yet/;
@@ -537,7 +600,7 @@ describe('the interactive turn', () => {
   });
 
   it('lets a player stop after roll 1, for two player transactions and one operator one', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const before = { p: g.playerTx, o: g.operatorTx };
     await g.playTurn(0, 0, alwaysStopEarly);
     assert.equal(g.playerTx - before.p, 2, 'open + score');
@@ -548,7 +611,7 @@ describe('the interactive turn', () => {
   });
 
   it('costs four player transactions and three operator ones for a full turn', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const before = { p: g.playerTx, o: g.operatorTx };
     await g.playTurn(0, 0, alwaysThreeRolls);
     assert.equal(g.playerTx - before.p, 4, 'open + hold + hold + score');
@@ -558,7 +621,7 @@ describe('the interactive turn', () => {
   it('scores the dice as they stand, whichever roll the player stopped on', async () => {
     // Three seats stop at three different points in the same round; each must be scored on the
     // dice its own turn actually ended with, and the mirror must reproduce all three.
-    const g = await seated({ seats: 3 }, { strategy: 'bestScore' });
+    const g = await seated({ seats: 3, ...VRF }, { strategy: 'bestScore' });
     const stops: Mask[][] = [[], [maskOf(0, 1)], [maskOf(0, 1), maskOf(2, 3)]];
     for (let seat = 0; seat < 3; seat++) {
       const plannedHolds = stops[seat]!;
@@ -611,7 +674,7 @@ describe('the interactive turn', () => {
 
   it('matches the circuit on the stream merge for every mask', async () => {
     // The mirror against the compiled circuit, on real hash-derived dice, for all 32 masks.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const digest = g.ledger().roundDigest;
     const mixed = mixEntropyTs(g.entropyFor(0, 0), digest);
     const roll0 = firstRollTs(g.config.tableId, digestFor(g, 0, 0, 0), mixed, 0);
@@ -625,7 +688,7 @@ describe('the interactive turn', () => {
   });
 
   it('keeps a held die byte-for-byte across both rerolls', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const roll0 = await rolledOnce(g, 0);
     const mask = maskOf(0, 2, 4);
     // Every roll surfaces in the PLAYER's next move, one step after the operator answered it.
@@ -653,7 +716,7 @@ describe('the interactive turn', () => {
 
   it('writes each hold into the cell the next roll reads, and no other', async () => {
     // The v2 seam: `hold1` is read only by the reveal of roll 2 and `hold2` only by roll 3's.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await rolledOnce(g, 0);
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, maskOf(1, 3), g.tick());
@@ -670,7 +733,7 @@ describe('the interactive turn', () => {
   });
 
   it('clears both holds when a new turn is opened', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     // Pin masks that actually hold something, so "cleared" is distinguishable from "was already
     // empty" -- `alwaysThreeRolls` walks a schedule that includes the keep-nothing mask.
     await g.playTurn(0, 0, ({ step }) => (step === 0 ? maskOf(0, 1) : maskOf(2)));
@@ -695,7 +758,7 @@ describe('the interactive turn', () => {
   });
 
   it('pins the canonical sentinel for every argument a kind does not use', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const e = g.entropyFor(0, 0);
     g.sim.asPlayer(g.players[0]!.sk);
 
@@ -741,7 +804,7 @@ describe('the interactive turn', () => {
   });
 
   it('accepts a keep-nothing hold as "reroll everything"', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const roll0 = await rolledOnce(g, 0);
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.hold(0, REROLL_ALL(), g.tick());
@@ -794,7 +857,7 @@ describe('simultaneous rounds', () => {
   it('interleaves six pipelines without one seat touching another', async () => {
     // Round-robin every step across all six seats, which is the worst case for a shared pending
     // cell -- under the cursor model's seven singletons this could not even be expressed.
-    const g = await seated({ seats: 6 });
+    const g = await seated({ seats: 6, ...VRF });
     const digest = g.ledger().roundDigest;
     const masks = [0, 1, 2, 3, 4, 5].map((s) => maskOf(s % 5, (s + 2) % 5));
 
@@ -875,7 +938,7 @@ describe('simultaneous rounds', () => {
   });
 
   it('leaves every other seat byte-identical when one seat moves', async () => {
-    const g = await seated({ seats: 4 });
+    const g = await seated({ seats: 4, ...VRF });
     const snapshot = () => {
       const led = g.ledger();
       return [1, 2, 3].map((s) => ({
@@ -893,7 +956,7 @@ describe('simultaneous rounds', () => {
   });
 
   it('refuses a second turn in the same round', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await g.playTurn(0, 0, alwaysStopEarly);
     g.sim.asPlayer(g.players[0]!.sk);
     await assert.rejects(
@@ -908,7 +971,7 @@ describe('simultaneous rounds', () => {
     // submits round 1's entropy while round 0 is open cannot match its own commitment -- and if
     // it submits round 0's entropy instead, the round cursor refuses it as a repeat move (the
     // test above). Neither is bypassable by choosing the other argument.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await g.playTurn(0, 0, alwaysStopEarly);
     g.sim.asPlayer(g.players[0]!.sk);
     await assert.rejects(
@@ -923,7 +986,7 @@ describe('simultaneous rounds', () => {
   });
 
   it('accepts an answer for a seat that has not opened a turn, and it unlocks nothing', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.openTurn(0, g.entropyFor(0, 0), g.tick());
     g.sim.asOperator();
@@ -946,7 +1009,7 @@ describe('closeRound', () => {
   // =======================================================================================
 
   it('refuses to close while a live seat still owes the round', async () => {
-    const g = await seated({ seats: 3 });
+    const g = await seated({ seats: 3, ...VRF });
     await g.playTurn(0, 0);
     await g.playTurn(1, 0);
     await assert.rejects(() => g.sim.closeRound(g.tick()), /not every seat has finished/);
@@ -958,7 +1021,7 @@ describe('closeRound', () => {
     // Seven sub-states, and the round is not over in any of them. This is what
     // `seatProgress.round` being advanced by SCORING rather than by a resolve buys: one read per
     // seat settles the question at every one of them.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await g.playTurn(0, 0, alwaysStopEarly);
     const seat = 1;
 
@@ -1004,7 +1067,7 @@ describe('closeRound', () => {
   });
 
   it('restamps the deadline every round, and only there', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const atOpen = g.ledger().roundDeadline;
     await g.playTurn(0, 0);
     await g.playTurn(1, 0);
@@ -1015,7 +1078,7 @@ describe('closeRound', () => {
   });
 
   it('is permissionless -- a player can advance a table whose operator went quiet', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await g.playTurn(0, 0);
     await g.playTurn(1, 0);
     g.sim.asPlayer(g.players[1]!.sk);
@@ -1032,7 +1095,7 @@ describe('the frozen round digest', () => {
   // the operator its choice of everybody's future dice, by choosing the order it resolves in.
 
   it('gives every seat in a round the same digest to hash against', async () => {
-    const g = await seated({ seats: 4 });
+    const g = await seated({ seats: 4, ...VRF });
     const frozen = g.ledger().roundDigest;
     for (let seat = 0; seat < 4; seat++) {
       await g.playTurn(seat, 0);
@@ -1073,7 +1136,7 @@ describe('the frozen round digest', () => {
     // `RollContext` has no seat field. The whole of the separation is `playerEntropy`, which is
     // a hash of `sk_s` -- and `join` refuses a second seat for a `C_s` already registered, so
     // two seats cannot share one.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     const digest = g.ledger().roundDigest;
     const a = firstRollTs(
       g.config.tableId,
@@ -1117,7 +1180,7 @@ describe('entropy and authorisation', () => {
   it('rejects a hold and a score signed with the wrong secret', async () => {
     // Not optional for the later moves: without it anyone could hold nothing and score another
     // seat's dice into its worst category.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await rolledOnce(g, 0);
     g.sim.asPlayer(g.players[1]!.sk);
     await assert.rejects(() => g.sim.hold(0, maskOf(0), g.clock), /wrong entropy secret/);
@@ -1167,7 +1230,7 @@ describe('entropy and authorisation', () => {
   });
 
   it('rejects a category that is already filled', async () => {
-    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    const g = await seated({ seats: 2, ...VRF }, { holds: alwaysStopEarly });
     await g.playRound(0);
     const first = g.seats[0]!.card.scores.findIndex((s) => s !== null);
     assert.ok(first >= 0);
@@ -1181,7 +1244,7 @@ describe('entropy and authorisation', () => {
   });
 
   it('rejects a category index outside 0..12', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await rolledOnce(g, 0);
     g.sim.asPlayer(g.players[0]!.sk);
     for (const cat of [CATEGORY_COUNT, CATEGORY_COUNT + 1, 200]) {
@@ -1198,7 +1261,7 @@ describe('the three-transaction resolve', () => {
     // Each answer is `S = x*B` with a DLEQ against the SEALED public key. A step that skipped
     // the check would accept an answer computed under some other key -- internally consistent,
     // just not a proof about this table.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.openTurn(0, g.entropyFor(0, 0), g.tick());
 
@@ -1231,7 +1294,7 @@ describe('the three-transaction resolve', () => {
     // is the MOVE's: the resolve reads no round at all (it must not read anything a move writes),
     // so it files whatever round it is told, and the move refuses an answer whose round is not
     // its own.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     assert.ok(!ledgerReads('resolveRoll').has('openRound'), 'the resolve reads no round');
     await g.playTurn(0, 0, alwaysStopEarly);
     await g.playTurn(1, 0, alwaysStopEarly);
@@ -1274,7 +1337,7 @@ describe('joker rules at table level', () => {
     const g = await seated(
       // Key swept offline for a game in which some seat rolls five of a kind twice, so the
       // second lands with the box already filled and the joker rules engage.
-      { seats: 4, tableId: bytes32(14), vrfSecret: 4822692657239678623259n },
+      { seats: 4, ...VRF, tableId: bytes32(14), vrfSecret: 4822692657239678623259n },
       { strategy: 'bestScore', probeIllegal: true, holds: keepModal },
     );
     await g.playToEnd();
@@ -1339,12 +1402,17 @@ describe('elimination', () => {
   }
 
   it('refuses one second before the deadline and allows it one second after', async () => {
+    // ON-CHAIN: nobody has opened round 1, so every seat owes its open, due at the end of the
+    // first phase slot -- not at the round deadline, which is six slots away.
     const g = await atRound(1);
-    const deadline = Number(g.ledger().roundDeadline);
+    const owed = seatObligation(g.ledger(), 0);
+    assert.ok(owed !== null && owed.kind === 'open' && owed.slot === SLOT.open);
+    const deadline = Number(owed.dueAt);
+    assert.equal(deadline, Number(g.ledger().roundOpenedAt + g.config.phaseSecs));
     const { q, rem } = penaltySplit(g.config.tier, 1);
     await assert.rejects(
       () => g.sim.eliminate(0, q, rem, deadline),
-      /deadline has not passed/,
+      /phase deadline has not passed/,
       'the predicate is strict: at the deadline exactly, the seat still has time',
     );
     await g.sim.eliminate(0, q, rem, deadline + 1);
@@ -1352,7 +1420,7 @@ describe('elimination', () => {
   });
 
   it('refuses a seat that has already played the round', async () => {
-    const g = await atRound(1);
+    const g = await atRound(1, { seats: 2, ...VRF });
     await g.playTurn(0, 1, alwaysStopEarly);
     const past = Number(g.ledger().roundDeadline) + 1;
     const { q, rem } = penaltySplit(g.config.tier, 1);
@@ -1380,10 +1448,12 @@ describe('elimination', () => {
         assert.equal(refund, g.config.tier - q);
         assert.equal(g.ledger().seatProgress.lookup(0n).eliminated, true);
       } else {
-        await assert.rejects(
-          () => g.sim.eliminate(seat, q, rem, past),
-          /waiting on the operator, not the other way round/,
-        );
+        // ON-CHAIN there is no operator to wait on, and the shield is the schedule itself: seat
+        // 1 has not opened, so roll 1 does not exist yet and seat 0 owes nothing -- however
+        // late it is. The silence is seat 1's, and `seatObligation` says so.
+        await assert.rejects(() => g.sim.eliminate(seat, q, rem, past), /owes nothing yet/);
+        assert.equal(seatObligation(g.ledger(), 0), null);
+        assert.equal(seatObligation(g.ledger(), 1)?.kind, 'open');
       }
     }
   });
@@ -1406,7 +1476,7 @@ describe('elimination', () => {
     // places, and all four are the player's silence. Stage 0 (never opened) is covered above;
     // these are the three mid-turn ones: asked, ANSWERED, and then nothing.
     for (const stopAt of [STAGE.askedRoll1, STAGE.askedRoll2, STAGE.askedRoll3] as const) {
-      const g = await atRound(2);
+      const g = await atRound(2, { seats: 2, ...VRF });
       const seat = 0;
       g.sim.asPlayer(g.players[seat]!.sk);
       await g.sim.openTurn(seat, g.entropyFor(seat, 2), g.tick());
@@ -1438,12 +1508,14 @@ describe('elimination', () => {
     }
   });
 
-  it('refuses a seat that is waiting on the operator, at all three roll steps', async () => {
-    // The other half: a player who asked and is waiting must not be eliminated for the
-    // operator's silence. `abortTable` is the remedy for that instead. Same three stages as
-    // above, UNANSWERED -- the stage alone no longer tells the two apart; the answer cell does.
+  it('FAST tables: an unanswered seat is eliminable at all three asked stages', async () => {
+    // Under the VRF the operator's silence was shielded on an on-chain table; now no on-chain
+    // seat ever waits on the operator (`describe('the reveal scheme')`), and the fast table --
+    // where the VRF lives -- waives the shield by design: resolves are off-chain there, so a
+    // seat parked at an asked stage past the deadline is a stalled fast turn. Same three
+    // stages, UNANSWERED, and all three go.
     for (const stopAt of [STAGE.askedRoll1, STAGE.askedRoll2, STAGE.askedRoll3] as const) {
-      const g = await atRound(2);
+      const g = await atRound(2, { seats: 2, ...VRF });
       const seat = 0;
       g.sim.asPlayer(g.players[seat]!.sk);
       await g.sim.openTurn(seat, g.entropyFor(seat, 2), g.tick());
@@ -1463,11 +1535,10 @@ describe('elimination', () => {
 
       const past = Number(g.ledger().roundDeadline) + 1;
       const { q, rem } = penaltySplit(g.config.tier, 2);
-      await assert.rejects(
-        () => g.sim.eliminate(seat, q, rem, past),
-        /waiting on the operator/,
-        `a seat at stage ${stopAt} is the operator's to discharge`,
-      );
+      g.sim.asOperator();
+      await g.sim.eliminate(seat, q, rem, past);
+      assert.equal(g.ledger().seatProgress.lookup(BigInt(seat)).eliminated, true);
+      assert.equal(g.ledger().seatTurn.lookup(BigInt(seat)).stage, BigInt(STAGE.idle));
     }
   });
 
@@ -1551,6 +1622,7 @@ describe('elimination', () => {
     // has already been handed back `tier - penalty`, so paying it the pot would pay it twice.
     const opts: TableOptions = {
       seats: 3,
+      ...VRF,
       tableId: bytes32(11),
       vrfSecret: 4822692657239678639097n,
     };
@@ -1577,7 +1649,7 @@ describe('elimination', () => {
   });
 
   it('refuses every move from an eliminated seat, for the rest of the game', async () => {
-    const g = await atRound(2);
+    const g = await atRound(2, { seats: 2, ...VRF });
     await g.eliminate(0, 2);
     await g.playTurn(1, 2, alwaysStopEarly);
     await g.closeRound(2);
@@ -1707,7 +1779,10 @@ describe('redeem', () => {
 
   it('pays an eliminated seat once the game settles, and only once', async () => {
     const tier = 1_300_000n;
-    const g = await seated({ seats: 3, tier }, { strategy: 'bestScore', holds: alwaysStopEarly });
+    const g = await seated(
+      { seats: 3, ...VRF, tier },
+      { strategy: 'bestScore', holds: alwaysStopEarly },
+    );
     for (let r = 0; r < 6; r++) await g.playRound(r);
     await g.playTurn(0, 6, alwaysStopEarly);
     await g.playTurn(2, 6, alwaysStopEarly);
@@ -1739,7 +1814,10 @@ describe('redeem', () => {
 
   it('chains a receipt the mirror can reproduce, over the elimination that preceded it', async () => {
     const tier = 1_300_000n;
-    const g = await seated({ seats: 2, tier }, { strategy: 'bestScore', holds: alwaysStopEarly });
+    const g = await seated(
+      { seats: 2, ...VRF, tier },
+      { strategy: 'bestScore', holds: alwaysStopEarly },
+    );
     for (let r = 0; r < 4; r++) await g.playRound(r);
     await g.playTurn(1, 4, alwaysStopEarly);
     await g.eliminate(0, 4);
@@ -1803,7 +1881,7 @@ describe('abortTable', () => {
 
   it('refunds every seat when the operator stalls, at all three roll steps', async () => {
     for (const stopAfter of [0, 1, 2]) {
-      const g = await seated({ seats: 2 });
+      const g = await seated({ seats: 2, ...VRF });
       await g.playTurn(1, 0, alwaysStopEarly);
       g.sim.asPlayer(g.players[0]!.sk);
       await g.sim.openTurn(0, g.entropyFor(0, 0), g.tick());
@@ -1852,7 +1930,7 @@ describe('abortTable', () => {
     // A seat sitting at `askedRoll1` WITH its answer posted has been rolled and owes a hold or
     // a score. That is the player's silence, not the operator's, so `eliminate` covers it and
     // `abortTable` must not.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await g.playTurn(1, 0, alwaysStopEarly);
     await rolledOnce(g, 0);
     assert.equal(g.ledger().seatTurn.lookup(0n).stage, BigInt(STAGE.askedRoll1));
@@ -1927,7 +2005,7 @@ describe('leaving a filling table, and starting one early', () => {
   });
 
   it('starts early with the players present once the wait has run', async () => {
-    const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT });
+    const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT, ...VRF });
     await g.join(0);
     await g.join(1);
     const startAt = Number(g.ledger().fillOpenedAt + WAIT);
@@ -2138,7 +2216,7 @@ describe('settlement guards', () => {
     // the moment the field is one, eleven more solo rounds would change nothing but the
     // calendar. The last player is paid immediately and — just as important — the eliminated
     // seat's redeem unlocks, since redeem is gated on a terminal phase.
-    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    const g = await seated({ seats: 2, ...VRF }, { holds: alwaysStopEarly });
     await g.playRound(0);
     await g.playTurn(1, 1); // seat 1 plays round 1; seat 0 goes silent
     await g.eliminate(0, 1);
@@ -2174,7 +2252,7 @@ describe('settlement guards', () => {
   it('a seat resigns voluntarily: cheaper than the timeout, walkover pays the survivor', async () => {
     // Round index 2: a timeout would charge 3/13 of the stake; resigning charges 2/13 — the
     // open round does not count, which is the whole incentive to press the button.
-    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    const g = await seated({ seats: 2, ...VRF }, { holds: alwaysStopEarly });
     await g.playRound(0);
     await g.playRound(1);
     await g.playTurn(1, 2); // seat 1 plays round 2; seat 0 decides to leave mid-round
@@ -2230,7 +2308,7 @@ describe('settlement guards', () => {
   it('a resignation is legal mid-resolve and after scoring — states a timeout cannot touch', async () => {
     // Awaiting the operator (odd stage): eliminate refuses this, resign does not — the player
     // renounces the roll they paid for; idling the turn makes the in-flight resolve unlandable.
-    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    const g = await seated({ seats: 2, ...VRF }, { holds: alwaysStopEarly });
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.openTurn(0, g.entropyFor(0, 0)); // seat 0 now at stage 1, awaiting roll 1
     const tier = g.config.tier;
@@ -2239,7 +2317,7 @@ describe('settlement guards', () => {
     assert.equal(g.ledger().seatTurn.lookup(0n).stage, BigInt(STAGE.idle));
 
     // Already scored the open round (progress.round > openRound): also resignable.
-    const h = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    const h = await seated({ seats: 2, ...VRF }, { holds: alwaysStopEarly });
     await h.playTurn(0, 0);
     assert.equal(h.ledger().seatProgress.lookup(0n).round, 1n);
     h.sim.asPlayer(h.players[0]!.sk);
@@ -2251,7 +2329,7 @@ describe('settlement guards', () => {
     // Seat 0 posts a real score, then everyone but seat 5 times out. Seat 5 has scored nothing —
     // and still wins, because eliminated seats are ineligible however good their card looks.
     // This is the deliberate consequence of "he's gone from this game".
-    const g = await seated({ seats: 6 }, { holds: alwaysStopEarly });
+    const g = await seated({ seats: 6, ...VRF }, { holds: alwaysStopEarly });
     for (const s of [0, 1, 2, 3, 4, 5]) await g.playTurn(s, 0);
     await g.closeRound(0);
     await g.playTurn(5, 1);
@@ -2264,7 +2342,7 @@ describe('settlement guards', () => {
   });
 
   it('refuses a settle seed that does not open the commitment', async () => {
-    const g = await seated({ seats: 2 }, { holds: alwaysStopEarly });
+    const g = await seated({ seats: 2, ...VRF }, { holds: alwaysStopEarly });
     await g.playToEnd();
     const [q, r] = g.rakeSplit();
     await assert.rejects(
@@ -2303,7 +2381,7 @@ describe('settlement guards', () => {
     // NEXT round's players are judged against, so a hostile caller who under-declares `now` by
     // the full slack shaves it off everyone else's window for free. Two (not four) admits the
     // fast tables' five-minute rounds; a 300 s round survives the worst shave with 180 s left.
-    const base = tableConfig({ seats: 2 });
+    const base = tableConfig({ seats: 2, ...VRF });
     for (const bad of [0n, 1n, 239n, 240n]) {
       await assert.rejects(
         () => TableSimulator.create({ ...base, turnTimeoutSecs: bad }),
@@ -2345,9 +2423,11 @@ describe('the settle deadline bypass', () => {
   // its seed file, would otherwise lock every stake permanently. Past
   // `roundDeadline + tableTimeoutSecs` the seed check is waived.
 
+  // FAST tables only: an on-chain table needs no key to be replayed, so nothing is waived there
+  // (`describe('the reveal scheme')`).
   async function finished(): Promise<GameDriver> {
     const g = await seated(
-      { seats: 2, tableId: bytes32(0x71) },
+      { seats: 2, tableId: bytes32(0x71), ...VRF },
       { strategy: 'bestScore', holds: alwaysStopEarly },
     );
     await g.playToEnd();
@@ -2436,7 +2516,10 @@ describe('the stall matrix: every reachable state has a permissionless exit', ()
     // Four sub-states: never opened, and abandoned after each of the three rolls. All four are
     // the player's silence, so all four exit through `eliminate` and then the game continues.
     for (const rolls of [0, 1, 2, 3]) {
-      const g = await seated({ seats: 2 }, { strategy: 'bestScore', holds: alwaysStopEarly });
+      const g = await seated(
+        { seats: 2, ...VRF },
+        { strategy: 'bestScore', holds: alwaysStopEarly },
+      );
       for (let r = 0; r < 4; r++) await g.playRound(r);
       await g.playTurn(1, 4, alwaysStopEarly);
 
@@ -2481,7 +2564,7 @@ describe('the stall matrix: every reachable state has a permissionless exit', ()
 
   it('exits a table where the operator stopped, at every roll step', async () => {
     for (const stopAfter of [0, 1, 2]) {
-      const g = await seated({ seats: 2 });
+      const g = await seated({ seats: 2, ...VRF });
       await g.playTurn(1, 0, alwaysStopEarly);
       g.sim.asPlayer(g.players[0]!.sk);
       await g.sim.openTurn(0, g.entropyFor(0, 0), g.tick());
@@ -2520,7 +2603,7 @@ describe('the stall matrix: every reachable state has a permissionless exit', ()
   it('exits a table stuck mid-round because nobody closed it', async () => {
     // Everyone finished, nobody called closeRound. Not a stall at all: `closeRound` is
     // permissionless and always available, and the round deadline does not gate it.
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await g.playTurn(0, 0, alwaysStopEarly);
     await g.playTurn(1, 0, alwaysStopEarly);
     const long = Number(g.ledger().roundDeadline) + 1_000_000;
@@ -2545,10 +2628,14 @@ describe('the declared-time sandwich', () => {
     // through this test and this comment.
     // `abortTable` joined the list when it learned to START a table (early start stamps round
     // 0's deadline), and it pins its declared `now` exactly as the other two do.
-    for (const circuit of ['join', 'closeRound', 'abortTable']) {
+    // `eliminate` joined it with the reveal scheme: on an on-chain table an elimination
+    // RE-STAMPS the phase schedule (and with it the round deadline), so that whoever was blocked
+    // behind the eliminated seat gets a whole slot rather than being due at once.
+    for (const circuit of ['join', 'closeRound', 'abortTable', 'eliminate']) {
       assert.ok(ledgerWrites(circuit).has('roundDeadline'), `${circuit} stamps a deadline`);
+      assert.ok(ledgerWrites(circuit).has('roundOpenedAt'), `${circuit} stamps the schedule`);
     }
-    for (const circuit of ['playerMove', 'resolveRoll', 'eliminate', 'settle', 'redeem']) {
+    for (const circuit of ['playerMove', 'revealEntropy', 'resolveRoll', 'settle', 'redeem']) {
       assert.ok(
         !ledgerWrites(circuit).has('roundDeadline'),
         `${circuit} must not stamp a deadline -- it takes no declared time`,
@@ -2567,7 +2654,7 @@ describe('the declared-time sandwich', () => {
   });
 
   it('refuses a declared time further behind than the slack', async () => {
-    const g = await seated({ seats: 2 });
+    const g = await seated({ seats: 2, ...VRF });
     await g.playTurn(0, 0, alwaysStopEarly);
     await g.playTurn(1, 0, alwaysStopEarly);
     const blockTime = g.clock + 10_000;
@@ -2587,7 +2674,7 @@ describe('the declared-time sandwich', () => {
     // The C1 fix, restated as a property rather than as a constructor assert: with
     // `turnTimeout > 4 * slack`, a caller who under-declares by the whole slack still leaves the
     // next round more than three quarters of its window.
-    const g = await seated({ seats: 2, turnTimeoutSecs: 600n });
+    const g = await seated({ seats: 2, ...VRF, turnTimeoutSecs: 600n });
     await g.playTurn(0, 0, alwaysStopEarly);
     await g.playTurn(1, 0, alwaysStopEarly);
     const blockTime = g.clock + 1_000;
@@ -2616,6 +2703,7 @@ describe('tie-break at table level', () => {
   it('breaks a tie between two finishers by seat order', async () => {
     const opts: TableOptions = {
       seats: 2,
+      ...VRF,
       tableId: bytes32(84),
       vrfSecret: 4822692657239678639097n,
     };
@@ -2640,6 +2728,7 @@ describe('tie-break at table level', () => {
   it('falls back to the lowest seat at a four-seat table', async () => {
     const opts: TableOptions = {
       seats: 4,
+      ...VRF,
       tableId: bytes32(107),
       vrfSecret: 4822692657239681276124n,
     };
@@ -2732,10 +2821,10 @@ describe('the transaction cost of an interactive turn', () => {
 
   it('costs 4 player + 3 operator per full turn and 2 + 1 when the player stops early', () => {
     const seats = 6;
-    const full = replayGame(tableConfig({ seats }), makePlayers(seats), {
+    const full = replayGame(tableConfig({ seats, ...VRF }), makePlayers(seats), {
       holds: alwaysThreeRolls,
     });
-    const early = replayGame(tableConfig({ seats }), makePlayers(seats), {
+    const early = replayGame(tableConfig({ seats, ...VRF }), makePlayers(seats), {
       holds: alwaysStopEarly,
     });
     const turns = seats * ROUND_COUNT;
@@ -2745,6 +2834,20 @@ describe('the transaction cost of an interactive turn', () => {
     assert.equal(full.operatorTx, turns * 3, 'full turn: three rolls');
     assert.equal(early.playerTx - seats, turns * 2, 'early stop: open + score');
     assert.equal(early.operatorTx, turns * 1, 'early stop: one roll');
+
+    // ON-CHAIN: no operator transaction at all, and every seat in the round reveals once per
+    // reroll that ANYONE takes -- so a full turn is 4 + 2 per seat, and a table where everybody
+    // stops after roll 1 reveals nothing.
+    const chainFull = replayGame(tableConfig({ seats }), makePlayers(seats), {
+      holds: alwaysThreeRolls,
+    });
+    const chainEarly = replayGame(tableConfig({ seats }), makePlayers(seats), {
+      holds: alwaysStopEarly,
+    });
+    assert.equal(chainFull.playerTx - seats, turns * 6, 'on-chain full turn: 4 moves + 2 reveals');
+    assert.equal(chainFull.operatorTx, 0, 'on-chain: the operator rolls nothing');
+    assert.equal(chainEarly.playerTx - seats, turns * 2, 'on-chain early stop: open + score');
+    assert.equal(chainEarly.operatorTx, 0);
 
     // The lever a player has over the length of a game: stopping early more than halves it.
     const fullTotal = full.playerTx + full.operatorTx;
@@ -2789,7 +2892,10 @@ describe('token custody, as far as the simulator can see it', () => {
     // re-checks it after every single move; this test walks the paths that move money between
     // the two halves.
     const tier = 1_300_000n;
-    const g = await seated({ seats: 4, tier }, { strategy: 'bestScore', holds: alwaysStopEarly });
+    const g = await seated(
+      { seats: 4, ...VRF, tier },
+      { strategy: 'bestScore', holds: alwaysStopEarly },
+    );
     for (let r = 0; r < 3; r++) await g.playRound(r);
     await g.playTurn(0, 3, alwaysStopEarly);
     await g.playTurn(1, 3, alwaysStopEarly);
@@ -2832,5 +2938,320 @@ describe('token custody, as far as the simulator can see it', () => {
       players[Number(winner)]!.addr.bytes,
     );
     assert.deepEqual(g.ledger().rakeAddress.bytes, g.config.rakeAddress.bytes);
+  });
+});
+
+// =========================================================================================
+describe("the reveal scheme: an on-chain table rolls from the seats' contributions", () => {
+  // =======================================================================================
+  //
+  // reveal-core.compact and docs/reveal-dice.md. Every roll is a hash of one contribution per
+  // live seat, and a contribution to roll k is revealed only once every seat still rolling has
+  // fixed the hold before roll k -- so nobody, operator included, can compute a roll before the
+  // decision it would have informed is on chain. The differential games above (every default
+  // table is an on-chain one) prove the dice agree with the mirror at every step; this block
+  // pins the two barriers, the phase schedule `eliminate` enforces, and what the mode changes
+  // elsewhere in the contract.
+
+  const open = async (g: GameDriver, seat: number, round = 0): Promise<void> => {
+    g.sim.asPlayer(g.players[seat]!.sk);
+    await g.sim.openTurn(seat, g.entropyFor(seat, round), g.tick());
+  };
+  const hold = async (g: GameDriver, seat: number, mask: Mask): Promise<void> => {
+    g.sim.asPlayer(g.players[seat]!.sk);
+    await g.sim.hold(seat, mask, g.tick());
+  };
+  const reveal = async (g: GameDriver, seat: number, k: number): Promise<void> => {
+    g.sim.asPlayer(g.players[seat]!.sk);
+    await g.sim.revealEntropy(seat, k, g.tick());
+  };
+  /** Score the dice the seat is looking at (public, computed without any secret). */
+  const scoreOn = async (g: GameDriver, seat: number): Promise<number[]> => {
+    const seen = chainRevealFor(g.ledger(), seat);
+    assert.ok(seen !== null, `seat ${seat} has no roll to score`);
+    g.sim.asPlayer(g.players[seat]!.sk);
+    await g.sim.score(seat, g.chooseCategory(seat, seen.dice), g.tick());
+    return seen.dice;
+  };
+  const NOT_HELD = /not every seat has fixed its hold/;
+  const NOT_REVEALED = /not every seat has revealed its contribution/;
+  const six = (...sks: (Uint8Array | null)[]): (Uint8Array | null)[] =>
+    [...sks, null, null, null, null, null, null].slice(0, 6);
+
+  it('reveals only once every seat still rolling has held, and decides only once every seat has revealed', async () => {
+    const g = await seated({ seats: 3 });
+    const sk = g.players.map((p) => p.sk);
+    // Nobody sees roll 1 until the last open lands: an open IS the reveal for roll 1.
+    await open(g, 0);
+    await open(g, 1);
+    assert.equal(chainRevealFor(g.ledger(), 0), null, 'roll 1 needs every contribution');
+    await open(g, 2);
+    const digest0 = chainDigestFor(g.config.tableId, 0, 0, six(sk[0]!, sk[1]!, sk[2]!));
+    for (const seat of [0, 1, 2]) {
+      const seen = chainRevealFor(g.ledger(), seat);
+      const mixed = g.ledger().seatTurn.lookup(BigInt(seat)).mixed;
+      assert.deepEqual(seen?.dice, firstRollTs(g.config.tableId, digest0, mixed, 0));
+    }
+
+    // Seat 0 holds; seat 1 is still deciding -- so nobody may reveal for roll 2 yet, not even
+    // seat 2, and seat 0 cannot see roll 2 either.
+    await hold(g, 0, maskOf(0, 1));
+    g.sim.asPlayer(sk[2]!);
+    await assert.rejects(() => g.sim.revealEntropy(2, 1, g.clock), NOT_HELD);
+    assert.equal(chainRevealFor(g.ledger(), 0), null);
+
+    // Seat 1 stops after roll 1 and seat 2 holds: every seat still rolling has decided, so the
+    // reveal phase opens -- for the scored seat too, whose contribution is in the others' rolls.
+    await scoreOn(g, 1);
+    await hold(g, 2, maskOf(4));
+    await reveal(g, 2, 1);
+    await reveal(g, 1, 1);
+    // Seat 0 has not revealed its own, so it cannot move on roll 2 -- neither hold nor score.
+    g.sim.asPlayer(sk[0]!);
+    await assert.rejects(() => g.sim.hold(0, maskOf(0), g.clock), NOT_REVEALED);
+    await assert.rejects(() => g.sim.score(0, 0, g.clock), NOT_REVEALED);
+    await reveal(g, 0, 1);
+
+    // Roll 2 is public for both rolling seats, from all three contributions, and what a seat's
+    // next move puts on chain is exactly what everyone could already see.
+    const digest1 = chainDigestFor(g.config.tableId, 0, 1, six(sk[0]!, sk[1]!, sk[2]!));
+    const expected = new Map<number, number[]>();
+    for (const [seat, mask] of [
+      [0, maskOf(0, 1)],
+      [2, maskOf(4)],
+    ] as const) {
+      const turn = g.ledger().seatTurn.lookup(BigInt(seat));
+      const seen = chainRevealFor(g.ledger(), seat);
+      assert.ok(seen !== null && seen.index === 1);
+      const want = rerollUnderMaskTs(
+        g.config.tableId,
+        digest1,
+        turn.mixed,
+        0,
+        1,
+        mask,
+        diceToArray(turn.roll),
+      );
+      assert.deepEqual(seen.dice, want, `seat ${seat}'s roll 2`);
+      expected.set(seat, want);
+    }
+    await hold(g, 0, KEEP_ALL());
+    assert.deepEqual(diceToArray(g.ledger().seatTurn.lookup(0n).roll), expected.get(0));
+    assert.deepEqual(await scoreOn(g, 2), expected.get(2));
+
+    // Only seat 0 still rolls. Everyone still reveals for roll 3, and it can then score.
+    g.sim.asPlayer(sk[0]!);
+    await assert.rejects(() => g.sim.score(0, 0, g.clock), NOT_REVEALED);
+    await reveal(g, 0, 2);
+    await reveal(g, 1, 2);
+    await reveal(g, 2, 2);
+    await scoreOn(g, 0);
+    await g.sim.closeRound(g.tick());
+    assert.equal(g.ledger().openRound, 1n);
+  });
+
+  it('refuses a contribution that is not H(sk, tableId, round, rollIndex), the wrong secret, roll 1, or a fast table', async () => {
+    const g = await seated({ seats: 2 });
+    await open(g, 0);
+    await open(g, 1);
+    await hold(g, 0, maskOf(0));
+    await hold(g, 1, maskOf(1));
+    const sk0 = g.players[0]!.sk;
+    const right = contributionTs(sk0, g.config.tableId, 0, 1);
+    g.sim.asPlayer(sk0);
+    for (const wrong of [
+      bytes32(0xcc), // arbitrary
+      contributionTs(sk0, g.config.tableId, 0, 2), // right seat, wrong roll
+      contributionTs(sk0, g.config.tableId, 1, 1), // right seat, wrong round
+      contributionTs(g.players[1]!.sk, g.config.tableId, 0, 1), // another seat's
+    ]) {
+      await assert.rejects(
+        () => g.sim.revealEntropyRaw(0, 1, wrong, g.clock),
+        /value is not H\(sk, tableId, round, rollIndex\)/,
+      );
+    }
+    g.sim.asPlayer(g.players[1]!.sk);
+    await assert.rejects(
+      () => g.sim.revealEntropyRaw(0, 1, right, g.clock),
+      /wrong entropy secret/,
+      'the right value from the wrong secret is still refused: the proof is of the secret',
+    );
+    g.sim.asPlayer(sk0);
+    await assert.rejects(() => g.sim.revealEntropy(0, 0, g.clock), /published by the open/);
+    await assert.rejects(() => g.sim.revealEntropy(0, 3, g.clock), /published by the open/);
+    await assert.rejects(() => g.sim.revealEntropy(2, 1, g.clock), /no such seat/);
+    // A repeat is harmless: the same value lands in the same cell.
+    await reveal(g, 0, 1);
+    await reveal(g, 0, 1);
+    assert.deepEqual(g.ledger().seatReveal.lookup(revealKey(0, 1)).value, right);
+
+    const f = await seated({ seats: 2, ...VRF });
+    f.sim.asPlayer(f.players[0]!.sk);
+    await assert.rejects(() => f.sim.revealEntropy(0, 1, f.clock), /rolls come from the VRF/);
+  });
+
+  it('gives the operator no move: a resolve is refused', async () => {
+    const g = await seated({ seats: 2 });
+    await open(g, 0);
+    g.sim.asOperator();
+    await assert.rejects(
+      () => g.sim.resolveRoll(0, g.tick()),
+      /rolls come from the seats' contributions/,
+    );
+  });
+
+  it('eliminates exactly the seat that owes, at the end of its slot, and restarts the schedule', async () => {
+    const g = await seated({ seats: 2 }, { strategy: 'bestScore' });
+    const P = Number(g.config.phaseSecs);
+    const origin = Number(g.ledger().roundOpenedAt);
+    const { q, rem } = penaltySplit(g.config.tier, 0);
+    const owed = (seat: number) => seatObligation(g.ledger(), seat);
+    const tryAt = (seat: number, at: number): Promise<bigint> => {
+      g.sim.asOperator();
+      return g.sim.eliminate(seat, q, rem, at);
+    };
+
+    // Slot 1: both owe an open. At the slot's end exactly, still not.
+    assert.deepEqual([owed(0)?.slot, owed(1)?.slot], [SLOT.open, SLOT.open]);
+    await assert.rejects(() => tryAt(0, origin + P), /phase deadline has not passed/);
+    // Seat 0 opens: it now owes nothing (roll 1 needs seat 1's contribution), however late.
+    await open(g, 0);
+    assert.equal(owed(0), null);
+    await assert.rejects(() => tryAt(0, origin + 6 * P), /owes nothing yet/);
+    assert.equal(owed(1)?.slot, SLOT.open);
+    // Seat 1 opens: roll 1 is public and both owe a decision on it, slot 2.
+    await open(g, 1);
+    assert.deepEqual([owed(0)?.slot, owed(1)?.slot], [SLOT.decide1, SLOT.decide1]);
+    assert.equal(Number(owed(0)!.dueAt), origin + 2 * P);
+    await assert.rejects(() => tryAt(0, origin + 2 * P), /phase deadline has not passed/);
+    // Seat 0 holds. Seat 1 has not decided, so seat 0 is blocked and owes nothing; seat 1 owes.
+    await hold(g, 0, maskOf(0));
+    assert.equal(owed(0), null);
+    assert.equal(owed(1)?.slot, SLOT.decide1);
+    // Seat 1 holds too: the reveal phase for roll 2 is open and both owe a reveal, slot 3.
+    await hold(g, 1, maskOf(1));
+    assert.deepEqual(
+      [owed(0)?.kind, owed(0)?.rollIndex, owed(0)?.slot],
+      ['reveal', 1, SLOT.reveal1],
+    );
+    assert.equal(owed(1)?.slot, SLOT.reveal1);
+    await reveal(g, 0, 1);
+    assert.equal(owed(0), null, 'revealed: nothing to owe until the other seat has too');
+    await assert.rejects(() => tryAt(1, origin + 3 * P), /phase deadline has not passed/);
+
+    // One second past slot 3, seat 1 is out for the missed reveal -- and the schedule restarts.
+    const at = origin + 3 * P + 1;
+    await tryAt(1, at);
+    g.clock = at;
+    let led = g.ledger();
+    assert.equal(led.seatProgress.lookup(1n).eliminated, true);
+    assert.equal(Number(led.roundOpenedAt), at, 'an elimination restamps the schedule origin');
+    assert.equal(led.roundDeadline, BigInt(at) + g.config.turnTimeoutSecs);
+    assert.equal(led.seatReveal.lookup(revealKey(1, 1)).out, true);
+    assert.equal(
+      led.seatReveal.lookup(revealKey(1, 0)).round,
+      0n,
+      'the contribution it DID make stays where roll 1 found it',
+    );
+    // Seat 0 is unblocked: it owes a decision on roll 2, due a whole slot from the NEW origin,
+    // and roll 2 is public with seat 1's slot contributing the fixed zero.
+    assert.deepEqual([owed(0)?.kind, owed(0)?.slot], ['decide', SLOT.decide2]);
+    assert.equal(Number(owed(0)!.dueAt), at + SLOT.decide2 * P);
+    const turn = led.seatTurn.lookup(0n);
+    const digest = chainDigestFor(g.config.tableId, 0, 1, six(g.players[0]!.sk, null));
+    assert.deepEqual(
+      chainRevealFor(led, 0)?.dice,
+      rerollUnderMaskTs(
+        g.config.tableId,
+        digest,
+        turn.mixed,
+        0,
+        1,
+        maskOf(0),
+        diceToArray(turn.roll),
+      ),
+    );
+    // The survivor finishes its turn and the round closes over it alone.
+    await scoreOn(g, 0);
+    await g.sim.closeRound(g.tick());
+    led = g.ledger();
+    assert.equal(led.openRound, 1n);
+    assert.equal(led.activeSeats, 1n, 'a walkover is available from here');
+  });
+
+  it('a seat that has scored still owes its contribution to the rolls the others take', async () => {
+    const g = await seated({ seats: 2 });
+    const P = Number(g.config.phaseSecs);
+    const owed = (seat: number) => seatObligation(g.ledger(), seat);
+    await open(g, 0);
+    await open(g, 1);
+    await scoreOn(g, 0); // seat 0 stops after roll 1
+    await hold(g, 1, maskOf(2)); // seat 1 goes on
+    assert.deepEqual([owed(0)?.kind, owed(0)?.rollIndex], ['reveal', 1]);
+    const origin = Number(g.ledger().roundOpenedAt);
+    const { q, rem } = penaltySplit(g.config.tier, 0);
+    await assert.rejects(
+      () => g.sim.eliminate(0, q, rem, origin + SLOT.reveal1 * P),
+      /phase deadline has not passed/,
+    );
+    await reveal(g, 0, 1);
+    assert.equal(owed(0), null);
+    assert.deepEqual([owed(1)?.kind, owed(1)?.rollIndex], ['reveal', 1]);
+    await reveal(g, 1, 1);
+    // Seat 1 sees roll 2 and scores on it; nobody asks for roll 3, so nobody owes a reveal for it.
+    await scoreOn(g, 1);
+    assert.equal(owed(0), null);
+    assert.equal(owed(1), null);
+    await g.sim.closeRound(g.tick());
+    assert.equal(g.ledger().openRound, 1n);
+  });
+
+  it("never blames the operator: a silent seat is eliminate's business, not abortTable's", async () => {
+    const g = await seated({ seats: 2 });
+    await open(g, 0); // seat 1 stays silent
+    const { q, rem } = perSeatRake(g.config.tier);
+    const long = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs) + 1_000_000;
+    await assert.rejects(() => g.sim.abortTable(q, rem, long), /neither stalled/);
+    const p = penaltySplit(g.config.tier, 0);
+    await g.sim.eliminate(1, p.q, p.rem, long);
+    assert.equal(g.ledger().seatProgress.lookup(1n).eliminated, true);
+  });
+
+  it("settles without the operator's key, at any time, and certifies the game verifiable", async () => {
+    const g = await seated({ seats: 2 }, { strategy: 'bestScore', holds: alwaysStopEarly });
+    await g.playToEnd();
+    const [q, r] = g.rakeSplit();
+    // Before any grace: a key that opens nothing is accepted -- every roll was a public hash.
+    const winner = await g.sim.settle(WRONG_KEY, q, r);
+    assert.equal(winner, BigInt(g.expectedWinner()));
+    const led = g.ledger();
+    assert.equal(led.phase, PHASE.settled);
+    assert.equal(led.revealedVrfSecret, 0n, 'a key that opens nothing is never recorded');
+    assert.deepEqual(
+      led.finalDigest,
+      finalDigestTs(
+        led.roundDigest,
+        g.config.tableId,
+        PHASE.settled,
+        Number(winner),
+        2,
+        led.tier * 2n - q,
+        q,
+        0n,
+        true,
+      ),
+      'verifiable: the replay needs no key',
+    );
+  });
+
+  it('needs a phase slot above the floor with six inside the round, and none on a fast table', async () => {
+    const base = tableConfig({ seats: 2 }); // 600 s slots in a 3 600 s round
+    await assert.rejects(() => TableSimulator.create({ ...base, phaseSecs: 240n }), /phase slot/);
+    await assert.rejects(() => TableSimulator.create({ ...base, phaseSecs: 601n }), /phase slot/);
+    await TableSimulator.create({ ...base, phaseSecs: 241n });
+    await TableSimulator.create({ ...base, phaseSecs: 600n });
+    const fast = tableConfig({ seats: 2, ...VRF });
+    await assert.rejects(() => TableSimulator.create({ ...fast, phaseSecs: 241n }), /phase slot/);
+    await TableSimulator.create({ ...fast, phaseSecs: 0n });
   });
 });

@@ -280,3 +280,13 @@ Measured after the fact, so the claims are checkable rather than asserted:
 
 **Still open, and not in-contract:** the per-circuit indexer UTXO audit, which must be re-run
 against the recompiled artifact (see §3), now including a force-settled table.
+
+## Addendum, 2026-09-24 — the reveal scheme is not yet reviewed
+
+`docs/reveal-dice.md` replaced the blind VRF on on-chain tables with seat-contributed
+randomness, added a ninth circuit (`revealEntropy`), a phase schedule in `eliminate` (which now
+declares a time and re-stamps `roundDeadline`), and mode splits in `playerMove`, `settle`,
+`abortTable` and `resolveRoll`. None of it has had a review pass in this document's format. The
+residual it leaves on purpose -- the last revealer's priced, one-shot withhold -- is stated in
+the design note; the concurrency claims are re-derived mechanically by
+`describe('conflict-freedom')` as before.

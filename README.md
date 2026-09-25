@@ -13,12 +13,12 @@ uses the word only to describe the style of play.
 
 ## What is here
 
-| Path        | What                                                                                                                                                                                                                       |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `contract/` | `table.compact` (one deployment per table: stakes, seats, rolls, scoring, settlement), `lobby.compact` (a registry), the shared modules, TypeScript mirrors of every hash and rule, the witnesses, and 199 simulator tests |
-| `api/`      | Contract-interaction plumbing: providers, wallet helpers, bech32, pure game rules. `./node` is Node-only                                                                                                                   |
-| `verifier/` | `npm run verify -- <table address>` — re-derives every roll and score of a finished table from the indexer's record and the operator's revealed seed                                                                       |
-| `docs/`     | The protocol: `table-interface.md` (start here), `security-review.md`, `client-rules.md`, the circuit notes, and `bugs-found.md`, a log of 30 upstream defects met while building on the ledger-9 line                     |
+| Path        | What                                                                                                                                                                                                                                                       |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `contract/` | `table.compact` (one deployment per table: stakes, seats, rolls, scoring, settlement), `lobby.compact` (a registry), the shared modules, TypeScript mirrors of every hash and rule, the witnesses, and 199 simulator tests                                 |
+| `api/`      | Contract-interaction plumbing: providers, wallet helpers, bech32, pure game rules. `./node` is Node-only                                                                                                                                                   |
+| `verifier/` | `npm run verify -- <table address>` — re-derives every roll and score of a finished table from the indexer's record and the operator's revealed seed                                                                                                       |
+| `docs/`     | The protocol: `table-interface.md` (start here), `reveal-dice.md` (the on-chain table's randomness), `security-review.md`, `client-rules.md`, the circuit notes, and `bugs-found.md`, a log of 30 upstream defects met while building on the ledger-9 line |
 
 ## Build
 
@@ -34,11 +34,14 @@ release is reproducible by compiling the tagged source with the pinned compiler.
 
 ## Trust model, in one paragraph
 
-Players' stakes sit in the table contract, paid out by its own circuits. The operator commits to
-a dice seed at deploy and every roll is a hash of that seed, the table's public round digest and
-the players' own entropy — the operator cannot choose the dice, and after settlement anyone can
-replay the whole game with `verifier`. On a **fast** table the ORDER of a player's rolls rests on
-the operator's word, and the docs say so wherever it matters. See `docs/security-review.md`.
+Players' stakes sit in the table contract, paid out by its own circuits. On an **on-chain**
+table every roll is a hash of one contribution per seat, each revealed only after the holds it
+could have informed are on chain — nobody, the operator included, can compute a roll before the
+decision it would inform is fixed, and the operator has no part in the dice at all
+(`docs/reveal-dice.md`). On a **fast** table the operator answers each roll through a blind VRF
+against a key sealed at deploy: it cannot choose or see a roll, but the ORDER of a player's rolls
+rests on its word, and the docs say so wherever it matters. After settlement anyone can replay
+either kind of game with `verifier`. See `docs/security-review.md`.
 
 ## Publishing (maintainers)
 

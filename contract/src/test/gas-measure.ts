@@ -14,9 +14,10 @@ const sim = await TableSimulator.create({
   vrfPublicKey: vrf.vrfPublicKeyOf(SECRET),
   turnTimeoutSecs: 600n,
   tableTimeoutSecs: 3_600n,
-  fastMode: false,
+  fastMode: true,
   startAfterSecs: 0n,
   inviteHash: ZERO_BYTES32(),
+  phaseSecs: 0n,
 });
 const skA = b32(0xa1);
 sim.asPlayer(skA);

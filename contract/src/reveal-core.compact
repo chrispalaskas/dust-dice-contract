@@ -1,0 +1,117 @@
+// The seats' own randomness, for an ON-CHAIN table.
+//
+// Every roll on an on-chain table is a hash of one CONTRIBUTION per live seat, and a seat's
+// contribution to roll k is revealed only after every seat still rolling has fixed the hold
+// that roll k would have informed. So nobody -- not a seat, not the operator, not the two of
+// them together -- can compute any seat's roll before the decision preceding it is on chain:
+// the honest seats' contributions do not exist anywhere yet. One honest seat protects the whole
+// table. The protocol, its costs and the one residual it leaves are docs/reveal-dice.md; the
+// fast table keeps the blind VRF of vrf-core.compact, and `fastMode` picks between the two.
+//
+// A contribution is `H(sk_s, tableId, round, rollIndex)`: deterministic in the seat's join-time
+// secret, so there is nothing to grind at reveal time and nothing to store between the move
+// that fixes a hold and the move that reveals -- exactly the property `forcedEntropy` already
+// has. Roll 1's contribution rides on the open (the decision before roll 1 is the previous
+// round's category, and an open is legal only once the round has closed behind it); rolls 2
+// and 3 have a circuit of their own, `revealEntropy`, whose only job is the barrier.
+
+pragma language_version >= 0.26;
+
+import CompactStandardLibrary;
+
+/**
+ * One seat's contribution to one roll of the open round, as the ledger keeps it.
+ *
+ * Cells are overwritten round after round, so `round` says which round the value belongs to
+ * and a stale cell is simply one whose round is not the open one. `out` is set by `eliminate`
+ * on every cell of a seat that leaves: from then on no roll waits for that slot, and it
+ * contributes a fixed zero value -- `contributionOf` returns the value only for a cell of the
+ * open round, so an eliminated seat's old value never leaks into a later round's digest.
+ */
+export struct RevealCell {
+  round: Uint<8>,
+  value: Bytes<32>,
+  out: Boolean,
+}
+
+/** A round no turn can have, marking a cell nobody has revealed into. */
+export pure circuit noRevealRound(): Uint<8> {
+  return 255;
+}
+
+export pure circuit noRevealCell(): RevealCell {
+  return RevealCell { round: noRevealRound(), value: default<Bytes<32>>, out: false };
+}
+
+/** Where `seatReveal` holds `seat`'s contribution to roll `rollIndex` (0..2). */
+export pure circuit revealKey(seat: Uint<8>, rollIndex: Uint<8>): Uint<8> {
+  return (seat * 3 + rollIndex) as Uint<8>;
+}
+
+/**
+ * The cell a move reads when it has no roll to reveal (an open). Never written after the
+ * constructor, so a read of it binds to nothing that can move -- the same device as
+ * `noAnswerKey` in table.compact.
+ */
+export pure circuit noRevealKey(): Uint<8> {
+  return 255;
+}
+
+/**
+ * A seat's contribution to one roll: `H("contrib", tableId, round‖rollIndex, sk)`.
+ *
+ * Hashed in the bytes domain for the reason `vrfInputPoint` gives: a Bytes<32> cast to Field
+ * fails at runtime on half of all real values. The two counters pack into one Field
+ * injectively because each is a Uint<8>. Distinct domain from `forcedEntropy` (which reveals
+ * `H(sk, tableId, round)` at the open for the seat-separating `mixed` value) and from the
+ * join-time commitment, so no reveal ever equals another public value derived from `sk`.
+ */
+export pure circuit contribution(
+                      sk: Bytes<32>,
+                      tableId: Bytes<32>,
+                      round: Uint<8>,
+                      rollIndex: Uint<8>,
+                      ): Bytes<32> {
+  const meta = (round as Field) * 256 + (rollIndex as Field);
+  return persistentHash<Vector<4, Bytes<32>>>(
+           [pad(32, "dust-dice:v3:contrib"), tableId, meta as Bytes<32>, sk,]
+           );
+}
+
+/** Has this slot said everything it will say about roll `r`: a value for this round, or out. */
+export pure circuit revealedFor(c: RevealCell, r: Uint<8>): Boolean {
+  return c.out || c.round == r;
+}
+
+/** The bytes a slot feeds into the digest: its value for THIS round, else a fixed zero. */
+export pure circuit contributionOf(c: RevealCell, r: Uint<8>): Bytes<32> {
+  return c.round == r ? c.value : default<Bytes<32>>;
+}
+
+/**
+ * The 32 bytes a roll's dice are expanded from on an on-chain table:
+ * `H("roll", tableId, round‖rollIndex, v_0 .. v_5)` over the six slots IN SEAT ORDER.
+ *
+ * Shared by every seat of the round -- the seats' streams are separated downstream by
+ * `mixed`, exactly as under the VRF -- and the same shape as the seed-era and VRF-era digests,
+ * so the ladder in dice-core is untouched: only where its 32 bytes come from moves.
+ */
+export pure circuit revealRollDigest(
+                      tableId: Bytes<32>,
+                      round: Uint<8>,
+                      rollIndex: Uint<8>,
+                      values: Vector<6, Bytes<32>>,
+                      ): Bytes<32> {
+  const meta = (round as Field) * 256 + (rollIndex as Field);
+  return persistentHash<Vector<9, Bytes<32>>>(
+           [pad(32, "dust-dice:v3:roll"),
+            tableId,
+            meta as Bytes<32>,
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5],]
+           );
+}

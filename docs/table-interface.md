@@ -8,8 +8,14 @@ Written for the operator daemon (`service/`) and the website (`ui/`). The CLI de
 client too and the same rules apply to it.
 
 Contract source: [`contract/src/table.compact`](../contract/src/table.compact). Design notes:
-[simultaneous-rounds.md](simultaneous-rounds.md), [table-contract.md](table-contract.md).
+[simultaneous-rounds.md](simultaneous-rounds.md), [table-contract.md](table-contract.md),
+[reveal-dice.md](reveal-dice.md) (the on-chain table's randomness, 2026-09-24).
 Measurements: [table-circuit.md](table-circuit.md).
+
+> **2026-09-24.** On-chain tables no longer use the VRF: every roll is a hash of one contribution
+> per seat, revealed in lockstep phases, and the operator has no move at all on the dice. The
+> VRF, `resolveRoll` and the answer cells are the FAST table's. Sections marked **(fast)** or
+> **(on-chain)** below apply to one mode; the rest to both.
 
 ---
 
@@ -42,7 +48,7 @@ roll, hold and score in any interleaving, and six `playerMove` transactions land
 measured at that width in [concurrency-probe.md](concurrency-probe.md). The round advances only
 when `closeRound` is called, and `closeRound` refuses until every live seat has scored.
 
-### One turn, in transactions
+### One turn, in transactions (fast)
 
 | #   | Who      | Call                                   | `seatTurn.stage` after | `vrfAnswer` after     |
 | --- | -------- | -------------------------------------- | ---------------------- | --------------------- |
@@ -65,6 +71,30 @@ turn's round and this turn's `blinded`, and the **player's** from then on (`answ
 
 **The player may score whenever its current query is answered** — after any roll. Scoring early
 skips the remaining holds and rolls entirely.
+
+### One round, in phases (on-chain)
+
+There is no operator transaction and no answer cell. A roll exists once **every live seat has
+revealed its contribution to it**, and a contribution to roll k may be revealed only once
+**every seat still rolling has fixed the hold before roll k** — so the round runs in lockstep
+phases across all seats, and no seat can compute a roll before the decision it would have
+informed is on chain ([reveal-dice.md](reveal-dice.md)).
+
+| phase    | who                                         | call                                          | `seatTurn.stage` after |
+| -------- | ------------------------------------------- | --------------------------------------------- | ---------------------- |
+| open     | every live seat                             | `playerMove(seat, 0, …)` — publishes `v(r,0)` | 1 `askedRoll1`         |
+|          | → roll 1 is public once the last open lands |                                               |
+| decide 1 | every seat still rolling                    | `playerMove(seat, 1, …)` hold, or `2` score   | 2 / 0                  |
+| reveal 2 | **every live seat, scored or not**          | `revealEntropy(seat, 1, v)`                   | unchanged              |
+|          | → roll 2 is public                          |                                               |
+| decide 2 | every seat still rolling                    | hold or score                                 | 3 / 0                  |
+| reveal 3 | every live seat                             | `revealEntropy(seat, 2, v)`                   | unchanged              |
+|          | → roll 3 is public                          |                                               |
+| score    | the seats still rolling                     | `playerMove(seat, 2, …)`                      | 0 `idle`               |
+
+A reveal nobody needs (no seat is asking for that roll) is not owed. Every roll is **public the
+moment the reveals complete** — a spectator computes every seat's dice with no secret
+(`chainRevealFor` in `@dust-dice/contract`), and the seat's next move puts the same dice on chain.
 
 **Why the resolve is kept out of the stage machine** ([bugs-found.md #35](bugs-found.md)): a fast
 table settles a whole turn as ONE transaction of up to seven merged calls, and the ledger-9 node
@@ -108,14 +138,16 @@ Take the next seat and stake `tier`. Returns the seat index.
   rejected with a `ReadMismatch`. Retry after re-reading `seatCount`. If both landed they would
   take the same seat index and one player's identity would be silently overwritten.
 
-### `playerMove(seat, kind, entropy, mask, category): Uint<8>`
+### `playerMove(seat, kind, entropy, mask, category, nextBlinded): Uint<8>`
 
 ```
-seat:     Uint<8>            the seat index returned by join
-kind:     Uint<8>            0 = open, 1 = hold, 2 = score
-entropy:  Bytes<32>          forced entropy on open; 32 zero bytes otherwise
-mask:     Vector<5, Boolean> the hold on a hold; all-false otherwise
-category: Uint<8>            0..12 on a score; 0 otherwise
+seat:        Uint<8>            the seat index returned by join
+kind:        Uint<8>            0 = open, 1 = hold, 2 = score
+entropy:     Bytes<32>          forced entropy on open; 32 zero bytes otherwise
+mask:        Vector<5, Boolean> the hold on a hold; all-false otherwise
+category:    Uint<8>            0..12 on a score; 0 otherwise
+nextBlinded: JubjubPoint        FAST: the blinded query for the roll this move unlocks
+                                ON-CHAIN: the identity point (0, 1), always
 ```
 
 Returns the seat's **next stage**, so a client can drive the state machine off the return value.
@@ -125,19 +157,22 @@ settlement verifier replays, and two encodings of one move would make it ambiguo
 rejects anything else with `only an open declares entropy` / `only a hold declares a mask` /
 `only a score declares a category`.
 
-| kind    | legal at `seatTurn.stage`                              | `entropy`                   | `mask`        | `category` |
-| ------- | ------------------------------------------------------ | --------------------------- | ------------- | ---------- |
-| 0 open  | 0, and `seatProgress[seat].round == openRound`         | `H(sk, tableId, openRound)` | all-false     | 0          |
-| 1 hold  | 1 or 2, with the asked roll answered in `vrfAnswer`    | 32 zero bytes               | the five bits | 0          |
-| 2 score | 1, 2 or 3, with the asked roll answered in `vrfAnswer` | 32 zero bytes               | all-false     | 0..12      |
+| kind    | legal at `seatTurn.stage`                                                                                | `entropy`                   | `mask`        | `category` |
+| ------- | -------------------------------------------------------------------------------------------------------- | --------------------------- | ------------- | ---------- |
+| 0 open  | 0, and `seatProgress[seat].round == openRound`                                                           | `H(sk, tableId, openRound)` | all-false     | 0          |
+| 1 hold  | 1 or 2; fast: the asked roll answered in `vrfAnswer`; on-chain: every contribution to it in `seatReveal` | 32 zero bytes               | the five bits | 0          |
+| 2 score | 1, 2 or 3; same condition                                                                                | 32 zero bytes               | all-false     | 0..12      |
 
-A hold or a score **reveals** the roll it acts on: it reads the answer cell for the asked roll,
-requires it to carry this turn's `round` and `blinded`, and proves with the witnesses
+A hold or a score **reveals** the roll it acts on. **(fast)** It reads the answer cell for the
+asked roll, requires it to carry this turn's `round` and `blinded`, and proves with the witnesses
 `vrfBlinding` (ρ) and `vrfGamma` that `B = ρ·P` for the input point this table, round, roll index,
-prior hold and seat secret define, and that `ρ·Γ = S`. The dice are derived from Γ and written to
+prior hold and seat secret define, and that `ρ·Γ = S`; the dice are derived from Γ. **(on-chain)**
+It reads the six `seatReveal` cells at the asked roll's index, requires every real slot to be
+revealed for this round or out, and derives the dice from their hash; the witnesses are
+placeholders and `nextBlinded` must be the identity point. Either way the dice are written to
 `seatTurn.roll` (hold) or `seatProgress.dice` (score). An open also latches `mixed =
-mixEntropy(entropy, roundDigest)`. Every kind also passes `nextBlinded`, the query for the roll
-this move unlocks (a point; unused on a score).
+mixEntropy(entropy, roundDigest)` and, in both modes, publishes the seat's contribution to roll 1
+into `seatReveal[seat*3 + 0]`.
 
 **All three kinds prove knowledge of the seat's `sk_s`** against the `C_s` recorded at join.
 Without it anyone could hold nothing and score a seat's dice into its worst category. The
@@ -148,7 +183,22 @@ All-true is legal but pointless — score instead.
 
 **Declares no time.**
 
-### `resolveRoll(seat, rollIndex, round, blinded, response, dleqA1, dleqA2, dleqZ): []` — operator
+### `revealEntropy(seat: Uint<8>, rollIndex: Uint<8>, value: Bytes<32>): []` — the seat (on-chain)
+
+Publishes `seatReveal[seat*3 + rollIndex] = {round: openRound, value, out: false}`, where `value`
+must equal `contribution(sk, tableId, openRound, rollIndex)` — proven from the seat's
+`playerEntropySecret` witness against its join commitment, exactly as the open's entropy is.
+`rollIndex` is 1 or 2 (roll 1's contribution rides on the open). Refused on a fast table.
+
+**The barrier:** every real slot is eliminated, or has scored this round, or is at stage
+`> rollIndex` (has fixed the hold before this roll). Until then the call fails with `not every
+seat has fixed its hold before this roll yet`. A repeat rewrites the same value. Reads every
+seat's `seatTurn` and `seatProgress` — safe precisely because no decide is legal while a reveal
+is (§1). Mirror: `contributionTs`; `seatObligation` says whether this seat owes one now.
+
+### `resolveRoll(seat, rollIndex, round, blinded, response, dleqA1, dleqA2, dleqZ): []` — operator (fast)
+
+**Refused on an on-chain table** (`rolls come from the seats' contributions, not the VRF`).
 
 Answers one VRF query: writes `vrfAnswer[seat*3 + rollIndex] = {round, blinded, response}` after
 verifying the Chaum–Pedersen DLEQ `(dleqA1, dleqA2, dleqZ)` that `response = x·blinded` for the
@@ -185,17 +235,36 @@ Refuses unless every seat is done: `seat >= seatCount || eliminated || seatProgr
 openRound`. **Declares a time.** Permissionless, so a player whose operator has gone quiet can
 advance the table.
 
-### `eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: Boolean): Uint<64>` — anyone / the seat itself
+### `eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: Boolean, now: Uint<64>): Uint<64>` — anyone / the seat itself
 
 Knocks out a seat. Returns the seat's refund. Two modes on one circuit (the deploy ceiling is
-nine and nine exist):
+nine and nine exist). **Declares a time** since 2026-09-24 (`now`, pinned like `closeRound`'s):
+on an on-chain table an elimination re-stamps the phase schedule, see below.
 
-- **`voluntary == false` (timeout)** — anyone. Requires `blockTimeGt(roundDeadline)`,
-  `seatProgress[seat].round == openRound`, `!eliminated`, and the seat to be the **player's** to
-  move (`playerOwes`: idle, or its asked roll answered in `vrfAnswer` — the player's silence).
-  An asked-and-unanswered seat is the operator's and is refused — **except on a fast table**
-  (`fastMode == true`), where resolves are off-chain and a seat parked at an asked stage past
-  the deadline is a stalled fast turn, so the owes-shield is waived. Penalty split: `q * 13 + rem == tier * (openRound + 1)`, `rem < 13`.
+- **`voluntary == false` (timeout)** — anyone. Requires `!eliminated` and then, by mode:
+  - **(fast)** `blockTimeGt(roundDeadline)` and `seatProgress[seat].round == openRound`. There is
+    no owes-shield: resolves are off-chain, so a seat parked at an asked stage past the deadline
+    is a stalled fast turn.
+  - **(on-chain)** the seat must owe an **unblocked** obligation whose phase slot has ended
+    (`this seat owes nothing yet` / `this seat's phase deadline has not passed` otherwise). The
+    slots run from `roundOpenedAt` in steps of `phaseSecs`:
+
+    | slot | obligation           | unblocked when                                                                                        |
+    | ---- | -------------------- | ----------------------------------------------------------------------------------------------------- |
+    | 1    | open                 | always                                                                                                |
+    | 2    | hold/score on roll 1 | every contribution to roll 1 is in                                                                    |
+    | 3    | reveal for roll 2    | every seat still rolling has held, and some seat is asking for roll 2 — **scored seats owe this too** |
+    | 4    | hold/score on roll 2 | revealed, and every contribution to roll 2 is in                                                      |
+    | 5    | reveal for roll 3    | as 3, one roll later                                                                                  |
+    | 6    | score on roll 3      | revealed, and every contribution to roll 3 is in                                                      |
+
+    A seat blocked behind another's silence owes nothing; the silent one does. **The elimination
+    re-stamps `roundOpenedAt = now` and `roundDeadline = now + turnTimeoutSecs`**, so whoever it
+    unblocks gets a whole slot rather than being due at once. Mirror: `seatObligation` /
+    `eliminableSeats` in `@dust-dice/contract` — use them, never a hand-rolled rule.
+
+  Penalty split in both modes: `q * 13 + rem == tier * (openRound + 1)`, `rem < 13`.
+
 - **`voluntary == true` (resignation)** — the seat itself: the `playerEntropySecret` witness must
   open `seatIdentity[seat].keyCommit`, the same authorisation `playerMove` demands. The deadline,
   stage-parity and played-this-round guards are all waived — resign any time while the table is
@@ -211,7 +280,8 @@ nine and nine exist):
   resignation pays the survivor and unlocks the resigner's redeem within about a minute.
 
 In both modes `q` is the penalty, which **stays in the pot**; `tier - q` becomes the seat's
-`seatRedeemable`. Pays the caller nothing. **Declares no time.**
+`seatRedeemable`, and the seat's three `seatReveal` cells are marked `out` (a value it revealed
+this round stays where the rolls found it). Pays the caller nothing.
 
 ### `settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8>` — anyone
 
@@ -225,9 +295,11 @@ Pays the winner `pot - q` and the rake `q`. Returns the winning seat.
   operator's policy prefers eliminating a delinquent survivor (reaching `abandoned`, where every
   penalty is waived) over crowning them.
 - `q * 100 + r == pot`, `r < 100`. The remainder goes to the winner.
-- **`seed` is public here** and must open `seedCommitment` — unless
+- **(fast)** `vrfSecret` is public here and must satisfy `x·G == vrfPublicKey` — unless
   `blockTimeGt(roundDeadline + tableTimeoutSecs)`, past which the check is waived and
-  `revealedSeed` stays all-zero. See §7.
+  `revealedVrfSecret` stays zero. **(on-chain)** nothing is required of it, ever: the game is
+  replayable from the public reveals, and the closing certificate says `verifiable = true`
+  regardless. See §7.
 - Eliminated seats cannot win. **Declares no time.**
 
 ### `redeem(seat: Uint<8>): Uint<64>` — anyone
@@ -249,12 +321,12 @@ and leaves the sending to `redeem`. Returns the per-seat share (0 on a start).
 
 Legal in exactly four situations, the first outranking the second:
 
-| situation        | condition                                                                                                  | effect                            |
-| ---------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| early start      | `phase == filling && startAfterSecs > 0 && activeSeats >= 2 && blockTimeGt(fillOpenedAt + startAfterSecs)` | `playing`, round 0 opens; no rake |
-| never filled     | `phase == filling && seatCount > 0 && blockTimeGt(roundDeadline)` and not starting                         | refund `tier`; no rake            |
-| operator stalled | `phase == playing`, some seat asked and **unanswered**, `blockTimeGt(roundDeadline + tableTimeoutSecs)`    | refund `tier`; no rake            |
-| all eliminated   | `phase == abandoned` (only a table that STARTED can be abandoned)                                          | refund `tier - q`; rake paid      |
+| situation        | condition                                                                                                               | effect                            |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| early start      | `phase == filling && startAfterSecs > 0 && activeSeats >= 2 && blockTimeGt(fillOpenedAt + startAfterSecs)`              | `playing`, round 0 opens; no rake |
+| never filled     | `phase == filling && seatCount > 0 && blockTimeGt(roundDeadline)` and not starting                                      | refund `tier`; no rake            |
+| operator stalled | **(fast only)** `phase == playing`, some seat asked and **unanswered**, `blockTimeGt(roundDeadline + tableTimeoutSecs)` | refund `tier`; no rake            |
+| all eliminated   | `phase == abandoned` (only a table that STARTED can be abandoned)                                                       | refund `tier - q`; rake paid      |
 
 `q` and `rem` are the **per-seat** rake on `tier`, not on the pot: `q * 100 + rem == tier`,
 `rem < 100`. Required unconditionally even on the paths that pay no rake, so the encoding stays
@@ -338,18 +410,19 @@ working as designed._
 
 ## 3. What the client computes, and what the circuit derives
 
-| Value                | Who computes it | How                                                                  |
-| -------------------- | --------------- | -------------------------------------------------------------------- |
-| `sk_s`               | player          | 32 fresh CSRNG bytes, **one per table**, never reused                |
-| `C_s`                | circuit         | `entropyKeyCommitment(tableId, sk)` at join                          |
-| `entropy` for a turn | **player**      | `forcedEntropyTs(sk, tableId, openRound)` — and re-proved in-circuit |
-| `mixed`              | circuit         | `mixEntropy(entropy, roundDigest)`, latched by `resolveRoll1`        |
-| the dice             | circuit         | from the seed; the client can only _predict_ them with the seed      |
-| `mask`               | **player**      | free choice, after seeing the dice                                   |
-| `category`           | **player**      | free choice, subject to the joker rules                              |
-| penalty `q`, `rem`   | **caller**      | `tier * (round + 1)` divided by 13 — Compact has no division         |
-| rake `q`, `r`        | **caller**      | `pot` divided by 100 at settle; `tier` by 100 at abortTable          |
-| seed commitment      | operator        | `seedCommitmentTs(tableId, seed)` **before the table opens**         |
+| Value                            | Who computes it | How                                                                                                           |
+| -------------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------- |
+| `sk_s`                           | player          | 32 fresh CSRNG bytes, **one per table**, never reused                                                         |
+| `C_s`                            | circuit         | `entropyKeyCommitment(tableId, sk)` at join                                                                   |
+| `entropy` for a turn             | **player**      | `forcedEntropyTs(sk, tableId, openRound)` — and re-proved in-circuit                                          |
+| `mixed`                          | circuit         | `mixEntropy(entropy, roundDigest)`, latched by the open                                                       |
+| contribution `v(r,k)` (on-chain) | **player**      | `contributionTs(sk, tableId, r, k)` — and re-proved in-circuit                                                |
+| the dice                         | circuit         | fast: from Γ, which only the seat can unblind; on-chain: from the six public contributions (`chainRevealFor`) |
+| `mask`                           | **player**      | free choice, after seeing the dice                                                                            |
+| `category`                       | **player**      | free choice, subject to the joker rules                                                                       |
+| penalty `q`, `rem`               | **caller**      | `tier * (round + 1)` divided by 13 — Compact has no division                                                  |
+| rake `q`, `r`                    | **caller**      | `pot` divided by 100 at settle; `tier` by 100 at abortTable                                                   |
+| seed commitment                  | operator        | `seedCommitmentTs(tableId, seed)` **before the table opens**                                                  |
 
 Mirrors live in `@dust-dice/contract`: `forcedEntropyTs`, `entropyKeyCommitmentTs`,
 `seedCommitmentTs`, `mixEntropyTs`, `firstRollTs`, `rerollUnderMaskTs`, `mergeStreamTs`,
@@ -366,7 +439,11 @@ rules. Use either to show "what would these dice score in each box" without a tr
 
 ```
 mixed  = H("dust-dice:v1:mix",  entropy_s(r), roundDigest_r)
-roll k = deriveDice(H("dust-dice:v1:roll", tableId, seed, mixed, r, k))     k = 0, 1, 2
+roll k = deriveDice(rollContext(tableId, D, mixed, r, k))                  k = 0, 1, 2
+
+fast:      D = H("dust-dice:v2:roll", H(Γ.x, Γ.y))            Γ = x·P, unblinded by the seat
+on-chain:  D = H("dust-dice:v3:roll", tableId, r‖k, v_0..v_5)  v_s = H("dust-dice:v3:contrib", tableId, r‖k, sk_s)
+           (a slot that is absent, or out without a value for this round, contributes 32 zero bytes)
 ```
 
 Roll 1 is `roll 0` in full. Rolls 2 and 3 **merge left to right**: the positions the mask does
@@ -410,8 +487,8 @@ circuit that stamps a deadline is told the time and pins the claim:
 blockTimeGte(now)  and  blockTimeLt(now + 120)   =>   now in (blockTime - 120, blockTime]
 ```
 
-**Only `join` and `closeRound` take a `now`.** Everything else compares real block time against a
-stored deadline. A client should pass its best estimate of current block time in seconds; passing
+**`join`, `closeRound`, `abortTable` and `eliminate` take a `now`.** Everything else compares
+real block time against a stored deadline. A client should pass its best estimate of current block time in seconds; passing
 a time ahead of the chain is rejected outright, and passing one more than 120 s behind is too.
 
 `roundDeadline` is the single deadline field:
@@ -421,11 +498,16 @@ a time ahead of the chain is rejected outright, and passing one more than 120 s 
 | `roundDeadline`                    | while `filling`: the fill deadline. While `playing`: when the open round must be finished. |
 | `roundDeadline + tableTimeoutSecs` | the operator's grace, and the settle seed-waiver point                                     |
 
-`turnTimeoutSecs` covers a **whole round** — up to four player transactions and three operator
-ones per seat, plus the operator's round trips. Size it accordingly and show the player the round
-deadline, not a per-move one. The constructor refuses any timeout at or below `120 * 2 = 240 s`
-(the factor was 4 until fast tables wanted five-minute rounds; a 300 s round survives the worst
-120 s shave with 180 s left).
+`turnTimeoutSecs` covers a **whole round**. On a fast table that is the only clock: size it for
+the turn plus the operator's round trips and show the player the round deadline. The constructor
+refuses any timeout at or below `120 * 2 = 240 s` (the factor was 4 until fast tables wanted
+five-minute rounds; a 300 s round survives the worst 120 s shave with 180 s left).
+
+**(on-chain) The phase schedule.** `roundOpenedAt` (stamped by `join`'s last seat, `abortTable`'s
+early start, `closeRound`, and re-stamped by `eliminate`) plus `n * phaseSecs` is the end of slot
+`n`, 1..6 as in the `eliminate` table; `phaseSecs` is sealed, must exceed 240 s, and six slots
+must fit inside `turnTimeoutSecs` (`0` on a fast table). Show the player the end of the slot of
+the obligation `seatObligation` reports, and "waiting for …" when it reports none.
 
 ---
 
@@ -459,10 +541,15 @@ table to `aborted`; only then does `redeem` pay the right number. A client that 
 
 ## 7. Verifiability
 
-`settle` publishes `revealedSeed`. **`revealedSeed == 0` on a settled table is a meaningful
-state, not "not settled yet"**: it means the game was force-settled past the deadline without a
-valid seed, and the rolls cannot be re-derived. A verifier must report such a game as
-_unverified_ rather than as _verification failed_.
+**(fast)** `settle` publishes `revealedVrfSecret`. **Zero on a settled table is a meaningful
+state, not "not settled yet"**: the game was force-settled past the deadline without a valid key,
+and the rolls cannot be re-derived. A verifier must report such a game as _unverified_ rather
+than as _verification failed_. Each seat's `sk` is published by its final score
+(`seatSecretRevealed`), which the replay also needs.
+
+**(on-chain)** nothing is needed beyond the log: every contribution is in `seatReveal` when it is
+revealed and in the `revealEntropy` / `playerMove(open)` transactions forever, and the dice
+follow from them (`chainDigestFor`, `chainRevealFor`). A verifier treats the key as irrelevant.
 
 `finalDigest` is a closing certificate written by both `settle` and `abortTable`:
 `H("dust-dice:v1:final", roundDigest, tableId, ending, winner, seatCount, paid, rake, perSeat,
@@ -480,45 +567,48 @@ Read with a one-shot `queryContractState`, never `contractStateObservable`, for 
 
 ### Sealed configuration
 
-`tableId`, `tier`, `seatLimit`, `rakeAddress`, `seedCommitment`, `turnTimeoutSecs`,
+`tableId`, `tier`, `seatLimit`, `rakeAddress`, `vrfPublicKey`, `turnTimeoutSecs`,
 `tableTimeoutSecs`, `fastMode`, `startAfterSecs` (0 = no early start), `inviteHash` (zero =
-public; otherwise `inviteCommitment(code)` and `join` needs the code).
+public; otherwise `inviteCommitment(code)` and `join` needs the code), `phaseSecs` (on-chain: one
+phase slot; 0 on a fast table).
 
 ### Table state
 
-| field             | type         | notes                                                                                                                           |
-| ----------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| `phase`           | enum         | 0 filling, 1 playing, 2 settled, 3 aborted, 4 abandoned. **Comes back as a `number`, not a `bigint`** — it is a Compact `enum`. |
-| `seatCount`       | `bigint`     | SLOTS taken (a pre-start leaver keeps its slot); frozen once playing                                                            |
-| `activeSeats`     | `bigint`     | players present / not eliminated; 0 while playing means abandoned                                                               |
-| `started`         | `boolean`    | true once the game began (full house or early start)                                                                            |
-| `fillOpenedAt`    | `bigint`     | declared time of the last join; early start at `+ startAfterSecs`                                                               |
-| `openRound`       | `bigint`     | 0..12 while playing; 13 means the game is over                                                                                  |
-| `roundDigest`     | `Uint8Array` | frozen for the round                                                                                                            |
-| `roundDeadline`   | `bigint`     | see §5                                                                                                                          |
-| `pot`             | `bigint`     |                                                                                                                                 |
-| `revealedSeed`    | `Uint8Array` | zeros until an honest settle                                                                                                    |
-| `winnerSeatIndex` | `bigint`     | meaningless before settle                                                                                                       |
-| `finalDigest`     | `Uint8Array` | zeros until settle or abortTable                                                                                                |
+| field               | type         | notes                                                                                                                           |
+| ------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `phase`             | enum         | 0 filling, 1 playing, 2 settled, 3 aborted, 4 abandoned. **Comes back as a `number`, not a `bigint`** — it is a Compact `enum`. |
+| `seatCount`         | `bigint`     | SLOTS taken (a pre-start leaver keeps its slot); frozen once playing                                                            |
+| `activeSeats`       | `bigint`     | players present / not eliminated; 0 while playing means abandoned                                                               |
+| `started`           | `boolean`    | true once the game began (full house or early start)                                                                            |
+| `fillOpenedAt`      | `bigint`     | declared time of the last join; early start at `+ startAfterSecs`                                                               |
+| `openRound`         | `bigint`     | 0..12 while playing; 13 means the game is over                                                                                  |
+| `roundDigest`       | `Uint8Array` | frozen for the round                                                                                                            |
+| `roundDeadline`     | `bigint`     | see §5                                                                                                                          |
+| `roundOpenedAt`     | `bigint`     | (on-chain) origin of the phase schedule; re-stamped by every elimination                                                        |
+| `pot`               | `bigint`     |                                                                                                                                 |
+| `revealedVrfSecret` | `bigint`     | (fast) zero until an honest settle                                                                                              |
+| `winnerSeatIndex`   | `bigint`     | meaningless before settle                                                                                                       |
+| `finalDigest`       | `Uint8Array` | zeros until settle or abortTable                                                                                                |
 
 ### Per-seat maps, keyed `0..5` (all six pre-inserted, so no lookup ever aborts)
 
-| map              | fields                                                                    |
-| ---------------- | ------------------------------------------------------------------------- |
-| `seatIdentity`   | `addr`, `keyCommit`                                                       |
-| `seatCard`       | `scores[13]`, `filled[13]`, `fiveOfAKindBonuses`                          |
-| `seatProgress`   | `round`, `total`, `finishedAtRound`, `eliminated`, `dice`                 |
-| `seatTurn`       | `stage`, `round`, `entropy`, `blinded`, `mixed`, `hold1`, `hold2`, `roll` |
-| `vrfAnswer`      | keyed `seat*3 + rollIndex`: `round`, `blinded`, `response`                |
-| `seatRedeemable` | `bigint`                                                                  |
-| `seatPaid`       | `bigint` — what `redeem` has already sent this slot                       |
-| `seatReceipt`    | `Uint8Array`                                                              |
+| map              | fields                                                                                                                                       |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `seatIdentity`   | `addr`, `keyCommit`                                                                                                                          |
+| `seatCard`       | `scores[13]`, `filled[13]`, `fiveOfAKindBonuses`                                                                                             |
+| `seatProgress`   | `round`, `total`, `finishedAtRound`, `eliminated`, `dice`                                                                                    |
+| `seatTurn`       | `stage`, `round`, `entropy`, `blinded`, `mixed`, `hold1`, `hold2`, `roll`                                                                    |
+| `vrfAnswer`      | (fast) keyed `seat*3 + rollIndex`: `round`, `blinded`, `response`                                                                            |
+| `seatReveal`     | (on-chain) keyed `seat*3 + rollIndex`: `round`, `value`, `out` — revealed for the open round iff `round == openRound`; `out` once eliminated |
+| `seatRedeemable` | `bigint`                                                                                                                                     |
+| `seatPaid`       | `bigint` — what `redeem` has already sent this slot                                                                                          |
+| `seatReceipt`    | `Uint8Array`                                                                                                                                 |
 
 **Whether a slot is real is `seat < seatCount`, never map membership.**
 `finishedAtRound == 65535` is the never-finished sentinel; `65534` marks a seat that left before
 the start.
 
-### Driving a UI off the effective stage
+### Driving a UI off the effective stage (fast)
 
 The ledger stage alone does not say whether the operator has answered; fold in the answer cell
 (`effectiveStage` in `verifier/src/contracts.ts`: asked roll k is `2k-1` unanswered, `2k` answered):
@@ -537,6 +627,22 @@ At effective stages 2, 4 and 6 the dice the seat is looking at are **not on chai
 `seatTurn[seat].roll` is the previous reveal, and the current roll is `vrfAnswer[…].response`
 unblinded with the seat's own ρ (`signerGateway.revealedDice` in the UI). The chain learns them
 with the seat's next move.
+
+### Driving a UI on an on-chain table
+
+Ask `seatObligation(ledger, seat)` (and `chainRevealFor(ledger, seat)` for the dice):
+
+| `seatObligation` returns         | show                                                          | next action             |
+| -------------------------------- | ------------------------------------------------------------- | ----------------------- |
+| `{kind: 'open'}`                 | "your turn"                                                   | player: open            |
+| `null`, stage ≥ 1, no dice yet   | "waiting for N seat(s) to reveal / to decide"                 | wait                    |
+| `{kind: 'decide', rollIndex: k}` | roll k+1 dice (`chainRevealFor`); hold/score controls         | player                  |
+| `{kind: 'reveal', rollIndex: k}` | "reveal your contribution to roll k+1" — one click, no choice | player: `revealEntropy` |
+| `{kind: 'score'}`                | roll 3 dice; score controls only                              | player: score           |
+| `null`, scored this round        | "done for this round" (until a reveal is owed)                | wait                    |
+
+Every obligation has a due time (`dueAt`); show it. A client may auto-send reveals — they carry
+no decision — subject to the wallet's approval.
 
 Three details a client will otherwise only find by reading the Compact:
 
@@ -558,13 +664,23 @@ Three details a client will otherwise only find by reading the Compact:
 The honest arithmetic, measured by the test suite
 (`describe('the transaction cost of an interactive turn')`), not estimated.
 
-**Per turn:**
+**Per turn (fast):**
 
 | turn              | player tx | operator tx | total |
 | ----------------- | --------: | ----------: | ----: |
 | full, three rolls |         4 |           3 |     7 |
 | stop after roll 2 |         3 |           2 |     5 |
 | stop after roll 1 |         2 |           1 |     3 |
+
+**Per turn (on-chain):** no operator transaction; instead every live seat sends one
+`revealEntropy` per reroll that ANY seat takes in the round — so a seat's own turn costs its
+moves plus up to two reveals, whether or not it rerolls itself.
+
+| round shape                           |  per seat | total |
+| ------------------------------------- | --------: | ----: |
+| everyone rolls three times            |     4 + 2 |     6 |
+| everyone stops after roll 1           |     2 + 0 |     2 |
+| one seat rolls three times, rest stop | 6 / 2 + 2 |     — |
 
 **Per game**, plus one `join` per seat, one `closeRound` per round, one `settle`, and one
 `redeem` per seat that is owed money:
@@ -607,10 +723,13 @@ operator that wants the full width of simultaneous rounds needs a pool of wallet
    it is indistinguishable from the transient `InvalidDustSpendProof`
    ([bugs-found.md #6](bugs-found.md)). Confirm from the ledger that the move did not land, then
    resubmit.
-5. **Do not seat the operator at a table it operates.** With interactive holds a seed-knowing
-   player can compute all 32 hold outcomes before choosing — see the residual note in
-   `table.compact`'s header. This is stronger than the old policy preview and the site's threat
-   model should say so.
+5. **(fast) Do not seat the operator at a table it operates.** With interactive holds a
+   key-knowing player can compute all 32 hold outcomes before choosing — see the residual note in
+   `table.compact`'s header. On an on-chain table this rule is unnecessary: the operator holds no
+   secret the dice depend on.
+6. **(on-chain) Send the reveals you owe, promptly, even after you have scored.** A seat that has
+   stopped for the round still owes its contribution to every reroll the others take, and it is
+   eliminable for a missed one exactly as for a missed move. Read `seatObligation` every poll.
 
 ---
 
@@ -643,7 +762,8 @@ directions**:
 
 This contract keeps every circuit at k ≥ 13 so nothing is ever refused at admission, and pays
 for it with a hard cap of nine circuits. That is why `playerMove` merges three player moves and
-`resolveReroll` merges two rolls.
+`resolveRoll` answers all three rolls. **All nine are used** since `revealEntropy` (2026-09-24):
+join, playerMove, revealEntropy, resolveRoll, closeRound, eliminate, settle, redeem, abortTable.
 
 **For a client author this means one thing:** if you need new on-chain behaviour, it has to go
 behind an existing circuit's kind discriminator, not into a new circuit. `npm run deploy-probe

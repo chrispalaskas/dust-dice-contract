@@ -113,18 +113,23 @@ const ADT_FIELDS: ReadonlyArray<readonly [PathKey, string]> = [
   // block sits one lower than before (2,1..2,8), while bucket 1's tail moved down by one
   // (`phase` 1,6 -> 1,5, `seatSecretRevealed` 1,14 -> 1,13). Re-derived from the generated
   // accessor on 2026-09-21, reading each Map's own method paths rather than by arithmetic.
-  ['2,1', 'seatIdentity'],
-  ['2,2', 'seatCard'],
-  ['2,3', 'seatProgress'],
-  ['2,4', 'seatTurn'],
-  ['2,5', 'vrfAnswer'],
-  ['2,6', 'seatRedeemable'],
-  ['2,7', 'seatReceipt'],
-  ['2,8', 'joinedKeys'],
-  // Declared after `padStore` (2,9) with the other late fields, between `started` and
-  // `fillOpenedAt`.
-  ['2,12', 'seatPaid'],
-  ['1,13', 'seatSecretRevealed'],
+  // `seatReveal`, `phaseSecs` and `roundOpenedAt` (the on-chain reveal scheme, 2026-09-24)
+  // took the field count to 36 and the compiler rebalanced a third time: bucket 1 now runs from
+  // `tableTimeoutSecs` and holds the first three maps, bucket 2 opens with `seatProgress`, and
+  // `padStore` sits at 2,6. Re-derived from the generated accessor, reading each Map's own
+  // method paths.
+  ['1,10', 'seatSecretRevealed'],
+  ['1,13', 'seatIdentity'],
+  ['1,14', 'seatCard'],
+  ['2,0', 'seatProgress'],
+  ['2,1', 'seatTurn'],
+  ['2,2', 'vrfAnswer'],
+  ['2,3', 'seatRedeemable'],
+  ['2,4', 'seatReceipt'],
+  ['2,5', 'joinedKeys'],
+  // Declared after `padStore` (2,6) with the other late fields.
+  ['2,9', 'seatPaid'],
+  ['2,12', 'seatReveal'],
 ];
 for (const [key, name] of ADT_FIELDS) FIELDS.set(key, name);
 
@@ -155,13 +160,15 @@ export function assertFieldMapIsComplete(): void {
   // Bucket 1 begins at `seatLimit` since the VRF field count pushed `tier` into bucket 0; see
   // the `seatSecretRevealed` entry above.
   // The `vrfAnswer` map (2026-09-21) rebalanced once more: bucket 2 opens with `finalDigest`.
-  expect('1,5', 'phase');
-  expect('1,13', 'seatSecretRevealed');
-  expect('2,0', 'finalDigest');
-  expect('2,9', 'padStore');
-  expect('2,10', 'startAfterSecs');
-  expect('2,13', 'fillOpenedAt');
-  expect('2,14', 'inviteHash');
+  // The reveal scheme's three fields (2026-09-24): see the `seatSecretRevealed` entry above.
+  expect('1,2', 'phase');
+  expect('1,12', 'finalDigest');
+  expect('2,6', 'padStore');
+  expect('2,7', 'startAfterSecs');
+  expect('2,10', 'fillOpenedAt');
+  expect('2,11', 'inviteHash');
+  expect('2,13', 'phaseSecs');
+  expect('2,14', 'roundOpenedAt');
 }
 
 /**

@@ -18,9 +18,20 @@
 // witness-checked modal-face machinery they needed -- a hold is now five explicit bits the
 // player sends after seeing the dice.
 //
-// NINE exported circuits -- join, playerMove, resolveRoll1, resolveReroll, closeRound,
+// NINE exported circuits -- join, playerMove, revealEntropy, resolveRoll, closeRound,
 // eliminate, settle, redeem, abortTable -- against a deploy ceiling MEASURED AT NINE on this
 // node. See section 8: the old "11-12" figure was inherited, never tested, and is wrong.
+//
+// TWO KINDS OF RANDOMNESS, chosen by the sealed `fastMode` (docs/reveal-dice.md):
+//
+//   on-chain  every roll is a hash of one CONTRIBUTION per live seat, each revealed only once
+//             every seat still rolling has fixed the hold before that roll (the open publishes
+//             roll 1's, `revealEntropy` the other two). The operator has no part in the dice.
+//   fast      the blind VRF of vrf-core.compact: the operator answers a blinded query with a
+//             DLEQ against the sealed key, and the player unblinds (`resolveRoll`).
+//
+// The randomness-residual section below describes the fast table; the on-chain table's own
+// residual (the last revealer's priced withhold) is in the design note.
 //
 // Two merges got the count there and both are load-bearing rather than tidiness. The
 // interactive turn wants three player entry points where the old one wanted one (open a turn,
@@ -257,6 +268,7 @@
 //
 // -------------------------------------------------------------------------------------------
 // The randomness residual GREW with interactive holds, and the old wording no longer applies
+// (FAST TABLES -- on an on-chain table the seed this section speaks of does not exist)
 // -------------------------------------------------------------------------------------------
 //
 // `entropy_s(r)` is forced to `H(sk_s, tableId, r)` and proven against a join-time commitment,
@@ -293,7 +305,10 @@ pragma language_version >= 0.26;
 import CompactStandardLibrary;
 
 include "dice-core";
+
 include "vrf-core";
+
+include "reveal-core";
 
 include "scoring-core";
 
@@ -941,6 +956,37 @@ export ledger fillOpenedAt: Uint<64>;
 export sealed ledger inviteHash: Bytes<32>;
 
 /**
+ * ON-CHAIN TABLES: each seat's contribution to each roll of the open round, keyed by
+ * `revealKey(seat, rollIndex)` -- one cell per (seat, roll), overwritten round after round,
+ * plus the never-written `noRevealKey()` cell an open reads (reveal-core.compact).
+ *
+ * WRITTEN in the reveal phase of a roll (by `revealEntropy`, and by the open for roll 1) and
+ * READ in the decide phase that follows it (by every `playerMove` that reveals dice). The two
+ * phases never overlap -- a reveal is legal only once every seat still rolling has fixed its
+ * hold, and a decide is legal only once every live seat has revealed -- which is what keeps six
+ * simultaneous decides conflict-free while each reads all six cells: nothing writes a cell
+ * anyone is reading. `eliminate` also writes a leaving seat's three cells (`out`), and it
+ * conflicts with everything anyway.
+ */
+export ledger seatReveal: Map<Uint<8>, RevealCell>;
+
+/**
+ * ON-CHAIN TABLES: the length of one phase slot, in seconds. A round is six slots from
+ * `roundOpenedAt` -- open, decide, reveal, decide, reveal, score -- and a seat is eliminable
+ * only for an obligation that is actually unblocked and whose slot has ended (`eliminate`).
+ * Zero on a fast table, which keeps the single round deadline.
+ */
+export sealed ledger phaseSecs: Uint<64>;
+
+/**
+ * ON-CHAIN TABLES: the origin of the open round's phase schedule. Stamped by whatever opens a
+ * round (`join`, `abortTable`'s early start, `closeRound`) and RE-STAMPED by `eliminate`, so
+ * that a seat whose obligation was blocked behind the eliminated one gets a fresh slot rather
+ * than being due the instant it is unblocked. A blind write in every writer.
+ */
+export ledger roundOpenedAt: Uint<64>;
+
+/**
  * The 4 KB of transaction padding, as a COMPILE-TIME CONSTANT.
  *
  * The width appears twice -- here and in `padStore`'s type -- and language 0.26 has no way to
@@ -1344,6 +1390,7 @@ constructor(id: Bytes<32>,
             fast: Boolean,
             startAfter: Uint<64>,
             invite: Bytes<32>,
+            phaseSlot: Uint<64>,
             ) {
   assert(seats >= 2, "a table needs at least 2 seats");
   assert(seats <= maxSeats(), "a table holds at most 6 seats");
@@ -1362,6 +1409,16 @@ constructor(id: Bytes<32>,
   assert(tableTimeout > timeoutFloor,
          "table timeout must exceed four times the declared-time slack"
          );
+  // The phase slot has the same floor as the round, for the same reason: the origin is a
+  // declared time, under-declarable by the slack, and only slot 1 is shortened by that -- the
+  // later slots are fixed offsets from the same origin. Six slots must fit the round budget,
+  // so the score's slot never outlives the round deadline the settle grace is measured from.
+  // A fast table has no phases and says so with a zero.
+  assert(fast
+           ? phaseSlot == 0
+           : (phaseSlot > timeoutFloor && turnTimeout >= (phaseSlot * 6) as Uint<64>),
+         "phase slot must be 0 on a fast table, else exceed the declared-time floor with six slots inside the turn timeout"
+         );
 
   tableId = disclose(id);
   tier = disclose(stake);
@@ -1376,6 +1433,7 @@ constructor(id: Bytes<32>,
   startAfterSecs = disclose(startAfter);
   // Zero = public. The hash is public knowledge by construction; only the preimage is secret.
   inviteHash = disclose(invite);
+  phaseSecs = disclose(phaseSlot);
 
   phase = Phase.filling;
   roundDigest = genesisDigest(disclose(id));
@@ -1399,6 +1457,7 @@ constructor(id: Bytes<32>,
   finalDigest = default<Bytes<32>>;
   started = false;
   fillOpenedAt = 0;
+  roundOpenedAt = 0;
 
   // Pre-insert the three maps that are read AT A FIXED INDEX 0..5, so every runtime `lookup` is
   // total. See section 7.
@@ -1439,9 +1498,16 @@ constructor(id: Bytes<32>,
       );
     seatRedeemable.insert(s as Uint<8>, 0);
     seatPaid.insert(s as Uint<8>, 0);
+    // A decide reads all eighteen contribution cells' worth of slots -- six at one roll index --
+    // so every slot's three cells exist from the start, absent seats included.
+    seatReveal.insert(revealKey(s as Uint<8>, 0), noRevealCell());
+    seatReveal.insert(revealKey(s as Uint<8>, 1), noRevealCell());
+    seatReveal.insert(revealKey(s as Uint<8>, 2), noRevealCell());
   }
   // The one answer cell an idle seat's move reads. See `noAnswerKey`.
   vrfAnswer.insert(noAnswerKey(), noAnswer());
+  // Likewise the one contribution cell an open reads. See `noRevealKey`.
+  seatReveal.insert(noRevealKey(), noRevealCell());
 }
 
 // ===========================================================================================
@@ -1532,6 +1598,7 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
     // Round 0 opens now, and every seat gets a full turn timeout to play its first turn.
     phase = Phase.playing;
     openRound = 0;
+    roundOpenedAt = t;
     roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
   } else {
     // The fill clock. Restarted by every join, so a table that is still attracting players is
@@ -1645,6 +1712,11 @@ export circuit playerMove(
          "playerMove: only a hold declares a mask -- pass all-false"
          );
   assert(scoring || cat == 0, "playerMove: only a score declares a category -- pass 0");
+  // On an on-chain table there is no VRF and nothing to ask: the query is the default point
+  // (the identity, (0, 1)), so the public log has one representation of a move in either mode.
+  assert(fastMode || nextBlinded == default<JubjubPoint>,
+         "playerMove: only a fast table's move carries a VRF query -- pass the identity point"
+         );
 
   // ---- authorisation: knowledge of this seat's entropy secret -------------------------
   const sk = playerEntropySecret();
@@ -1675,9 +1747,13 @@ export circuit playerMove(
 
   // ---- reveal the roll this move acts on ------------------------------------------------
   //
-  // The operator's resolve published `S = x*B` into `vrfAnswer` and learned nothing from it;
-  // the dice appear here, in the PLAYER's transaction, because unblinding needs `rho`. Four
-  // things are checked and they are not interchangeable:
+  // The roll's 32 bytes come from one of two places, and `fastMode` -- sealed -- says which.
+  // A circuit has no branches, so BOTH derivations run on every move; each is gated by its
+  // own mode so the other's inputs are placeholders that prove nothing.
+  //
+  // FAST TABLE (vrf-core): the operator's resolve published `S = x*B` into `vrfAnswer` and
+  // learned nothing from it; the dice appear here, in the PLAYER's transaction, because
+  // unblinding needs `rho`. Four things are checked and they are not interchangeable:
   //
   //   1. The answer cell for this seat and roll index holds an answer to THIS query: same
   //      round, same `B` as the one this seat committed with its previous move. The resolve
@@ -1690,42 +1766,81 @@ export circuit playerMove(
   //   3. `B == rho*P` ties the query the operator actually answered to that `P`.
   //   4. `S == rho*Gamma` unblinds it, stated that way so no scalar inverse is needed here.
   //
-  // Together they say: this Gamma is `x*P` for this exact roll, and the operator's DLEQ at
-  // resolve time already said the `x` was the sealed one. The dice follow from Gamma alone.
+  // ON-CHAIN TABLE (reveal-core): the roll is a hash of every live slot's contribution, and
+  // this move may only run once every one of them is in -- the barrier that gives the scheme
+  // its property. Six reads of `seatReveal`, all at this roll's index; nothing writes those
+  // cells while decides are legal (see the ledger declaration), so six simultaneous decides
+  // still land in one block.
   const rho = vrfBlinding();
   const gamma = vrfGamma();
   const revealIndex = askedIndex(pend.stage);
   // The hold that the roll being revealed was taken UNDER. Roll 1 is taken under no hold, so
   // the mask is empty — which is also what makes roll 1's query formable at open time.
-  const priorHold = pend.stage == stageAskedRoll1()
-                      ? default<Vector<5, Boolean>>
-                      : (pend.stage == stageAskedRoll2() ? pend.hold1.bits : pend.hold2.bits);
-  // An idle seat (an open) reads the never-written sentinel cell instead of a real one.
-  const answer = vrfAnswer.lookup(between ? answerKey(s, revealIndex) : noAnswerKey());
-  assert(!between || (answer.round == pend.round && answer.blinded == pend.blinded),
+  const priorHold =
+          pend.stage == stageAskedRoll1()
+            ? default<Vector<5, Boolean>>
+            : (pend.stage == stageAskedRoll2() ? pend.hold1.bits : pend.hold2.bits);
+  const fastReveal = fastMode && between;
+  const chainReveal = !fastMode && between;
+  // An idle seat (an open), and every move on an on-chain table, reads the never-written
+  // sentinel cell instead of a real one.
+  const answer = vrfAnswer.lookup(fastReveal ? answerKey(s, revealIndex) : noAnswerKey());
+  assert(!fastReveal || (answer.round == pend.round && answer.blinded == pend.blinded),
          "playerMove: the operator has not answered this seat's query yet"
          );
   const inputPoint = vrfInputPoint(tableId, pend.round, revealIndex, packHoldMask(priorHold), sk);
-  assert(disclose(!between || ecMul(inputPoint, rho as JubjubScalar) == pend.blinded),
+  assert(disclose(!fastReveal || ecMul(inputPoint, rho as JubjubScalar) == pend.blinded),
          "playerMove: the blinded query on chain is not this seat's input point blinded"
          );
-  assert(disclose(!between || ecMul(gamma, rho as JubjubScalar) == answer.response),
+  assert(disclose(!fastReveal || ecMul(gamma, rho as JubjubScalar) == answer.response),
          "playerMove: gamma does not unblind the operator's response"
          );
 
+  const n = seatCount;
+  const c0 = seatReveal.lookup(chainReveal ? revealKey(0, revealIndex) : noRevealKey());
+  const c1 = seatReveal.lookup(chainReveal ? revealKey(1, revealIndex) : noRevealKey());
+  const c2 = seatReveal.lookup(chainReveal ? revealKey(2, revealIndex) : noRevealKey());
+  const c3 = seatReveal.lookup(chainReveal ? revealKey(3, revealIndex) : noRevealKey());
+  const c4 = seatReveal.lookup(chainReveal ? revealKey(4, revealIndex) : noRevealKey());
+  const c5 = seatReveal.lookup(chainReveal ? revealKey(5, revealIndex) : noRevealKey());
+  assert(!chainReveal ||
+         ((0 >= n || revealedFor(c0, r)) &&
+          (1 >= n || revealedFor(c1, r)) &&
+          (2 >= n || revealedFor(c2, r)) &&
+          (3 >= n || revealedFor(c3, r)) &&
+          (4 >= n || revealedFor(c4, r)) &&
+          (5 >= n || revealedFor(c5, r))),
+         "playerMove: not every seat has revealed its contribution to this roll yet"
+         );
+  const chainDigest =
+          revealRollDigest(
+            tableId,
+            r,
+            revealIndex,
+            [contributionOf(c0, r),
+             contributionOf(c1, r),
+             contributionOf(c2, r),
+             contributionOf(c3, r),
+             contributionOf(c4, r),
+             contributionOf(c5, r),]
+            );
+
   // The ladder is UNCHANGED — only where its 32 bytes come from moves, from the seed to the
-  // VRF output. Same domain tags, same rejection thresholds, same distribution, so every
-  // property the dice tests pin still holds.
-  const freshDice = deriveDice(rollContext(tableId, vrfRollDigest(gamma), pend.mixed,
-                                           pend.round, revealIndex));
+  // VRF output or the seats' contributions. Same domain tags, same rejection thresholds, same
+  // distribution, so every property the dice tests pin still holds.
+  const rollDigest = fastMode ? vrfRollDigest(gamma) : chainDigest;
+  const freshDice =
+          deriveDice(rollContext(tableId, rollDigest, pend.mixed, pend.round, revealIndex));
   // ONE disclosure point for the roll, and it is the whole of what this transaction makes
   // public about `gamma`. The dice are meant to be public — every roll lands on chain, which
-  // is what lets a spectator follow the game and a replay check it. What stays private is
-  // `rho` and `gamma` themselves, and with them the operator's ability to have known the dice
-  // before the player did.
-  const revealed = disclose(revealIndex == 0
-                              ? freshDice
-                              : mergeStream(priorHold, fromDice(pend.roll), freshDice));
+  // is what lets a spectator follow the game and a replay check it. What stays private on a
+  // fast table is `rho` and `gamma` themselves, and with them the operator's ability to have
+  // known the dice before the player did. On an on-chain table nothing here is private at
+  // all: the dice are a function of public reveals, and anyone computed them already.
+  const revealed =
+          disclose(revealIndex == 0
+                     ? freshDice
+                     : mergeStream(priorHold, fromDice(pend.roll), freshDice));
   const revealedDice = toDice(revealed);
 
   // ---- score ---------------------------------------------------------------------------
@@ -1768,6 +1883,20 @@ export circuit playerMove(
     if (finishing) {
       seatSecretRevealed.insert(s, disclose(sk));
     }
+  }
+
+  // ---- the open's contribution to roll 1 ----------------------------------------------
+  //
+  // The decision before roll 1 is the previous round's category, and an open is legal only
+  // once `closeRound` has run -- i.e. once every seat has scored -- so publishing it here IS
+  // the reveal phase for roll 1, with `closeRound` as its barrier. Written in both modes (a
+  // fast table never reads it; uniform is cheaper than conditional), and a blind write on the
+  // seat's own key, so opens stay conflict-free.
+  if (opening) {
+    seatReveal.insert(
+      revealKey(s, 0),
+      RevealCell { round: r, value: disclose(contribution(sk, tableId, r, 0)), out: false, }
+      );
   }
 
   // ---- the turn's next stage -----------------------------------------------------------
@@ -1823,6 +1952,99 @@ export circuit playerMove(
 }
 
 // ===========================================================================================
+// revealEntropy -- ON-CHAIN TABLES: a seat's contribution to roll 2 or 3, once the holds are in
+// ===========================================================================================
+//
+// The one circuit the reveal scheme adds, and the ninth export, which is the deploy ceiling
+// (section 8). It could not ride on `playerMove`: a circuit reads what it reads regardless of
+// which kind runs, and the barrier below binds to every seat's turn and progress -- reads that
+// every other seat's DECIDE writes. On `playerMove` that would have made six simultaneous
+// decides collide; here the reads land in a phase in which no decide is legal.
+//
+// EVERY LIVE SEAT REVEALS, including one that has already scored this round: its contribution
+// is in the other seats' rolls whether or not it takes those rolls itself. A seat that never
+// needs to (nobody is asking for that roll) simply is not eliminable for not doing so -- see
+// `eliminate`'s `anyAskingFor`.
+//
+// A repeat reveal rewrites the same value (it is deterministic in `sk`), so a lost transaction
+// is retried without ceremony.
+
+/**
+ * Publish `contribution(sk, tableId, openRound, rollIndex)` for this seat, proven against the
+ * seat's join-time commitment. Legal only once every seat still rolling has fixed the hold
+ * preceding roll `rollIndex` -- which is what stops any seat computing that roll early.
+ */
+export circuit revealEntropy(seat: Uint<8>, rollIndex: Uint<8>, value: Bytes<32>): [] {
+  assert(phase == Phase.playing, "revealEntropy: table is not playing");
+  assert(!fastMode, "revealEntropy: a fast table's rolls come from the VRF, not from contributions");
+
+  const s = disclose(seat);
+  const k = disclose(rollIndex);
+  const v = disclose(value);
+  assert(s < seatCount, "revealEntropy: no such seat");
+  assert(k == 1 || k == 2,
+         "revealEntropy: roll 1's contribution is published by the open -- only rolls 2 and 3 are revealed here"
+         );
+
+  const r = openRound;
+  assert(r < roundCount(), "revealEntropy: the game is over");
+
+  // Authorisation and derivation, exactly as the open's entropy: supplied AND re-derived, so a
+  // wrong secret and a wrong value fail distinguishably.
+  const sk = playerEntropySecret();
+  assert(disclose(entropyKeyCommitment(tableId, sk) == seatIdentity.lookup(s).keyCommit),
+         "revealEntropy: wrong entropy secret for this seat"
+         );
+  assert(disclose(contribution(sk, tableId, r, k) == v),
+         "revealEntropy: value is not H(sk, tableId, round, rollIndex)"
+         );
+  assert(!seatProgress.lookup(s).eliminated, "revealEntropy: this seat has been eliminated");
+
+  // THE BARRIER. Every slot has either left the round (scored, eliminated, absent) or has
+  // committed to taking roll `k` -- its stage is past the decision this roll would inform.
+  const n = seatCount;
+  assert(slotViewFor(0, k, r, n).decided &&
+         slotViewFor(1, k, r, n).decided &&
+         slotViewFor(2, k, r, n).decided &&
+         slotViewFor(3, k, r, n).decided &&
+         slotViewFor(4, k, r, n).decided &&
+         slotViewFor(5, k, r, n).decided,
+         "revealEntropy: not every seat has fixed its hold before this roll yet"
+         );
+
+  seatReveal.insert(revealKey(s, k), RevealCell { round: r, value: v, out: false });
+
+  padTransaction();
+}
+
+/** What one slot has to say about the barrier for roll `k`. Two reads: its turn and progress. */
+export struct SlotView {
+  /** Out of the round, or committed to taking roll `k`: this slot no longer blocks its reveal. */
+  decided: Boolean,
+  /** A live seat waiting for exactly roll `k`: someone who needs everybody's contribution. */
+  asking: Boolean,
+}
+
+circuit slotViewFor(s: Uint<8>, k: Uint<8>, r: Uint<8>, n: Uint<8>): SlotView {
+  const p = seatProgress.lookup(s);
+  const t = seatTurn.lookup(s);
+  // Stage `k + 1` is "asked roll k" (see the state machine): a seat there has fixed hold k-1.
+  const live = s < n && !p.eliminated;
+  return SlotView { decided: !live || p.round > r || t.stage > k,
+                    asking: live && p.round == r && t.stage == (k + 1) as Uint<8>, };
+}
+
+/** Has every live slot revealed its contribution to roll `k` of round `r`? Six cell reads. */
+circuit allRevealedFor(k: Uint<8>, r: Uint<8>, n: Uint<8>): Boolean {
+  return (0 >= n || revealedFor(seatReveal.lookup(revealKey(0, k)), r)) &&
+         (1 >= n || revealedFor(seatReveal.lookup(revealKey(1, k)), r)) &&
+         (2 >= n || revealedFor(seatReveal.lookup(revealKey(2, k)), r)) &&
+         (3 >= n || revealedFor(seatReveal.lookup(revealKey(3, k)), r)) &&
+         (4 >= n || revealedFor(seatReveal.lookup(revealKey(4, k)), r)) &&
+         (5 >= n || revealedFor(seatReveal.lookup(revealKey(5, k)), r));
+}
+
+// ===========================================================================================
 // resolveRoll -- the operator's move: answer one query, prove the key, touch nothing else
 // ===========================================================================================
 //
@@ -1853,16 +2075,21 @@ export circuit playerMove(
  * Answer one VRF query. Touches exactly ONE map, `vrfAnswer`, and reads only constants of the
  * playing table -- which is what lets a merged fast turn run its three resolves first.
  */
-export circuit resolveRoll(seat: Uint<8>,
-                           rollIndex: Uint<8>,
-                           round: Uint<8>,
-                           blinded: JubjubPoint,
-                           response: JubjubPoint,
-                           dleqA1: JubjubPoint,
-                           dleqA2: JubjubPoint,
-                           dleqZ: Field,
-                           ): [] {
+export circuit resolveRoll(
+                 seat: Uint<8>,
+                 rollIndex: Uint<8>,
+                 round: Uint<8>,
+                 blinded: JubjubPoint,
+                 response: JubjubPoint,
+                 dleqA1: JubjubPoint,
+                 dleqA2: JubjubPoint,
+                 dleqZ: Field,
+                 ): [] {
   assert(phase == Phase.playing, "resolveRoll: table is not playing");
+  // The operator has no move on an on-chain table: its rolls are the seats' contributions.
+  assert(fastMode,
+         "resolveRoll: an on-chain table's rolls come from the seats' contributions, not the VRF"
+         );
 
   const s = disclose(seat);
   const i = disclose(rollIndex);
@@ -1873,13 +2100,21 @@ export circuit resolveRoll(seat: Uint<8>,
 
   const b = disclose(blinded);
   const answer = disclose(response);
-  assert(disclose(vrfDleqHolds(vrfPublicKey, b, answer, disclose(dleqA1), disclose(dleqA2),
-                               disclose(dleqZ))),
+  assert(disclose(vrfDleqHolds(
+                    vrfPublicKey,
+                    b,
+                    answer,
+                    disclose(dleqA1),
+                    disclose(dleqA2),
+                    disclose(dleqZ)
+                    )),
          "resolveRoll: the response is not this table's VRF applied to the query"
          );
 
-  vrfAnswer.insert(answerKey(s, i),
-                   VrfAnswer { round: disclose(round), blinded: b, response: answer, });
+  vrfAnswer.insert(
+    answerKey(s, i),
+    VrfAnswer { round: disclose(round), blinded: b, response: answer, }
+    );
 
   // Before the padding's checkpoint, so it weighs the part the ledger would otherwise run in
   // the guaranteed phase. See `resolveBallast`.
@@ -1958,6 +2193,7 @@ export circuit closeRound(now: Uint<64>): Uint<8> {
   // Restamped even for the final close, because `settle`'s seed-waiver deadline is measured from
   // it: the operator gets one more table timeout past the end of the game to produce the seed
   // before anyone may force-settle without it.
+  roundOpenedAt = t;
   roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
 
   padTransaction();
@@ -2052,11 +2288,23 @@ pure circuit roundResultOf(p: SeatProgress): RoundResult {
  * have no conditional calls), but its value only reaches an assertion behind `voluntary`, so
  * the operator's placeholder secret proves nothing and gates nothing.
  */
-export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: Boolean): Uint<64> {
+export circuit eliminate(
+                 seat: Uint<8>,
+                 q: Uint<64>,
+                 rem: Uint<64>,
+                 voluntary: Boolean,
+                 now: Uint<64>,
+                 ): Uint<64> {
   const s = disclose(seat);
   assert(s < seatCount, "eliminate: no such seat");
 
   const vol = disclose(voluntary);
+  // Declared and pinned like `closeRound`'s, because on an on-chain table this circuit
+  // RE-STAMPS the phase schedule (see the end). Under-declaring shortens the fresh slot 1 by
+  // at most the slack, the bound the constructor's floor already prices in.
+  const t = disclose(now);
+  pinTime(t);
+  const playing = phase == Phase.playing;
   // A FILLING table may be left voluntarily -- and only voluntarily: nobody owes anything
   // before the game starts, so there is no silence to punish. `openRound` is 0 while filling,
   // so the resignation schedule below charges `tier * 0 / 13 == 0`: a full refund, with the
@@ -2073,19 +2321,81 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
 
   const r = openRound;
   assert(r < roundCount(), "eliminate: the game is over");
-  assert(vol || blockTimeGt(roundDeadline), "eliminate: the round deadline has not passed");
 
   const prog = seatProgress.lookup(s);
   assert(!prog.eliminated, "eliminate: this seat is already out");
-  assert(vol || prog.round == r, "eliminate: this seat has already played the open round");
-
   const pend = seatTurn.lookup(s);
-  // On a FAST table the owes-shield is waived: resolves are off-chain there, so a seat parked
-  // at an asked stage past the deadline is a stalled fast turn, not an operator debt. On-chain
-  // tables keep the rule exactly: an asked-but-unanswered stage is the operator's silence and
-  // eliminating it would punish the wrong party.
-  assert(vol || fastMode || playerOwes(s, pend),
-         "eliminate: this seat is waiting on the operator, not the other way round"
+
+  // ---- FAST table: one round deadline, and the owes-shield is waived --------------------
+  // Resolves are off-chain there, so a seat parked at an asked stage past the deadline is a
+  // stalled fast turn, not an operator debt.
+  assert(vol || !fastMode || blockTimeGt(roundDeadline),
+         "eliminate: the round deadline has not passed"
+         );
+  assert(vol || !fastMode || prog.round == r,
+         "eliminate: this seat has already played the open round"
+         );
+
+  // ---- ON-CHAIN table: the phase schedule ---------------------------------------------
+  //
+  // A seat is eliminable for exactly one thing: an obligation that is UNBLOCKED -- the
+  // reveals or holds it was waiting on are in -- and whose slot has ended. A seat blocked
+  // behind another's silence owes nothing; the silent one does. Slots, from `roundOpenedAt`:
+  //
+  //     1  open                 stage 0, round not yet scored
+  //     2  hold or score on roll 1   stage 1, and every contribution to roll 1 is in
+  //     3  reveal for roll 2    not yet revealed it, the holds before roll 2 are all in, and
+  //                             some seat is waiting for roll 2 (a scored seat owes this too)
+  //     4  hold or score on roll 2   stage 2, revealed, every contribution to roll 2 is in
+  //     5  reveal for roll 3    as slot 3, one roll later
+  //     6  score on roll 3      stage 3, revealed, every contribution to roll 3 is in
+  //
+  // Thirty binding reads, and that is fine: this circuit read-modify-writes `pot` and
+  // conflicts with every concurrent move already. The loser retries.
+  const n = seatCount;
+  const scored = prog.round > r;
+  const own0 = seatReveal.lookup(revealKey(s, 0));
+  const own1 = seatReveal.lookup(revealKey(s, 1));
+  const own2 = seatReveal.lookup(revealKey(s, 2));
+  const view1 = [slotViewFor(0, 1, r, n),
+                 slotViewFor(1, 1, r, n),
+                 slotViewFor(2, 1, r, n),
+                 slotViewFor(3, 1, r, n),
+                 slotViewFor(4, 1, r, n),
+                 slotViewFor(5, 1, r, n),];
+  const view2 = [slotViewFor(0, 2, r, n),
+                 slotViewFor(1, 2, r, n),
+                 slotViewFor(2, 2, r, n),
+                 slotViewFor(3, 2, r, n),
+                 slotViewFor(4, 2, r, n),
+                 slotViewFor(5, 2, r, n),];
+  const holdsIn1 = allDecided(view1);
+  const holdsIn2 = allDecided(view2);
+  const asked1 = anyAsking(view1);
+  const asked2 = anyAsking(view2);
+  const owesOpen = !scored && pend.stage == stageIdle();
+  const owesDecide1 = pend.stage == stageAskedRoll1() && allRevealedFor(0, r, n);
+  const owesReveal1 =
+          (scored || pend.stage >= stageAskedRoll2()) && !revealedFor(own1, r) && holdsIn1 && asked1;
+  const owesDecide2 =
+          pend.stage == stageAskedRoll2() && revealedFor(own1, r) && allRevealedFor(1, r, n);
+  const owesReveal2 =
+          (scored || pend.stage >= stageAskedRoll3()) && !revealedFor(own2, r) && holdsIn2 && asked2;
+  const owesScore =
+          pend.stage == stageAskedRoll3() && revealedFor(own2, r) && allRevealedFor(2, r, n);
+  const slot = owesOpen
+                 ? 1
+                 : (owesDecide1
+                      ? 2
+                      : (owesReveal1
+                           ? 3
+                           : (owesDecide2 ? 4 : (owesReveal2 ? 5 : (owesScore ? 6 : 0)))));
+  const slotEnds = ((roundOpenedAt as Field) + (slot as Field) * (phaseSecs as Field)) as Uint<64>;
+  assert(vol || fastMode || slot != 0,
+         "eliminate: this seat owes nothing yet -- it is waiting on the other seats"
+         );
+  assert(vol || fastMode || blockTimeGt(slotEnds),
+         "eliminate: this seat's phase deadline has not passed"
          );
 
   // Rounds are 0..12 here and 1..13 in the design note. See the doc comment. A RESIGNATION IS
@@ -2138,6 +2448,13 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
                roll: pend.roll, }
     );
 
+  // The seat's contributions are OUT from now on: no roll waits for this slot again. A value
+  // already revealed this round stays where the rolls that read it found it; a cell without
+  // one contributes the fixed zero (`contributionOf`).
+  seatReveal.insert(revealKey(s, 0), RevealCell { round: own0.round, value: own0.value, out: true });
+  seatReveal.insert(revealKey(s, 1), RevealCell { round: own1.round, value: own1.value, out: true });
+  seatReveal.insert(revealKey(s, 2), RevealCell { round: own2.round, value: own2.value, out: true });
+
   // The forfeited share stays behind; the rest leaves the pot for good.
   pot = (pot - refund) as Uint<64>;
   seatRedeemable.insert(s, (seatRedeemable.lookup(s) + refund) as Uint<64>);
@@ -2155,10 +2472,33 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
     phase = Phase.abandoned;
   }
 
+  // ON-CHAIN: the schedule restarts. Whoever was blocked behind this seat is unblocked now,
+  // and must get a whole slot rather than be due at once -- otherwise one silence would
+  // cascade through the table. Blind writes, like every writer of these two.
+  if (playing && !fastMode) {
+    roundOpenedAt = t;
+    roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
+  }
+
   assertCustody();
 
   padTransaction();
   return refund;
+}
+
+/** Every slot past the decision this roll would inform. */
+pure circuit allDecided(v: Vector<6, SlotView>): Boolean {
+  return v[0].decided &&
+         v[1].decided &&
+         v[2].decided &&
+         v[3].decided &&
+         v[4].decided &&
+         v[5].decided;
+}
+
+/** Some live seat is waiting for this roll, so everyone's contribution to it is owed. */
+pure circuit anyAsking(v: Vector<6, SlotView>): Boolean {
+  return v[0].asking || v[1].asking || v[2].asking || v[3].asking || v[4].asking || v[5].asking;
 }
 
 // ===========================================================================================
@@ -2244,8 +2584,11 @@ export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
   // asked anything guards nothing.
   const x = disclose(vrfSecret);
   const opens = ecMulGenerator(x as JubjubScalar) == vrfPublicKey;
+  // An ON-CHAIN table needs no key to be replayed: every roll was a hash of public reveals, so
+  // the game is verifiable from the log alone and there is nothing here to waive.
+  const verifiable = !fastMode || opens;
   const graceExpired = blockTimeGt((roundDeadline + tableTimeoutSecs) as Uint<64>);
-  assert(opens || graceExpired, "settle: the secret does not match the table's VRF public key");
+  assert(verifiable || graceExpired, "settle: the secret does not match the table's VRF public key");
 
   assertCustody();
 
@@ -2287,7 +2630,7 @@ export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
       split[0],
       split[1],
       0,
-      opens
+      verifiable
       );
   phase = Phase.settled;
 
@@ -2460,12 +2803,15 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
           phase == Phase.filling && seatCount > 0 && blockTimeGt(roundDeadline) && !starting;
 
   const graceExpired = blockTimeGt((roundDeadline + tableTimeoutSecs) as Uint<64>);
-  const waiting = awaitingOperatorAt(0) ||
-                  awaitingOperatorAt(1) ||
-                  awaitingOperatorAt(2) ||
-                  awaitingOperatorAt(3) ||
-                  awaitingOperatorAt(4) ||
-                  awaitingOperatorAt(5);
+  // Only a FAST table ever waits on the operator: on an on-chain one every step of a round is
+  // a player's, and whoever is silent is `eliminate`'s business, never a reason to void.
+  const waiting = fastMode &&
+                  (awaitingOperatorAt(0) ||
+                   awaitingOperatorAt(1) ||
+                   awaitingOperatorAt(2) ||
+                   awaitingOperatorAt(3) ||
+                   awaitingOperatorAt(4) ||
+                   awaitingOperatorAt(5));
   const operatorStalled = phase == Phase.playing && waiting && graceExpired;
 
   const allOut = phase == Phase.abandoned;
@@ -2540,6 +2886,7 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
     phase = Phase.playing;
     started = true;
     openRound = 0;
+    roundOpenedAt = t;
     roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
   } else {
     pot = 0;

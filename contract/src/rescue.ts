@@ -22,6 +22,8 @@
 import type { Ledger as TableLedger } from './managed/table/contract/index.js';
 
 /** Rounds per seat, as `table.compact`'s `roundCount()` fixes it. */
+import { seatObligation } from './contrib.ts';
+
 const ROUND_COUNT = 13;
 
 /** `Phase` as the generated bindings spell it — plain numbers, not a Compact enum. */
@@ -100,6 +102,15 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
   // one last time precisely so this waiver has a clock, and every other circuit refuses:
   // openRound == 13 means no seat owes a move to eliminate and no roll is in flight to abort.
   if (Number(led.openRound) >= ROUND_COUNT) {
+    if (!led.fastMode) {
+      return {
+        kind: 'settle',
+        why:
+          'All thirteen rounds are played. An on-chain table needs no key to settle -- every ' +
+          'roll was a hash of public reveals -- so anyone can settle it now: the winner is paid ' +
+          'and every other seat becomes redeemable.',
+      };
+    }
     return graceExpired
       ? {
           kind: 'settle',
@@ -113,6 +124,46 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
           kind: 'none',
           why: 'The last round is closing; the table settles from here.',
         };
+  }
+
+  // ON-CHAIN (docs/reveal-dice.md): no operator to wait on, and no single round deadline. A seat
+  // is eliminable for exactly one thing -- an obligation the contract says is unblocked whose
+  // phase slot has ended -- and `seatObligation` IS that rule. Whoever owes and is late goes
+  // first; a table where nobody owes anything is between phases, not stuck.
+  if (!led.fastMode) {
+    for (let seat = 0; seat < Number(led.seatCount); seat++) {
+      const owed = seatObligation(led, seat);
+      if (owed === null || !past(owed.dueAt)) continue;
+      const what =
+        owed.kind === 'open'
+          ? 'open its turn'
+          : owed.kind === 'reveal'
+            ? `reveal its contribution to roll ${owed.rollIndex + 1}`
+            : owed.kind === 'score'
+              ? 'score its last roll'
+              : `hold or score on roll ${owed.rollIndex + 1}`;
+      return {
+        kind: 'eliminate',
+        seat,
+        why:
+          `Seat ${seat + 1} owes the table one thing -- ${what} -- and its phase slot has ` +
+          'ended. The other seats cannot go on without it. Eliminating it moves the table ' +
+          'towards a state where everyone can redeem, and gives the others a fresh slot.',
+      };
+    }
+    if (led.activeSeats === 1n) {
+      return {
+        kind: 'settle',
+        why:
+          'Only one seat is still in, so the game is already decided. Anyone can settle it ' +
+          'now -- an on-chain table needs no key from the operator: the survivor is paid and ' +
+          'every eliminated seat becomes redeemable.',
+      };
+    }
+    return {
+      kind: 'none',
+      why: 'No seat is late: every seat that owes something still has time in its phase slot, and the rest are waiting on them. The operator closes each round.',
+    };
   }
 
   if (!past(led.roundDeadline))

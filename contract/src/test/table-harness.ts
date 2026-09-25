@@ -71,6 +71,13 @@ import {
   type RoundResultTs,
 } from '../table-mirror.ts';
 import {
+  chainDigestFor,
+  chainRevealFor,
+  contributionTs,
+  revealKey,
+  seatObligation,
+} from '../contrib.ts';
+import {
   DEFAULT_BLOCK_TIME,
   diceToArray,
   TableSimulator,
@@ -158,6 +165,8 @@ export type TableOptions = {
   startAfterSecs?: bigint;
   /** Seal an invite commitment to make the table private. Defaults to public. */
   inviteHash?: Uint8Array;
+  /** ON-CHAIN: one phase slot. Defaults to 600 s (six inside the 3 600 s round); 0 on fast. */
+  phaseSecs?: bigint;
 };
 
 export function tableConfig(opts: TableOptions): TableConfig {
@@ -182,6 +191,7 @@ export function tableConfig(opts: TableOptions): TableConfig {
     fastMode: opts.fastMode ?? false,
     startAfterSecs: opts.startAfterSecs ?? 0n,
     inviteHash: opts.inviteHash ?? new Uint8Array(32),
+    phaseSecs: opts.phaseSecs ?? ((opts.fastMode ?? false) ? 0n : 600n),
   };
 }
 
@@ -276,20 +286,21 @@ export const keepModal: HoldChooser = ({ dice }) => {
  * `replayGame` plans it here and never touches a chain at all. If the two planned separately, a
  * divergence between them would be a test bug rather than a contract bug.
  */
-export function planTurn(
+/** The 32 bytes one roll's dice come from, by roll index and the hold it is taken under. */
+export type DigestSource = (rollIndex: number, holdMask: readonly boolean[]) => Uint8Array;
+
+/**
+ * A FAST table's digests: `Gamma = x*P`, where `P` commits to the roll index and to the hold
+ * the roll is taken under — so the thing that plays the seed's old role changes at every step.
+ * What it does NOT depend on is the blinding: that cancels, which is exactly why a test can
+ * predict a roll before it is played.
+ */
+export function vrfDigests(
   config: TableConfig,
-  mixed: Uint8Array,
-  seat: number,
   round: number,
   seatSecret: Uint8Array,
-  chooser: HoldChooser,
-): { holds: Mask[]; rolls: number[][]; final: number[] } {
-  // ONE DIGEST PER ROLL, not one seed per table. Under the VRF a roll comes from
-  // `Gamma = x*P`, and `P` commits to the roll index and to the hold the roll is taken under —
-  // so the thing that plays the seed's old role changes at every step. What it does NOT depend
-  // on is the blinding: that cancels, which is exactly why this function can still predict a
-  // roll before it is played.
-  const digest = (rollIndex: number, holdMask: readonly boolean[]): Uint8Array =>
+): DigestSource {
+  return (rollIndex, holdMask) =>
     vrf.rollDigestFor({
       secret: config.vrfSecret,
       tableId: config.tableId,
@@ -298,7 +309,31 @@ export function planTurn(
       holdMask: vrf.packHoldMask(holdMask),
       seatSecret,
     });
+}
 
+/**
+ * An ON-CHAIN table's digests: one per roll of the round, shared by every seat, from the
+ * contributions of the slots that are in the round (`null` = a slot that contributes the fixed
+ * zero: absent, or eliminated before it opened). Independent of the holds, which is the point:
+ * a seat's contribution is fixed at join and only its REVEAL is gated on the holds.
+ */
+export function chainDigests(
+  config: TableConfig,
+  round: number,
+  contributors: ReadonlyArray<Uint8Array | null>,
+): DigestSource {
+  return (rollIndex) => chainDigestFor(config.tableId, round, rollIndex, contributors);
+}
+
+export function planTurn(
+  config: TableConfig,
+  mixed: Uint8Array,
+  seat: number,
+  round: number,
+  seatSecret: Uint8Array,
+  chooser: HoldChooser,
+  digest: DigestSource = vrfDigests(config, round, seatSecret),
+): { holds: Mask[]; rolls: number[][]; final: number[] } {
   const holds: Mask[] = [];
   const rolls: number[][] = [firstRollTs(config.tableId, digest(0, NO_HOLD), mixed, round)];
   for (let step = 0; step < 2; step++) {
@@ -371,6 +406,9 @@ export type TurnRecord = {
   dice: number[];
   category: number;
 };
+
+/** One seat's planned on-chain turn, with the two values its open carries. */
+type ChainPlan = ReturnType<typeof planTurn> & { entropy: Uint8Array; mixed: Uint8Array };
 
 export type Strategy = 'firstLegal' | 'bestScore';
 
@@ -832,7 +870,16 @@ export class GameDriver {
    */
   async eliminate(seat: number, round: number): Promise<bigint> {
     const led = this.ledger();
-    this.clock = Math.max(this.clock, Number(led.roundDeadline) + 1);
+    if (this.config.fastMode) {
+      this.clock = Math.max(this.clock, Number(led.roundDeadline) + 1);
+    } else {
+      // ON-CHAIN: the deadline is the slot of the seat's UNBLOCKED obligation, not the round's.
+      // A seat that owes nothing yet cannot be eliminated, and the harness says so rather than
+      // letting the contract's refusal read as a test bug.
+      const owed = seatObligation(led, seat);
+      assert.ok(owed !== null, `seat ${seat} owes nothing unblocked, so it cannot be eliminated`);
+      this.clock = Math.max(this.clock, Number(owed.dueAt) + 1);
+    }
     const { q, rem } = penaltySplit(this.config.tier, round);
     const potBefore = led.pot;
     const owedBefore = led.seatRedeemable.lookup(BigInt(seat));
@@ -855,6 +902,20 @@ export class GameDriver {
       'elimination must close any half-played turn',
     );
     assert.equal(after.pot, potBefore - refund, 'the refundable share must leave the pot');
+    for (const k of [0, 1, 2]) {
+      assert.equal(
+        after.seatReveal.lookup(revealKey(seat, k)).out,
+        true,
+        `an eliminated seat's contribution cell ${k} must be marked out`,
+      );
+    }
+    if (!this.config.fastMode && after.phase === PHASE.playing) {
+      assert.equal(
+        after.roundOpenedAt,
+        BigInt(this.clock),
+        'an on-chain elimination must restart the phase schedule',
+      );
+    }
     assert.equal(
       after.seatRedeemable.lookup(BigInt(seat)),
       owedBefore + refund,
@@ -883,6 +944,7 @@ export class GameDriver {
    * quietly skipped seat.
    */
   async playRound(round: number): Promise<void> {
+    if (!this.config.fastMode) return this.playRoundChain(round);
     const live = this.liveSeats();
     const playing = live.filter((s) => !this.plannedElimination(s, round));
     for (const seat of this.orderFor(round, playing)) {
@@ -893,6 +955,225 @@ export class GameDriver {
       if (this.ledger().phase === PHASE.abandoned) return;
     }
     await this.closeRound(round);
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // The ON-CHAIN round: lockstep, in phases
+  // ---------------------------------------------------------------------------------------
+  //
+  // Under the reveal scheme no seat can finish a turn on its own: roll k exists only once every
+  // live seat has revealed its contribution to it, and a contribution to roll k is legal only
+  // once every seat still rolling has fixed its hold before roll k. So the driver walks the
+  // round phase by phase across ALL seats -- opens, then for each roll: the dice (asserted
+  // against the mirror before anyone moves, because they are public the moment the reveals
+  // complete), the decides, the reveals for the next roll -- and only then closes it.
+
+  /**
+   * The slots that contribute to round `round`: every live seat not scheduled to be knocked out
+   * in it. A planned straggler never opens, so on an on-chain table it is eliminated BEFORE
+   * anyone rolls (it would block roll 1 for everybody) and its slot contributes the fixed zero.
+   */
+  contributorsFor(round: number): (Uint8Array | null)[] {
+    return Array.from({ length: MAX_SEATS }, (_, s) => {
+      const seat = this.seats[s];
+      if (seat === undefined || seat.eliminated || this.plannedElimination(s, round)) return null;
+      return this.players[s]!.sk;
+    });
+  }
+
+  async playRoundChain(round: number): Promise<void> {
+    for (const seat of this.liveSeats().filter((s) => this.plannedElimination(s, round))) {
+      await this.eliminate(seat, round);
+      if (this.ledger().phase === PHASE.abandoned) return;
+    }
+    const playing = this.liveSeats();
+    const digests = chainDigests(this.config, round, this.contributorsFor(round));
+    const digestBefore = this.digest;
+    const plans = new Map<number, ChainPlan>();
+    for (const seat of playing) {
+      const entropy = this.entropyFor(seat, round);
+      const mixed = mixEntropyTs(entropy, digestBefore);
+      plans.set(seat, {
+        ...planTurn(
+          this.config,
+          mixed,
+          seat,
+          round,
+          this.players[seat]!.sk,
+          this.chooser(),
+          digests,
+        ),
+        entropy,
+        mixed,
+      });
+    }
+
+    // ---- opens: everyone's contribution to roll 1 ------------------------------------
+    for (const seat of this.orderFor(round, playing)) {
+      await this.openChain(seat, round, plans.get(seat)!);
+    }
+
+    // ---- the three rolls, in lockstep ----------------------------------------------------
+    const rolls = new Map<number, number[][]>(playing.map((s) => [s, []]));
+    const done = new Set<number>();
+    // Seats finish in whatever order their turns end; the record is kept in SEAT order, which
+    // is the order the replay produces and the order the digest folds.
+    const recorded = new Map<number, TurnRecord>();
+    for (let k = 0; k < 3; k++) {
+      const rolling = playing.filter((s) => !done.has(s));
+      if (rolling.length === 0) break;
+      // Every contribution to roll k is in, so every rolling seat's dice are public NOW, before
+      // any of them moves -- what a spectator computes, asserted against the mirror.
+      for (const seat of rolling) {
+        const seen = chainRevealFor(this.ledger(), seat);
+        assert.ok(seen !== null, `seat ${seat}'s roll ${k + 1} should be visible to everyone`);
+        assert.equal(seen.index, k);
+        assert.deepEqual(
+          seen.dice,
+          plans.get(seat)!.rolls[k],
+          `roll ${k + 1} diverged at seat ${seat} round ${round}`,
+        );
+        rolls.get(seat)!.push(seen.dice);
+      }
+      for (const seat of this.orderFor(round, rolling)) {
+        const plan = plans.get(seat)!;
+        if (k < plan.holds.length) {
+          await this.holdChain(seat, k, plan.holds[k]!, plan.rolls[k]!);
+        } else {
+          recorded.set(
+            seat,
+            await this.scoreChain(seat, round, plan, rolls.get(seat)!, digestBefore),
+          );
+          done.add(seat);
+        }
+      }
+      // ---- the reveal phase for roll k+1: EVERY live seat, scored or not -----------------
+      if (k < 2 && playing.some((s) => !done.has(s))) {
+        for (const seat of this.orderFor(round, playing)) {
+          await this.revealChain(seat, round, k + 1);
+        }
+      }
+    }
+    for (const seat of [...recorded.keys()].sort((a, b) => a - b)) {
+      this.turns.push(recorded.get(seat)!);
+    }
+    await this.closeRound(round);
+  }
+
+  async openChain(seat: number, round: number, plan: ChainPlan): Promise<void> {
+    const player = this.players[seat]!;
+    const led = this.ledger();
+    assert.equal(led.openRound, BigInt(round), `expected the table to be at round ${round}`);
+    assert.equal(led.seatProgress.lookup(BigInt(seat)).round, BigInt(round));
+    assert.equal(led.seatTurn.lookup(BigInt(seat)).stage, BigInt(STAGE.idle));
+
+    this.sim.asPlayer(player.sk);
+    assert.equal(
+      await this.sim.openTurn(seat, plan.entropy, this.tick()),
+      BigInt(STAGE.askedRoll1),
+    );
+    this.playerTx += 1;
+    const after = this.ledger();
+    const turn = after.seatTurn.lookup(BigInt(seat));
+    assert.equal(turn.round, BigInt(round));
+    assert.deepEqual(turn.entropy, plan.entropy);
+    assert.deepEqual(
+      turn.mixed,
+      plan.mixed,
+      'the open must latch the mirror-computed mixed entropy',
+    );
+    // The open IS the reveal phase for roll 1: the seat's contribution lands in its own cell.
+    const cell = after.seatReveal.lookup(revealKey(seat, 0));
+    assert.equal(cell.round, BigInt(round), 'the open must publish a contribution for this round');
+    assert.deepEqual(cell.value, contributionTs(player.sk, this.config.tableId, round, 0));
+    assert.equal(cell.out, false);
+    assert.equal(
+      after.seatProgress.lookup(BigInt(seat)).round,
+      BigInt(round),
+      'opening a turn must NOT advance the round cursor -- only scoring does',
+    );
+  }
+
+  /** A hold on roll `k` (0-based): reveals roll k on chain and fixes the mask before roll k+1. */
+  async holdChain(seat: number, k: number, mask: Mask, expectedRoll: number[]): Promise<void> {
+    this.sim.asPlayer(this.players[seat]!.sk);
+    const expectStage = k === 0 ? STAGE.askedRoll2 : STAGE.askedRoll3;
+    assert.equal(await this.sim.hold(seat, mask, this.tick()), BigInt(expectStage));
+    this.playerTx += 1;
+    const cell = this.ledger().seatTurn.lookup(BigInt(seat));
+    assert.deepEqual(diceToArray(cell.roll), expectedRoll, `the hold must reveal roll ${k + 1}`);
+    assert.deepEqual(
+      k === 0 ? cell.hold1.bits : cell.hold2.bits,
+      mask,
+      `hold ${k + 1} landed in the wrong cell`,
+    );
+  }
+
+  async revealChain(seat: number, round: number, k: number): Promise<void> {
+    const player = this.players[seat]!;
+    this.sim.asPlayer(player.sk);
+    await this.sim.revealEntropy(seat, k, this.tick());
+    this.playerTx += 1;
+    const cell = this.ledger().seatReveal.lookup(revealKey(seat, k));
+    assert.equal(cell.round, BigInt(round));
+    assert.deepEqual(cell.value, contributionTs(player.sk, this.config.tableId, round, k));
+    assert.equal(cell.out, false);
+  }
+
+  async scoreChain(
+    seat: number,
+    round: number,
+    plan: ChainPlan,
+    rolls: number[][],
+    digestBefore: Uint8Array,
+  ): Promise<TurnRecord> {
+    const player = this.players[seat]!;
+    const replay = this.seats[seat]!;
+    const dice = plan.final;
+    assert.deepEqual(
+      rolls[rolls.length - 1],
+      dice,
+      'the last roll seen is what the score is made on',
+    );
+    if (this.plan.probeIllegal === true) await this.probeIllegalPlacement(seat, round, dice);
+
+    const category = this.chooseCategory(seat, dice);
+    this.sim.asPlayer(player.sk);
+    assert.equal(await this.sim.score(seat, category, this.tick()), BigInt(STAGE.idle));
+    this.playerTx += 1;
+
+    replay.card = refApplyScore(replay.card, category as Category, dice as unknown as RefDice);
+    replay.dice = dice;
+
+    const after = this.ledger();
+    const prog = after.seatProgress.lookup(BigInt(seat));
+    assert.equal(prog.total, BigInt(refGrandTotal(replay.card)), `seat ${seat} total diverged`);
+    assert.equal(prog.round, BigInt(round + 1), 'scoring must advance the seat past the round');
+    assert.deepEqual(diceToArray(prog.dice), dice, 'the scored dice are what the digest folds');
+    assert.equal(after.seatTurn.lookup(BigInt(seat)).stage, BigInt(STAGE.idle));
+    const card = after.seatCard.lookup(BigInt(seat));
+    for (let cat = 0; cat < CATEGORY_COUNT; cat++) {
+      const ref = replay.card.scores[cat];
+      assert.equal(card.filled[cat], ref !== null, `seat ${seat} filled[${cat}] diverged`);
+      assert.equal(card.scores[cat], BigInt(ref ?? 0), `seat ${seat} scores[${cat}] diverged`);
+    }
+    if (round === FINAL_ROUND) {
+      replay.finishedAtRound = round;
+      assert.equal(prog.finishedAtRound, BigInt(round));
+    }
+    this.assertCustody();
+
+    return {
+      seat,
+      round,
+      entropy: plan.entropy,
+      mixed: plan.mixed,
+      digestBefore,
+      holds: plan.holds.map((h) => [...h]),
+      rolls,
+      dice,
+      category,
+    };
   }
 
   /** Close the open round and check the digest fold against the mirror. */
@@ -914,6 +1195,7 @@ export class GameDriver {
       BigInt(at) + this.config.turnTimeoutSecs,
       'closeRound must stamp the next round’s deadline',
     );
+    assert.equal(led.roundOpenedAt, BigInt(at), 'closeRound must stamp the phase schedule origin');
     this.assertCustody();
   }
 
@@ -1082,6 +1364,16 @@ export function replayGame(
   let operatorTx = 0;
 
   for (; round < ROUND_COUNT && !abandoned;) {
+    // ON-CHAIN: one digest per roll for the whole round, from the slots that are in it. A seat
+    // scheduled to be knocked out this round never opens and contributes the fixed zero.
+    const contributors: (Uint8Array | null)[] = Array.from({ length: MAX_SEATS }, (_, s) =>
+      s < seatCount && eliminated[s] !== true && !eliminateKeys.has(`${s}:${round}`)
+        ? players[s]!.sk
+        : null,
+    );
+    const roundDigests = chainDigests(config, round, contributors);
+    let maxHolds = 0;
+    let inRound = 0;
     // Every live seat that is not scheduled to walk away plays, in SEAT ORDER. The chain may have
     // seen any order at all; the digest cannot tell, which is the property under test.
     for (let seat = 0; seat < seatCount; seat++) {
@@ -1091,15 +1383,28 @@ export function replayGame(
       const player = players[seat]!;
       const entropy = forcedEntropyTs(player.sk, config.tableId, round);
       const mixed = mixEntropyTs(entropy, digest);
-      const { holds, rolls, final } = planTurn(config, mixed, seat, round, player.sk, chooser);
+      const { holds, rolls, final } = planTurn(
+        config,
+        mixed,
+        seat,
+        round,
+        player.sk,
+        chooser,
+        config.fastMode ? vrfDigests(config, round, player.sk) : roundDigests,
+      );
 
       const category = chooseCategoryFor(cards[seat]!, final, strategy);
       cards[seat] = refApplyScore(cards[seat]!, category as Category, final as unknown as RefDice);
       dice[seat] = final;
       if (round === FINAL_ROUND) finishedAtRound[seat] = round;
 
+      // Open + score, one hold per reroll. FAST: the operator answers each roll. ON-CHAIN: no
+      // operator transaction at all, but every seat in the round reveals once per reroll that
+      // ANYONE takes -- counted after the loop, when the round's longest turn is known.
       playerTx += 2 + holds.length;
-      operatorTx += 1 + holds.length;
+      if (config.fastMode) operatorTx += 1 + holds.length;
+      maxHolds = Math.max(maxHolds, holds.length);
+      inRound += 1;
       turns.push({
         seat,
         round,
@@ -1112,6 +1417,8 @@ export function replayGame(
         category,
       });
     }
+
+    if (!config.fastMode) playerTx += maxHolds * inRound;
 
     // Then the stragglers are knocked out, at the round they failed in.
     for (let seat = 0; seat < seatCount; seat++) {

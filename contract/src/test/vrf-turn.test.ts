@@ -33,9 +33,12 @@ const config = () => ({
   vrfPublicKey: vrf.vrfPublicKeyOf(SECRET),
   turnTimeoutSecs: 600n,
   tableTimeoutSecs: 3_600n,
-  fastMode: false,
+  // The VRF is the FAST table's randomness now; an on-chain table rolls from the seats'
+  // contributions (reveal-core.compact) and refuses a resolve.
+  fastMode: true,
   startAfterSecs: 0n,
   inviteHash: ZERO_BYTES32(),
+  phaseSecs: 0n,
 });
 
 describe('a turn played through the blind VRF', () => {

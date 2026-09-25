@@ -31,6 +31,12 @@
  *   6. the settle transaction spent ZERO user inputs and created exactly the two expected
  *      outputs, to the addresses recorded at join and at construction.
  *
+ * TWO KINDS OF TABLE (docs/reveal-dice.md). A FAST table's rolls come from the operator's blind
+ * VRF, so the replay needs the key `settle` revealed and each seat's secret its final score
+ * revealed. An ON-CHAIN table's rolls are hashes of the seats' public contributions, so the
+ * replay needs nothing but the log -- and where a seat's secret IS revealed, the verifier also
+ * checks that every contribution the chain accepted is the one that secret derives.
+ *
  * WHAT IT CANNOT PROVE, stated honestly: that each seat's published entropy really is
  * `H(sk_s, tableId, round)` for the secret committed at join. That binding is what the
  * `playerMove` circuit asserts in zero knowledge, and it is unverifiable from public data by
@@ -80,9 +86,12 @@ import {
   answerKey,
   askedIndex,
   blindQuery,
+  contributionTs,
   deriveBlinding,
   packHoldMask,
   rerollUnderMaskTs,
+  revealKey,
+  revealRollDigestTs,
   rollDigestFor,
   roundDigestTs,
   samePoint,
@@ -174,6 +183,8 @@ interface LogGroup {
 
 /** The calls a turn is made of, merged into one transaction or spread over several. */
 const TURN_CALLS = new Set(['playerMove', 'resolveRoll']);
+/** The calls an ON-CHAIN round is made of; none of them is ever merged. */
+const CHAIN_CALLS = new Set(['playerMove', 'revealEntropy']);
 
 /**
  * Causal order for two transactions that landed in the same block. Not a guess: the contract's
@@ -184,6 +195,7 @@ const GROUP_RANK: Record<string, number> = {
   join: 0,
   playerMove: 1,
   resolveRoll: 1,
+  revealEntropy: 1,
   eliminate: 2,
   closeRound: 3,
   settle: 4,
@@ -324,16 +336,22 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   }
 
   // --------------------------------------------------------------- 1. the key matches the seal
-  console.log('\n── the revealed VRF key ──');
   const x = final.revealedVrfSecret;
-  console.log(`  x ${x.toString(16)}`);
+  if (final.fastMode) {
+    console.log('\n── the revealed VRF key ──');
+    console.log(`  x ${x.toString(16)}`);
+  } else {
+    console.log(
+      "\n── no key needed: an on-chain table rolls from the seats' public contributions ──",
+    );
+  }
 
-  // Zero on a SETTLED table is not a missing field -- it is the contract's marker for a game
-  // force-settled past the table deadline with no valid key. The payout was still fully
+  // Zero on a SETTLED fast table is not a missing field -- it is the contract's marker for a
+  // game force-settled past the table deadline with no valid key. The payout was still fully
   // determined by public state and every roll was proven in its own transaction while the game
   // was live, but the game cannot be REPLAYED offline, which is exactly what this tool does. Say
   // so and stop, rather than reporting a failure that suggests the chain did something wrong.
-  if (x === 0n) {
+  if (final.fastMode && x === 0n) {
     console.log(
       '\n  This table was FORCE-SETTLED: the operator never revealed a valid key before the\n' +
         '  table deadline, so `settle` paid the winner computed from public state and left\n' +
@@ -344,12 +362,14 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     return 1;
   }
 
-  const pk = vrfPublicKeyOf(x);
-  c.ok(
-    'the revealed key is the one behind the public key the table was deployed with',
-    samePoint(pk, final.vrfPublicKey),
-    `x*G = (${pk.x.toString(16)}, ${pk.y.toString(16)})`,
-  );
+  if (final.fastMode) {
+    const pk = vrfPublicKeyOf(x);
+    c.ok(
+      'the revealed key is the one behind the public key the table was deployed with',
+      samePoint(pk, final.vrfPublicKey),
+      `x*G = (${pk.x.toString(16)}, ${pk.y.toString(16)})`,
+    );
+  }
 
   // ------------------------------------------------------------------------- walk the public log
   const groups = await readHistory(address);
@@ -370,8 +390,12 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   const unreplayable = seats.map((r, i) => (r.secret === undefined ? i : -1)).filter((i) => i >= 0);
   if (unreplayable.length > 0) {
     console.log(
-      `  seat(s) ${unreplayable.join(', ')} never reached a final score and revealed no secret: ` +
-        'their answers are checked against the key, but their dice cannot be re-derived offline.',
+      final.fastMode
+        ? `  seat(s) ${unreplayable.join(', ')} never reached a final score and revealed no secret: ` +
+            'their answers are checked against the key, but their dice cannot be re-derived offline.'
+        : `  seat(s) ${unreplayable.join(', ')} never reached a final score and revealed no secret: ` +
+            'their dice re-derive from the public contributions all the same; only the binding of ' +
+            'their own contributions to their secret rests on the proofs that landed.',
     );
   }
 
@@ -466,6 +490,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   let rollChecks = 0;
   let closes = 0;
   let eliminations = 0;
+  let reveals = 0;
 
   /** State immediately before the group being examined -- the previous group's, or the deploy's. */
   const before = (i: number): TableLedger | undefined => (i === 0 ? undefined : groups[i - 1]!.led);
@@ -683,11 +708,176 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     }
   };
 
+  /**
+   * ON-CHAIN: replay from the AFTER state against the verifier's own per-seat tracking, never
+   * from a before/after diff. That is what makes it sound however many seats moved in one block
+   * -- and on an on-chain table they do, six at a time, by design: every seat's turn cells are
+   * its own, and the contributions a move consumed were complete before it (the circuit
+   * asserted so), so they are in the block's after-state too. Every seat whose chain state has
+   * moved past what the replay tracked is checked; a later group in the same block then finds
+   * nothing new, which is exactly right.
+   */
+  const tracked = seats.map(() => ({ stage: 0, round: -1, revealed: [-1, -1, -1] }));
+  /** The six contributions to roll `k` of round `round`, as the circuit hashed them. */
+  const contributionsAt = (led: TableLedger, round: number, k: number): Uint8Array[] | null => {
+    const out: Uint8Array[] = [];
+    for (let s = 0; s < MAX_SEATS; s++) {
+      const cell = led.seatReveal.lookup(revealKey(s, k));
+      if (s < seatCount && !cell.out && Number(cell.round) !== round) return null;
+      out.push(Number(cell.round) === round ? cell.value : new Uint8Array(32));
+    }
+    return out;
+  };
+  const replayChainGroup = (g: LogGroup): void => {
+    const led = g.led;
+    const round = closes;
+    for (let seat = 0; seat < seatCount; seat++) {
+      const t = tracked[seat]!;
+      const r = seats[seat]!;
+      if (r.eliminated) continue;
+      // Contributions this seat has revealed for the open round, roll by roll. Where the seat's
+      // secret is public (its final score revealed it) the value is re-derived, which is the
+      // strongest statement available: the chain accepted exactly what the secret produces.
+      for (let k = 0; k < 3; k++) {
+        const cell = led.seatReveal.lookup(revealKey(seat, k));
+        if (Number(cell.round) !== round || t.revealed[k] === round) continue;
+        t.revealed[k] = round;
+        reveals += 1;
+        if (r.secret !== undefined) {
+          c.ok(
+            `seat ${seat} r${round}: contribution to roll ${k + 1} is the one its secret derives`,
+            same(cell.value, contributionTs(r.secret, tableId, round, k)),
+            `chain ${hex(cell.value).slice(0, 16)}…`,
+          );
+        }
+      }
+      const turn = led.seatTurn.lookup(BigInt(seat));
+      const prog = led.seatProgress.lookup(BigInt(seat));
+      const stage = Number(turn.stage);
+      const where = `seat ${seat} r${round}`;
+      // The roll a hold or a score reveals: derived from the six public cells at its index.
+      const revealedRoll = (index: number, mask: boolean[], chainDice: number[]): void => {
+        const values = contributionsAt(led, round, index);
+        if (values === null) {
+          // Only a block that also closed the round and saw the next round's opens or reveals
+          // can have overwritten a cell already; say so rather than fail the roll.
+          unseparable.push(
+            `${where} roll ${index + 1}: contribution cells overwritten in block ${g.blockHeight}`,
+          );
+          r.roll = chainDice;
+          r.rolls += 1;
+          return;
+        }
+        const digest = revealRollDigestTs(tableId, round, index, values);
+        const expected =
+          index === 0
+            ? firstRollTs(tableId, digest, r.mixed!, round)
+            : rerollUnderMaskTs(tableId, digest, r.mixed!, round, index, mask, r.roll);
+        const label =
+          index === 0
+            ? 'roll 1'
+            : `roll ${index + 1} under mask ${mask.map((b) => (b ? 1 : 0)).join('')}`;
+        c.ok(
+          `${where}: ${label}, from the seats' contributions`,
+          arrayEq(chainDice, expected),
+          `chain ${chainDice} vs replay ${expected}`,
+        );
+        if (index > 0) {
+          for (let d = 0; d < 5; d++) {
+            if (mask[d] === true) {
+              c.ok(
+                `${where}: held die ${d} survived roll ${index + 1}`,
+                chainDice[d] === r.roll[d],
+                `${r.roll[d]} -> ${chainDice[d]}`,
+              );
+            }
+          }
+        }
+        r.roll = expected;
+        r.rolls += 1;
+        rollChecks += 1;
+      };
+
+      if (t.stage === 0 && stage === 1 && Number(turn.round) === round && t.round !== round) {
+        // OPEN: latches the mix against the digest frozen at round open (the replay's), and
+        // publishes the seat's contribution to roll 1, checked above.
+        opens += 1;
+        r.rolls = 0;
+        r.mixed = mixEntropyTs(turn.entropy, digest);
+        c.ok(`${where}: mixed entropy`, same(turn.mixed, r.mixed), `chain ${hex(turn.mixed)}`);
+        c.ok(
+          `${where}: open clears both hold masks`,
+          turn.hold1.bits.every((b) => !b) && turn.hold2.bits.every((b) => !b),
+        );
+        c.ok(
+          `${where}: open publishes a contribution to roll 1`,
+          Number(led.seatReveal.lookup(revealKey(seat, 0)).round) === round,
+        );
+        t.stage = 1;
+        t.round = round;
+      } else if (t.stage >= 1 && t.round === round && stage === t.stage + 1) {
+        // HOLD on roll `t.stage - 1`: reveals it, fixes the mask before the next.
+        holds += 1;
+        const index = t.stage - 1;
+        const mask = index === 0 ? NO_HOLD : [...(index === 1 ? turn.hold1 : turn.hold2).bits];
+        revealedRoll(index, mask, diceToArray(turn.roll));
+        t.stage = stage;
+      } else if (
+        t.stage >= 1 &&
+        t.round === round &&
+        stage === 0 &&
+        Number(prog.round) === round + 1
+      ) {
+        // SCORE on roll `t.stage - 1`: reveals it into the progress record the digest folds.
+        scores += 1;
+        const index = t.stage - 1;
+        const mask = index === 0 ? NO_HOLD : [...(index === 1 ? turn.hold1 : turn.hold2).bits];
+        revealedRoll(index, mask, diceToArray(prog.dice));
+        const chainAfter = seatCard(led, seat);
+        const category = chainAfter.scores.findIndex(
+          (v, k) => v !== null && r.card.scores[k] === null,
+        );
+        c.ok(
+          `${where}: score filled exactly one new category`,
+          category >= 0 &&
+            chainAfter.scores.filter((v) => v !== null).length ===
+              r.card.scores.filter((v) => v !== null).length + 1,
+          `category index ${category}`,
+        );
+        if (category >= 0) {
+          r.card = applyScore(r.card, category as Category, r.roll as unknown as RefDice);
+          for (let k = 0; k < CATEGORY_COUNT; k++) {
+            c.ok(
+              `${where}: box ${k}`,
+              r.card.scores[k] === chainAfter.scores[k],
+              `replay ${r.card.scores[k]} vs chain ${chainAfter.scores[k]}`,
+            );
+          }
+          c.ok(
+            `${where}: running total`,
+            BigInt(grandTotal(r.card)) === prog.total,
+            `replay ${grandTotal(r.card)} vs chain ${prog.total}`,
+          );
+          if (round === FINAL_ROUND) r.finishedAtRound = round;
+        }
+        t.stage = 0;
+      }
+    }
+  };
+
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i]!;
     const led = g.led;
     const prev = before(i);
     const isTurn = g.entryPoints.every((k) => TURN_CALLS.has(k));
+
+    // ON-CHAIN: a move or a reveal (or several, when the operator folded a close into the block)
+    // -- replayed from the after-state, and the close checked after it if there is one.
+    if (!final.fastMode && g.entryPoints.some((k) => CHAIN_CALLS.has(k))) {
+      replayChainGroup(g);
+      for (const k of g.entryPoints) if (k === 'closeRound') verifyCloseRound(g);
+      continue;
+    }
 
     // A turn merged into one transaction: checked against the state it produced.
     if (isTurn && g.entryPoints.length > 1) {
@@ -1021,7 +1211,8 @@ async function verify(address: string, verbose: boolean): Promise<number> {
 
   console.log(
     `\n── replayed ${joins} joins, ${opens} opens, ${holds} holds, ${scores} scores, ` +
-      `${rollChecks} rolls, ${closes} round closes, ${eliminations} eliminations ──`,
+      `${rollChecks} rolls, ${closes} round closes, ${eliminations} eliminations` +
+      `${final.fastMode ? '' : `, ${reveals} contributions`} ──`,
   );
   c.ok('every seat joined', joins === seatCount, `${joins} joins for ${seatCount} seats`);
   // On a walkover the survivor's in-flight turn is legitimately cut off by the settle: opened,
