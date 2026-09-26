@@ -85,7 +85,75 @@ async function readSteps(address: string): Promise<Step[]> {
       ? a.blockHeight - b.blockHeight
       : progress(a.led) - progress(b.led),
   );
-  return steps;
+  return causalOrder(steps);
+}
+
+/** Could this transaction's calls have taken the table from `p` to `s`? */
+function produces(eps: readonly string[], p: BackgammonLedger, s: BackgammonLedger): boolean {
+  const P = Backgammon.BgPhase;
+  if (eps.includes('move')) return s.turn === p.turn + 1n;
+  if (eps.includes('resolveRoll')) {
+    return p.stage === STAGE_ROLL && s.stage === STAGE_MOVE && s.turn === p.turn;
+  }
+  if (eps.includes('join')) return s.seatCount === p.seatCount + 1n;
+  if (eps.includes('eliminate')) {
+    return (
+      (p.phase === P.filling && s.seatCount < p.seatCount) ||
+      (p.phase === P.playing && s.phase === P.decided && s.turn === p.turn)
+    );
+  }
+  if (eps.includes('settle')) return p.phase === P.decided && s.phase === P.settled;
+  if (eps.includes('abortTable')) return s.phase === P.aborted;
+  return false;
+}
+
+/**
+ * Order each block's transactions by CAUSE, not by listing: at every point take the transaction
+ * whose calls explain the step from the current state; one that left the state exactly as it was
+ * is a call that landed without effect (it lost a race in the same block) and goes where it
+ * changed nothing. Sorting by progress alone cannot tell a winning move from the timeout claim
+ * it beat -- both leave the same state behind.
+ */
+function causalOrder(sorted: Step[]): Step[] {
+  const out: Step[] = [];
+  let cur: BackgammonLedger | undefined;
+  for (let i = 0; i < sorted.length;) {
+    const block = sorted.filter((st) => st.blockHeight === sorted[i]!.blockHeight);
+    i += block.length;
+    const pending = [...block];
+    while (pending.length > 0) {
+      let k = pending.findIndex((st) =>
+        cur === undefined ? st.entryPoints.includes('join') : produces(st.entryPoints, cur, st.led),
+      );
+      if (k < 0 && cur) {
+        const key = stateKey(cur);
+        k = pending.findIndex((st) => stateKey(st.led) === key);
+      }
+      if (k < 0) k = 0; // unexplained: keep its place, and let the checks say what is wrong
+      const [st] = pending.splice(k, 1);
+      out.push(st!);
+      cur = st!.led;
+    }
+  }
+  return out;
+}
+
+/** Everything a call can change. Equal before and after = the call had no effect. */
+function stateKey(l: BackgammonLedger): string {
+  return [
+    l.phase,
+    l.seatCount,
+    l.stage,
+    l.toMove,
+    l.turn,
+    l.dice.a,
+    l.dice.b,
+    l.pot,
+    l.winner,
+    l.deadline,
+    l.board.s0.join(','),
+    l.board.s1.join(','),
+  ].join('|');
 }
 
 function boardOf(led: BackgammonLedger): Rules.Board {
@@ -169,6 +237,18 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
     const led = s.led;
     const what = s.entryPoints.join('+');
     if (verbose) console.log(`  tx ${i} ${what} (block ${s.blockHeight})`);
+
+    // A call can be INCLUDED and do nothing: built against a state a racing call changed first
+    // in the same block (a roll that lost to a resignation), it fails its fallible half and
+    // leaves the table as it was. The fee is spent; the game is not touched. Seen live on the
+    // devnet 2026-09-25; the Yacht verifier learned the same lesson (bugs-found #34).
+    if (prev && stateKey(prev) === stateKey(led)) {
+      console.log(
+        `  tx ${i} (${what}): landed without effect -- a racing call changed the table first`,
+      );
+      c.ok(`tx ${i} (${what}): the contract holds exactly its pot`, s.balance === led.pot);
+      continue;
+    }
 
     for (const ep of s.entryPoints) {
       switch (ep) {
