@@ -1,0 +1,135 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// The Backgammon table's dice: Yacht's dust dice, two at a time.
+//
+// `include`d by backgammon.compact AFTER dice-core.compact, whose byte ladder (`byteCandidate`,
+// `dieFromBytes`, the `Pick` accumulator) it reuses unchanged -- so this file carries no pragma
+// and no import of its own. Editing it changes the Backgammon table's verifier keys; it does
+// not touch Yacht's, which never include it.
+//
+// ---------------------------------------------------------------------------------------------
+// One hash per roll, and what goes into it
+// ---------------------------------------------------------------------------------------------
+//
+//     roll(t) = H("dust-dice:bg:v1:roll", tableId, seed, e_mover(t), e_opponent(t+1), t, stream)
+//
+// `seed` is the operator's, committed before either player existed. `e_s(t)` is FORCED:
+// `H(sk_s, tableId, t)`, proven against the commitment the seat registered at join, so a
+// player can reveal it but never choose it (policy-core.compact's `forcedEntropy`, with a
+// 16-bit ply counter because a long game passes 255 plies).
+//
+// PIPELINED, and that is why two entropies are hashed. Nobody posts a transaction just to
+// "roll": the mover's `move` at ply t reveals its own e(t+2), and `join` reveals e(1). So when
+// the operator rolls ply t, the mover's e(t) has been public since ply t-2 and the opponent's
+// e(t+1) became public with the move that ended ply t-1.
+//
+// Hashing BOTH is what stops a seed-knowing colluder seeing further than one ply ahead: with
+// only e_mover(t), the operator and a player together could compute every one of that player's
+// future rolls from the start. With e_opponent(t+1) in the hash, nobody can compute roll t
+// before the opponent's move at t-1 publishes it. The residual is stated in backgammon.compact's
+// header.
+//
+// The OPENING (ply 0) uses stream 1 and both seats' e(1), both revealed at join, and derives a
+// die per seat -- exactly the over-the-board opening, where each player throws one die, the
+// higher starts, and plays the two numbers. The pair can never be a double (see `bgOpening`).
+
+/** Everything that identifies one Backgammon roll. Fixed-width fields, hashed whole. */
+export struct BgRollContext {
+  domain: Bytes<32>,
+  tableId: Bytes<32>,
+  seed: Bytes<32>,
+  entropy: Bytes<32>,
+  other: Bytes<32>,
+  turn: Uint<16>,
+  stream: Uint<8>,
+}
+
+/** The two dice of a ply. For the opening, `a` is seat 0's die and `b` seat 1's. */
+export struct BgDice {
+  a: Uint<8>,
+  b: Uint<8>,
+}
+
+/** A seat's forced per-ply entropy: `H(sk, tableId, ply)`. Proven, never chosen. */
+export struct BgEntropyContext {
+  domain: Bytes<32>,
+  sk: Bytes<32>,
+  tableId: Bytes<32>,
+  turn: Uint<16>,
+}
+
+export pure circuit bgForcedEntropy(sk: Bytes<32>, tableId: Bytes<32>, turn: Uint<16>): Bytes<32> {
+  return persistentHash<BgEntropyContext>(
+           BgEntropyContext { domain: pad(32, "dust-dice:bg:v1:entropy"),
+                              sk: sk,
+                              tableId: tableId,
+                              turn: turn, }
+           );
+}
+
+export pure circuit bgRollBytes(
+                      tableId: Bytes<32>,
+                      seed: Bytes<32>,
+                      entropy: Bytes<32>,
+                      other: Bytes<32>,
+                      turn: Uint<16>,
+                      stream: Uint<8>,
+                      ): Vector<32, Uint<8>> {
+  return persistentHash<BgRollContext>(
+           BgRollContext { domain: pad(32, "dust-dice:bg:v1:roll"),
+                           tableId: tableId,
+                           seed: seed,
+                           entropy: entropy,
+                           other: other,
+                           turn: turn,
+                           stream: stream, }
+           )
+         as Vector<32, Uint<8>>;
+}
+
+/**
+ * FIVE-face candidate for the opening's second die: accept b < 250, five buckets of 50.
+ * The same shape as dice-core's six-face `byteCandidate`.
+ */
+pure circuit fiveCandidate(acc: Pick, b: Uint<8>): Pick {
+  const v = (1 +
+             ((b >= 50) as Uint<8>) +
+             ((b >= 100) as Uint<8>) +
+             ((b >= 150) as Uint<8>) +
+             ((b >= 200) as Uint<8>))
+            as Uint<8>;
+  return acc.found ? acc : (b < 250 ? Pick { found: true, die: v } : acc);
+}
+
+/** 1..5 from 4 candidate bytes. Exhaustion probability (6/256)^4 = 3.0e-7 (falls back to 1). */
+pure circuit fiveFromBytes(cands: Vector<4, Uint<8>>): Uint<8> {
+  const p = fold((acc: Pick, b: Uint<8>) => fiveCandidate(acc, b), noPick(), cands);
+  return p.die;
+}
+
+/**
+ * The dice for ply `turn` -- or, when `opening`, the two opening dice.
+ *
+ * ONE hash either way: the opening differs only in its stream and in which entropies it is
+ * given, and a circuit has no branches, so deriving both and selecting would pay for two.
+ *
+ * The opening's second die is `e + (e >= a)` with `e` uniform on 1..5 -- uniform on the five
+ * faces that are NOT `a` -- so the pair is never a double and needs no re-throw. Every ordered
+ * pair of distinct faces has probability exactly 1/30.
+ */
+export pure circuit bgDice(
+                      tableId: Bytes<32>,
+                      seed: Bytes<32>,
+                      entropy: Bytes<32>,
+                      other: Bytes<32>,
+                      turn: Uint<16>,
+                      opening: Boolean,
+                      ): BgDice {
+  const v = bgRollBytes(tableId, seed, entropy, other, turn, opening ? 1 : 0);
+  const a = dieFromBytes([v[0], v[1], v[2], v[3]]);
+  const six = dieFromBytes([v[4], v[5], v[6], v[7]]);
+  const five = fiveFromBytes([v[4], v[5], v[6], v[7]]);
+  const other2 = (five + ((five >= a) as Uint<8>)) as Uint<8>;
+  return BgDice { a: a, b: opening ? other2 : six };
+}

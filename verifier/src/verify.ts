@@ -84,12 +84,14 @@ import {
 } from '@dust-dice/contract';
 
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
-import { userAddressBytes } from '@dust-dice/api/node';
 
 import { NETWORK } from './config.ts';
+import { Checks, addressOf } from './checks.ts';
+import { verifyBackgammon } from './backgammon.ts';
 import {
   diceToArray,
   FINAL_ROUND,
+  gameOf,
   readTableLedger,
   ROUND_COUNT,
   STAGE,
@@ -107,42 +109,6 @@ import {
 const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 const same = (a: Uint8Array, b: Uint8Array): boolean => hex(a) === hex(b);
 const MAX_SEATS = 6;
-
-class Checks {
-  private failures: string[] = [];
-  private passes = 0;
-  private readonly verbose: boolean;
-
-  constructor(verbose: boolean) {
-    this.verbose = verbose;
-  }
-
-  ok(what: string, condition: boolean, detail = ''): void {
-    if (condition) {
-      this.passes += 1;
-      if (this.verbose) console.log(`  PASS ${what}`);
-    } else {
-      this.failures.push(`${what}${detail ? ` -- ${detail}` : ''}`);
-      console.log(`  FAIL ${what}${detail ? ` -- ${detail}` : ''}`);
-    }
-  }
-
-  get failed(): string[] {
-    return this.failures;
-  }
-
-  get count(): number {
-    return this.passes + this.failures.length;
-  }
-
-  summary(): void {
-    console.log(
-      `\n${this.failures.length === 0 ? 'VERIFIED' : 'VERIFICATION FAILED'}: ` +
-        `${this.passes} checks passed, ${this.failures.length} failed`,
-    );
-    for (const f of this.failures) console.log(`  - ${f}`);
-  }
-}
 
 /**
  * One TRANSACTION of the public log: the calls it carried, and the state it produced.
@@ -1049,37 +1015,22 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   return unseparable.length > 0 ? 2 : 0;
 }
 
-/**
- * Match a raw 32-byte payout key against the bech32m owner strings the indexer reports.
- *
- * The contract stores the raw key (a circuit argument cannot be a bech32m string); the indexer
- * reports the encoded address. Rather than re-implement the encoding here, the raw key is
- * matched against whichever created output's owner decodes to it -- and the decoding is the
- * wallet SDK's, via `@dust-dice/api/node`'s `userAddressBytes`, which is pure key math and needs
- * no wallet.
- */
-function addressOf(tx: { unshieldedCreatedOutputs: { owner: string }[] }, raw: Uint8Array): string {
-  const target = hex(raw);
-  for (const u of tx.unshieldedCreatedOutputs) {
-    try {
-      if (hex(userAddressBytes(u.owner)) === target) return u.owner;
-    } catch {
-      /* not an address this build can decode; skip */
-    }
-  }
-  return '<no created output belongs to this address>';
-}
-
 const address = process.argv[2];
 if (!address) {
   console.error(
     'usage: npm run verify -w cli -- <table-address> [--verbose]\n\n' +
       'Replays a settled Dust Dice table from the chain alone: every roll re-derived under the\n' +
       'hold masks the players sent, every score recomputed, the winner and the payout\n' +
-      're-confirmed.',
+      're-confirmed. A Backgammon table is recognised by its entry points and replayed ply by\n' +
+      'ply instead.',
   );
   process.exit(2);
 }
 
-process.exitCode = await verify(address, process.argv.includes('--verbose'));
+// One bin for both games: the contract's own entry points say which it is.
+const verbose = process.argv.includes('--verbose');
+process.exitCode =
+  (await gameOf(address)) === 'backgammon'
+    ? await verifyBackgammon(address, verbose)
+    : await verify(address, verbose);
 process.exit(process.exitCode);

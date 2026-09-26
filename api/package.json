@@ -1,14 +1,18 @@
 {
   "name": "@dust-dice/api",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "type": "module",
-  "description": "Contract interaction layer + pure game rules. No React imports \u2014 framework-swap seam. The './node' entry carries wallet/provider plumbing and must never be imported from browser code.",
+  "description": "Contract interaction layer + pure game rules. No React imports — framework-swap seam. The './node' entry carries wallet/provider plumbing and must never be imported from browser code.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./backgammon": {
+      "types": "./dist/backgammon.d.ts",
+      "default": "./dist/backgammon.js"
     },
     "./node": {
       "types": "./dist/node/index.d.ts",

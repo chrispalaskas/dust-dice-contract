@@ -4,12 +4,13 @@
 /**
  * Public surface of @dust-dice/contract.
  *
- * TWO CONTRACTS ARE MEANT TO BE DEPLOYED and four are not.
+ * THREE CONTRACTS ARE MEANT TO BE DEPLOYED and four are not.
  *
- * `Table` is the game: one deployment per table, holding the pot and running the two-step turn
- * (docs/table-contract.md, docs/table-circuit.md). `Lobby` is a per-site registry pointing at
+ * `Table` is Yacht: one deployment per table, holding the pot and running the two-step turn
+ * (docs/table-contract.md, docs/table-circuit.md). `Backgammon` is the second game, one
+ * deployment per two-seat game (docs/backgammon.md). `Lobby` is a per-site registry pointing at
  * whichever table is currently open per tier -- a convenience index with no funds and no
- * authority; the tables are the security boundary.
+ * authority; the tables are the security boundary. Each game has its own Lobby INSTANCE.
  *
  * `dice`, `turn`, `scoring` and `takeTurn` are measurement scaffolds and are NOT deployable --
  * no seats, no turn order, no pot, and nothing binding the operator's seed. They exist because
@@ -38,6 +39,7 @@ export * from './rescue.ts';
 export * from './dice-mirror.ts';
 export * from './policy-mirror.ts';
 export * from './table-mirror.ts';
+export * from './bg-mirror.ts';
 export * from './witnesses.ts';
 export * from './table-witnesses.ts';
 
@@ -47,3 +49,4 @@ export * as Scoring from './managed/scoring/contract/index.js';
 export * as TakeTurn from './managed/takeTurn/contract/index.js';
 export * as Table from './managed/table/contract/index.js';
 export * as Lobby from './managed/lobby/contract/index.js';
+export * as Backgammon from './managed/backgammon/contract/index.js';

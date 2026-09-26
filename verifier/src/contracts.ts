@@ -21,6 +21,7 @@ import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-p
 import {
   Table,
   Lobby,
+  Backgammon,
   tableWitnesses,
   lobbyWitnesses,
   unshieldedBalances,
@@ -32,7 +33,7 @@ import {
 import { NETWORK } from './config.ts';
 import { contractStateHexAt } from './indexer.ts';
 
-export { Table, Lobby };
+export { Table, Lobby, Backgammon };
 
 /**
  * The exported circuit names, spelled out.
@@ -57,6 +58,10 @@ export type TableCircuitId =
 
 export type LobbyCircuitId = 'openTableAt' | 'tableFilled';
 
+/** The Backgammon table's six exported circuits. */
+export type BackgammonCircuitId =
+  'join' | 'resolveRoll' | 'move' | 'eliminate' | 'settle' | 'abortTable';
+
 export const CompiledTableContract = CompiledContract.make<Table.Contract<TablePrivateState>>(
   'Table',
   Table.Contract<TablePrivateState>,
@@ -73,7 +78,19 @@ export const CompiledLobbyContract = CompiledContract.make<Lobby.Contract<LobbyP
   CompiledContract.withCompiledFileAssets('./lobby'),
 );
 
+/**
+ * Backgammon declares the same three witnesses as the Yacht table, so `tableWitnesses` and
+ * `TablePrivateState` serve both.
+ */
+export const CompiledBackgammonContract = CompiledContract.make<
+  Backgammon.Contract<TablePrivateState>
+>('Backgammon', Backgammon.Contract<TablePrivateState>).pipe(
+  CompiledContract.withWitnesses(tableWitnesses),
+  CompiledContract.withCompiledFileAssets('./backgammon'),
+);
+
 export type TableLedger = Table.Ledger;
+export type BackgammonLedger = Backgammon.Ledger;
 export type LobbyLedger = Lobby.Ledger;
 
 /** Which state to read: the latest, or the one a specific transaction left behind. */
@@ -110,6 +127,26 @@ export async function readContractState(address: string, at?: LedgerAt): Promise
 
 export async function readTableLedger(address: string, at?: LedgerAt): Promise<TableLedger> {
   return Table.ledger((await readContractState(address, at)).data);
+}
+
+export async function readBackgammonLedger(
+  address: string,
+  at?: LedgerAt,
+): Promise<BackgammonLedger> {
+  return Backgammon.ledger((await readContractState(address, at)).data);
+}
+
+/**
+ * Which game a deployed contract is, from its own entry points: `move` is Backgammon's alone,
+ * `playerMove` Yacht's. Undefined for anything else (a Lobby, or not a Dust Dice contract).
+ */
+export async function gameOf(address: string): Promise<'yacht' | 'backgammon' | undefined> {
+  const ops = (await readContractState(address))
+    .operations()
+    .map((o) => (typeof o === 'string' ? o : new TextDecoder().decode(o)));
+  if (ops.includes('move') && ops.includes('resolveRoll')) return 'backgammon';
+  if (ops.includes('playerMove')) return 'yacht';
+  return undefined;
 }
 
 export async function readLobbyLedger(address: string): Promise<LobbyLedger> {

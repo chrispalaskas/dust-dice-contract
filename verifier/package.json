@@ -1,8 +1,8 @@
 {
   "name": "@dust-dice/verifier",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "type": "module",
-  "description": "Independent verifier for Dust Dice: replays every roll of a finished table from the chain's own record \u2014 no operator, no trust \u2014 and the shared read-side helpers (compiled-contract handles, indexer queries).",
+  "description": "Independent verifier for Dust Dice: replays every roll of a finished table from the chain's own record — no operator, no trust — and the shared read-side helpers (compiled-contract handles, indexer queries).",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -60,8 +60,8 @@
     "dust-dice-verify": "dist/verify.js"
   },
   "peerDependencies": {
-    "@dust-dice/api": "0.4.4",
-    "@dust-dice/contract": "0.4.4"
+    "@dust-dice/api": "0.4.5",
+    "@dust-dice/contract": "0.4.5"
   },
-  "//peerDependencies": "The verifier resolves the compiled contract artifacts from wherever @dust-dice/contract is installed next to it. As regular dependencies with exact pins, npm nested a second copy of the contract package under the verifier whenever the consumer's version differed \u2014 and that copy was the one its config found (dust-dice bug #33). Peers make the consumer's single copy the only one."
+  "//peerDependencies": "The verifier resolves the compiled contract artifacts from wherever @dust-dice/contract is installed next to it. As regular dependencies with exact pins, npm nested a second copy of the contract package under the verifier whenever the consumer's version differed — and that copy was the one its config found (dust-dice bug #33). Peers make the consumer's single copy the only one."
 }

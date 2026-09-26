@@ -132,7 +132,7 @@ type AnyContract<PS> = {
   initialState(ctx: never): InitialState<PS>;
 };
 
-class BaseSimulator<PS> {
+export class BaseSimulator<PS> {
   address: ContractAddress = sampleContractAddress();
   state!: ChargedState;
   privateState: PS;
