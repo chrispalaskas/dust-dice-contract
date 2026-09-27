@@ -276,7 +276,13 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
             c.ok(`tx ${i}: a roll has a state before it`, false);
             break;
           }
-          const turn = Number(prev.turn);
+          // A ONE-TRANSACTION PLY carries the move and then this roll (cli/src/bg/ply.ts): the
+          // roll is for the ply AFTER that move, with the other seat to play it.
+          const afterMove =
+            s.entryPoints.indexOf('move') >= 0 &&
+            s.entryPoints.indexOf('move') < s.entryPoints.indexOf('resolveRoll');
+          const turn = Number(prev.turn) + (afterMove ? 1 : 0);
+          const rollMover = afterMove ? 1 - Number(prev.toMove) : Number(prev.toMove);
           // The seats' entropies as the roll read them: a roll never changes them, and at the
           // opening they only exist once this call -- the START, §6 -- has seated the players.
           const expected = bgRollForPly(
@@ -284,7 +290,7 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
             seed,
             [led.pendingEntropy.lookup(0n), led.pendingEntropy.lookup(1n)],
             turn,
-            Number(prev.toMove),
+            rollMover,
           );
           if (prev.phase === Backgammon.BgPhase.filling) {
             console.log(
@@ -348,9 +354,12 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
               Rules.hasWon(Rules.sidesFor(board, mover).mine) && Number(led.winner) === mover,
             );
           } else {
+            // The other seat is to roll -- or, in a one-transaction ply, has been rolled for.
+            const rolledToo = s.entryPoints.includes('resolveRoll');
             c.ok(
-              `ply ${turn}: the other seat is to roll`,
-              Number(led.toMove) === 1 - mover && led.stage === STAGE_ROLL,
+              `ply ${turn}: the other seat is to ${rolledToo ? 'move, rolled for in the same transaction' : 'roll'}`,
+              Number(led.toMove) === 1 - mover &&
+                led.stage === (rolledToo ? STAGE_MOVE : STAGE_ROLL),
             );
           }
           break;
