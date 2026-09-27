@@ -107,16 +107,17 @@ const FIELDS = fieldNames();
  * `assertFieldMapIsComplete` rather than as a silently mislabelled read.
  */
 const ADT_FIELDS: ReadonlyArray<readonly [PathKey, string]> = [
-  ['2,2', 'seatIdentity'],
-  ['2,3', 'seatCard'],
-  ['2,4', 'seatProgress'],
-  ['2,5', 'seatTurn'],
-  ['2,6', 'seatRedeemable'],
-  ['2,7', 'seatReceipt'],
-  ['2,8', 'joinedKeys'],
-  // Declared after `padStore` (2,9) with the other late fields, between `started` and
-  // `fillOpenedAt`.
-  ['2,12', 'seatPaid'],
+  ['2,1', 'seatIdentity'],
+  ['2,2', 'seatCard'],
+  ['2,3', 'seatProgress'],
+  ['2,4', 'seatTurn'],
+  ['2,5', 'seatRedeemable'],
+  ['2,6', 'seatReceipt'],
+  ['2,7', 'joinedKeys'],
+  // Declared after `padStore` (2,8) with the other late fields, between `started` and
+  // `fillOpenedAt` -- and `slotJoinedAt`, the last field of all (table.compact section 9).
+  ['2,11', 'seatPaid'],
+  ['2,14', 'slotJoinedAt'],
 ];
 for (const [key, name] of ADT_FIELDS) FIELDS.set(key, name);
 
@@ -144,12 +145,15 @@ export function assertFieldMapIsComplete(): void {
   // 0,0, the rest of the plain fields in bucket 1, and bucket 2 holding winnerSeatIndex,
   // finalDigest, the ADT block (2,2..2,8), padStore and the late fields. Re-derived from the
   // generated accessor on 2026-09-04.
-  expect('1,7', 'phase');
-  expect('2,1', 'finalDigest');
-  expect('2,9', 'padStore');
-  expect('2,10', 'startAfterSecs');
-  expect('2,13', 'fillOpenedAt');
-  expect('2,14', 'inviteHash');
+  // With `slotJoinedAt` (section 9) the compiler rebalanced again: bucket 1 now runs
+  // seatLimit..winnerSeatIndex, and bucket 2 starts at finalDigest with the ADT block at
+  // 2,1..2,7. Re-derived from the generated accessor on 2026-09-27.
+  expect('1,6', 'phase');
+  expect('2,0', 'finalDigest');
+  expect('2,8', 'padStore');
+  expect('2,9', 'startAfterSecs');
+  expect('2,12', 'fillOpenedAt');
+  expect('2,13', 'inviteHash');
 }
 
 /**

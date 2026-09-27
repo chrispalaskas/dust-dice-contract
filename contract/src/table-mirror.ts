@@ -48,6 +48,7 @@ const VEC13_BOOL = new CompactTypeVector(13, BOOL);
 /** Domain tags. Must equal the `pad(32, ...)` literals in table.compact. */
 export const TAG_GENESIS = 'dust-dice:v1:genesis';
 export const TAG_JOIN = 'dust-dice:v1:join';
+export const TAG_START = 'dust-dice:v1:start';
 export const TAG_ROUND = 'dust-dice:v1:round';
 export const TAG_ELIMINATED = 'dust-dice:v1:eliminated';
 export const TAG_REDEEMED = 'dust-dice:v1:redeemed';
@@ -122,6 +123,38 @@ export function joinDigestTs(
     addr,
     keyCommit,
   });
+}
+
+// ---------------------------------------------------------------------------------------
+// the start (table.compact section 9)
+// ---------------------------------------------------------------------------------------
+
+/** One seat as the start hashes it; a seat nobody took is 64 zero bytes. */
+export type StartSeatTs = { addr: Uint8Array; keyCommit: Uint8Array };
+
+/** Mirror of `startDigest`: every seat in seat order, `ids` padded to six with empty seats. */
+export function startDigestTs(
+  prev: Uint8Array,
+  seats: number | bigint,
+  ids: readonly StartSeatTs[],
+): Uint8Array {
+  const empty = new Uint8Array(32);
+  const six = Array.from({ length: 6 }, (_, i) => ids[i] ?? { addr: empty, keyCommit: empty });
+  const type: CompactType<null> = {
+    alignment: () =>
+      [BYTES32, BYTES32, UINT8, ...six.flatMap(() => [BYTES32, BYTES32])].flatMap((t) =>
+        t.alignment(),
+      ),
+    toValue: () =>
+      BYTES32.toValue(pad(32, TAG_START))
+        .concat(BYTES32.toValue(prev))
+        .concat(UINT8.toValue(BigInt(seats)))
+        .concat(
+          six.flatMap((id) => BYTES32.toValue(id.addr).concat(BYTES32.toValue(id.keyCommit))),
+        ),
+    fromValue: () => null,
+  };
+  return persistentHash(type, null);
 }
 
 // ---------------------------------------------------------------------------------------

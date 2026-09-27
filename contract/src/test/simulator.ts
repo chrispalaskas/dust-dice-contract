@@ -188,6 +188,10 @@ export class BaseSimulator<PS> {
    * signature: it names the circuit at all 24 call sites, which is the only place a reader can
    * see which one is being exercised.
    */
+  /** What the last circuit claimed to spend and receive -- its payouts are here. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  lastEffects: any;
+
   async run<R>(
     circuitId: string,
     call: (ctx: ReturnType<BaseSimulator<PS>['context']>) => CircuitResult<PS, R>,
@@ -195,6 +199,8 @@ export class BaseSimulator<PS> {
     void circuitId;
     const res = call(this.context());
     this.state = res.context.currentQueryContext.state;
+    // `effects` is on the runtime's QueryContext but not on the type this generic sees.
+    this.lastEffects = (res.context.currentQueryContext as unknown as { effects: unknown }).effects;
     if (res.context.currentPrivateState !== undefined) {
       this.privateState = res.context.currentPrivateState;
     }
@@ -533,9 +539,25 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     this.privateState = createTablePrivateState({ playerSecret: sk, inviteCode });
   }
 
-  join(payoutTo: UserAddress, now: number, blockTime = now): Promise<bigint> {
+  /**
+   * Claim a slot (table.compact section 9) -- the lowest free one unless `slot` says which.
+   * Returns the slot; the seat is the start's to give.
+   */
+  join(payoutTo: UserAddress, now: number, blockTime = now, slot?: number): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('join', (ctx) => this.table.impureCircuits.join(ctx, payoutTo, BigInt(now)));
+    const at = slot ?? this.lowestFreeSlot();
+    return this.run('join', (ctx) =>
+      this.table.impureCircuits.join(ctx, BigInt(at), payoutTo, BigInt(now)),
+    );
+  }
+
+  /** The lowest slot nobody holds, or 0 on a started table (where a join is refused anyway). */
+  lowestFreeSlot(): number {
+    const led = this.getLedger();
+    for (let i = 0; i < 6; i++) {
+      if (led.seatIdentity.lookup(BigInt(i)).addr.bytes.every((b) => b === 0)) return i;
+    }
+    return 0;
   }
 
   /**

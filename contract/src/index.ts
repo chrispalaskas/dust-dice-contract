@@ -40,7 +40,9 @@ export * from './dice-mirror.ts';
 export * from './policy-mirror.ts';
 export * from './table-mirror.ts';
 export * from './bg-mirror.ts';
+export * from './slots.ts';
 export * from './bg-slots.ts';
+export * from './table-slots.ts';
 export * from './witnesses.ts';
 export * from './table-witnesses.ts';
 

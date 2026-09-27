@@ -65,7 +65,7 @@ import {
 import {
   emptyRoundResult,
   genesisDigestTs,
-  joinDigestTs,
+  startDigestTs,
   roundDigestTs,
   type RoundResultTs,
 } from '../table-mirror.ts';
@@ -481,32 +481,88 @@ export class GameDriver {
     }
   }
 
-  async join(seat: number): Promise<void> {
+  /**
+   * Player `seat` claims slot `seat` (table.compact section 9). Players join in index order at
+   * rising times, so the start gives each the seat of its own index. The join that fills the
+   * table is followed by the start, as the operator does -- a join can no longer start a table.
+   */
+  async join(seat: number, opts: { start?: boolean } = {}): Promise<void> {
     const player = this.players[seat]!;
     this.sim.asPlayer(player.sk);
     const before = this.ledger();
     const at = this.tick();
-    const returned = await this.sim.join(player.addr, at);
+    const returned = await this.sim.join(player.addr, at, at, seat);
     this.playerTx += 1;
-    assert.equal(returned, BigInt(seat), `join returned the wrong seat index`);
+    assert.equal(returned, BigInt(seat), `join returned the wrong slot`);
 
-    this.digest = joinDigestTs(
-      this.digest,
-      seat,
-      player.addr.bytes,
-      entropyKeyCommitmentTs(this.config.tableId, player.sk),
-    );
     const led = this.ledger();
-    assert.deepEqual(
-      led.roundDigest,
-      this.digest,
-      `roundDigest diverged after seat ${seat} joined`,
+    const id = led.seatIdentity.lookup(BigInt(seat));
+    assert.deepEqual(id.addr.bytes, player.addr.bytes, 'the slot records the payout address');
+    assert.deepEqual(id.keyCommit, entropyKeyCommitmentTs(this.config.tableId, player.sk));
+    assert.equal(led.slotJoinedAt.lookup(BigInt(seat)), BigInt(at));
+    // Nothing shared moves at a join: that is what lets two land in one block.
+    assert.deepEqual(led.roundDigest, before.roundDigest, 'a join must not move the digest');
+    assert.equal(led.seatCount, before.seatCount);
+    assert.equal(led.activeSeats, before.activeSeats);
+    assert.equal(led.pot, before.pot, 'a join must not touch the pot');
+    this.assertCustody();
+
+    if (opts.start !== false && this.heldSlots().length >= this.players.length) {
+      await this.start();
+    }
+  }
+
+  /**
+   * What the last circuit paid straight to players, by payout address (hex) -- the slot refunds
+   * of table.compact section 9. `redeem` pays through here too.
+   */
+  paidOut(): Map<string, bigint> {
+    const out = new Map<string, bigint>();
+    const spends = this.sim.lastEffects?.claimedUnshieldedSpends as
+      Map<[unknown, { tag: string; address?: string }], bigint> | undefined;
+    for (const [[, to], amount] of spends ?? []) {
+      if (to.tag === 'user' && to.address)
+        out.set(to.address, (out.get(to.address) ?? 0n) + amount);
+    }
+    return out;
+  }
+
+  /** `paidOut` for one player. */
+  paidTo(player: number): bigint {
+    return this.paidOut().get(Buffer.from(this.players[player]!.addr.bytes).toString('hex')) ?? 0n;
+  }
+
+  /** Slots someone holds while the table fills. */
+  heldSlots(): number[] {
+    const led = this.ledger();
+    return [...Array(MAX_SEATS).keys()].filter(
+      (i) => !led.seatIdentity.lookup(BigInt(i)).addr.bytes.every((b) => b === 0),
     );
-    // Slots and active seats move by one each; they differ once a seat has left while filling.
-    assert.equal(led.seatCount, before.seatCount + 1n);
-    assert.equal(led.activeSeats, before.activeSeats + 1n);
-    // The pot holds the ACTIVE players' stakes: a pre-start leaver took its own back.
-    assert.equal(led.pot, before.pot + this.config.tier, 'a join adds exactly one stake');
+  }
+
+  /**
+   * The start, as the operator sends it once the table is full (or its early clock has run).
+   * Checks the seats, the counts, the pot and the digest against the mirror.
+   */
+  async start(at = this.tick()): Promise<void> {
+    const { q, rem } = perSeatRake(this.config.tier);
+    this.sim.asOperator();
+    const before = this.ledger();
+    assert.equal(before.phase, PHASE.filling, 'start: the table must be filling');
+    const ret = await this.sim.abortTable(q, rem, at);
+    this.operatorTx += 1;
+    assert.equal(ret, 0n, 'a start shares nothing out');
+    const led = this.ledger();
+    assert.equal(led.phase, PHASE.playing, 'the start opens round 0');
+    const n = Number(led.seatCount);
+    assert.equal(led.activeSeats, BigInt(n));
+    assert.equal(led.pot, this.config.tier * BigInt(n), 'the pot is the seated stakes');
+    const ids = [...Array(n).keys()].map((i) => {
+      const id = led.seatIdentity.lookup(BigInt(i));
+      return { addr: id.addr.bytes, keyCommit: id.keyCommit };
+    });
+    this.digest = startDigestTs(this.digest, n, ids);
+    assert.deepEqual(led.roundDigest, this.digest, 'roundDigest diverged at the start');
     this.assertCustody();
   }
 
@@ -1011,15 +1067,15 @@ export function replayGame(
   const seatCount = players.length;
   const eliminateKeys = new Set((plan.eliminations ?? []).map((f) => `${f.seat}:${f.round}`));
 
-  let digest = genesisDigestTs(config.tableId);
-  for (let seat = 0; seat < seatCount; seat++) {
-    digest = joinDigestTs(
-      digest,
-      seat,
-      players[seat]!.addr.bytes,
-      entropyKeyCommitmentTs(config.tableId, players[seat]!.sk),
-    );
-  }
+  // The start folds every seat in seat order, in one hash (table.compact section 9).
+  let digest = startDigestTs(
+    genesisDigestTs(config.tableId),
+    seatCount,
+    players.map((p) => ({
+      addr: p.addr.bytes,
+      keyCommit: entropyKeyCommitmentTs(config.tableId, p.sk),
+    })),
+  );
 
   const cards = players.map(() => refEmptyScorecard());
   const dice: number[][] = players.map(() => [1, 1, 1, 1, 1]);
@@ -1031,9 +1087,10 @@ export function replayGame(
   let round = 0;
   let active = seatCount;
   let abandoned = false;
-  // One join each, plus per turn: open + score, one hold per reroll. Operator: one per roll.
+  // One join each, plus per turn: open + score, one hold per reroll. Operator: the start, then
+  // one per roll.
   let playerTx = seatCount;
-  let operatorTx = 0;
+  let operatorTx = 1;
 
   for (; round < ROUND_COUNT && !abandoned;) {
     // Every live seat that is not scheduled to walk away plays, in SEAT ORDER. The chain may have

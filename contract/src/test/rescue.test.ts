@@ -188,6 +188,17 @@ describe('rescuing a stuck table: what to offer, and does the chain accept it', 
     const tier = g.config.tier;
     await g.sim.abortTable(tier / 100n, tier % 100n, Number(led.roundDeadline) + 1);
     assert.equal(Number(g.ledger().phase), PHASE.aborted);
-    assert.equal(g.ledger().seatRedeemable.lookup(0n), tier, 'no game, no rake, full refund');
+    assert.equal(g.paidTo(0), tier, 'no game, no rake, full refund, straight from the slot');
+  });
+
+  it('a full table STARTS, at once and by anybody (a join cannot start it)', async () => {
+    const g = await GameDriver.open({ seats: 2 }, { holds: alwaysStopEarly });
+    await g.join(0);
+    await g.join(1, { start: false });
+    const led = g.ledger();
+    const step = nextRescueStep(led, led.fillOpenedAt);
+    assert.equal(step.kind, 'start', step.why);
+    await g.start();
+    assert.equal(Number(g.ledger().phase), PHASE.playing);
   });
 });

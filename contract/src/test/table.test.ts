@@ -156,13 +156,35 @@ describe('conflict-freedom', () => {
     assert.deepEqual(sorted(ledgerReads('playerMove')), [
       // Frozen for the whole game once the table is `playing`.
       'openRound', //     written ONLY by closeRound, which cannot run while a seat may move
-      'phase', //         written only by join's last seat and by the terminal circuits
+      'phase', //         written only by the start and by the terminal circuits
       'seatCard', //      this seat's own
-      'seatCount', //     written only by join, and join only runs while `filling`
-      'seatIdentity', //  this seat's own, written once at join
+      'seatCount', //     written only by the start, which leaves `filling`
+      'seatIdentity', //  this seat's own, written once by the start
       'seatProgress', //  this seat's own
       'seatTurn', //      this seat's own
       'tableId', //       sealed
+    ]);
+  });
+
+  it('lets two joins to different slots land together (section 9)', () => {
+    // A join reads the phase, sealed constants and its OWN slot -- nothing another join writes.
+    // Two joins to one slot both read that slot, which is the guard that lets only one land.
+    assert.deepEqual(sorted(ledgerReads('join')), [
+      'inviteHash', //       sealed
+      'phase', //            written only by the start and the terminal circuits
+      'seatIdentity', //     its own slot, the guard
+      'tableId', //          sealed
+      'tableTimeoutSecs', // sealed
+      'tier', //             sealed
+    ]);
+    // And it writes nothing shared that it reads, and grows nothing: the fill clocks are blind
+    // writes, the slot and its time are pre-inserted cells.
+    assert.deepEqual(sorted(ledgerWrites('join')), [
+      'fillOpenedAt',
+      'padStore',
+      'roundDeadline',
+      'seatIdentity',
+      'slotJoinedAt',
     ]);
   });
 
@@ -307,12 +329,14 @@ describe('a full two-seat game', () => {
       BigInt(g.clock) + g.config.turnTimeoutSecs,
       'the last join opens round 0 with a full turn timeout',
     );
-    // Every slot was pre-inserted, including the four nobody took, so no lookup can abort.
+    // The maps read at fixed indices were pre-inserted, including the four slots nobody took,
+    // so no unguarded lookup can abort. Turns are the start's: one per seat, and no more.
     for (let s = 0; s < MAX_SEATS; s++) {
       assert.equal(led.seatProgress.lookup(BigInt(s)).round, 0n);
-      assert.equal(led.seatTurn.lookup(BigInt(s)).stage, BigInt(STAGE.idle));
       assert.equal(led.seatRedeemable.lookup(BigInt(s)), 0n);
+      assert.equal(led.seatTurn.member(BigInt(s)), s < 2, `seat ${s}'s turn`);
     }
+    assert.equal(led.seatTurn.lookup(0n).stage, BigInt(STAGE.idle));
   });
 
   it('plays 13 rounds of interactive turns and settles to the reference winner', async () => {
@@ -1034,16 +1058,19 @@ describe('entropy and authorisation', () => {
     }
   });
 
-  it('rejects a second join from the same entropy key', async () => {
-    const g = await GameDriver.open({ seats: 3 });
+  it('seats an entropy key once: a second slot of it is refunded, never seated', async () => {
+    // One secret must not take two seats -- the dice streams are separated by nothing else.
+    // Section 9 moved the check from `join` to the start (see "leaving a filling table").
+    const g = await GameDriver.open({ seats: 2 });
     await g.join(0);
     g.sim.asPlayer(g.players[0]!.sk);
-    await assert.rejects(
-      () => g.sim.join(userAddress(0x77), g.tick()),
-      /already holds a seat/,
-      'one secret must not take two seats -- the dice streams are separated by nothing else',
+    await g.sim.join(userAddress(0x77), g.tick(), g.clock, 4);
+    await g.join(1);
+    assert.equal(g.ledger().seatCount, 2n);
+    assert.notDeepEqual(
+      g.ledger().seatIdentity.lookup(0n).keyCommit,
+      g.ledger().seatIdentity.lookup(1n).keyCommit,
     );
-    assert.equal(g.ledger().seatCount, 1n);
   });
 
   it('rejects joining a full table and joining after play starts', async () => {
@@ -1156,7 +1183,7 @@ describe('joker rules at table level', () => {
     // joker rules; `probeIllegal` then attacks every scoring move with a category the reference
     // refuses, which in a joker situation is exactly what forced placement forbids.
     const g = await seated(
-      { seats: 4, tableId: bytes32(14) },
+      { seats: 4, tableId: bytes32(2) },
       { strategy: 'bestScore', probeIllegal: true, holds: keepModal },
     );
     await g.playToEnd();
@@ -1170,7 +1197,7 @@ describe('joker rules at table level', () => {
 
   it('rolls five of a kind under a modal-chasing player', async () => {
     const g = await seated(
-      { seats: 4, tableId: bytes32(14) },
+      { seats: 4, tableId: bytes32(2) },
       { strategy: 'bestScore', holds: keepModal },
     );
     await g.playToEnd();
@@ -1426,11 +1453,11 @@ describe('elimination', () => {
   });
 
   it('stops an eliminated seat playing, and stops it winning', async () => {
-    // Table 11 with seat 0 eliminated at round 10 was found by sweeping `replayGame` for a game
+    // Table 1 with seat 0 eliminated at round 10 was found by sweeping `replayGame` for a game
     // in which the ELIMINATED seat ends with the strictly highest total. Under the cursor model
     // it would have won; under simultaneous rounds elimination is permanent and economic, and it
     // has already been handed back `tier - penalty`, so paying it the pot would pay it twice.
-    const opts: TableOptions = { seats: 3, tableId: bytes32(11) };
+    const opts: TableOptions = { seats: 3, tableId: bytes32(1) };
     const plan: GamePlan = { strategy: 'bestScore', eliminations: [{ seat: 0, round: 10 }] };
     const preview = replayGame(tableConfig(opts), makePlayers(3), plan);
     assert.ok(preview.totals[0]! > preview.totals[1]!, 'this scenario was chosen for it');
@@ -1560,10 +1587,10 @@ describe('the all-eliminated waiver', () => {
 describe('redeem', () => {
   // =======================================================================================
 
-  it('refuses while the table is filling', async () => {
+  it('refuses while the table is filling: a slot is not a seat', async () => {
     const g = await GameDriver.open({ seats: 3 });
     await g.join(0);
-    await assert.rejects(() => g.sim.redeem(0), /table is not finished/);
+    await assert.rejects(() => g.sim.redeem(0), /no such seat/);
   });
 
   it('refuses while the table is live, even to a seat that is owed money', async () => {
@@ -1657,14 +1684,13 @@ describe('abortTable', () => {
     const led = g.ledger();
     assert.equal(led.phase, PHASE.aborted);
     assert.equal(led.pot, 0n);
-    assert.equal(led.seatRedeemable.lookup(0n), g.config.tier);
-    assert.equal(led.seatRedeemable.lookup(1n), g.config.tier);
-    assert.equal(led.seatRedeemable.lookup(2n), 0n, 'an unseated slot is owed nothing');
+    // The slots are paid straight back (section 9): there were never seats to redeem.
+    assert.equal(g.paidTo(0), g.config.tier);
+    assert.equal(g.paidTo(1), g.config.tier);
+    assert.equal(g.paidOut().size, 2, 'an empty slot is paid nothing');
+    for (let s = 0; s < 6; s++) assert.equal(led.seatRedeemable.lookup(BigInt(s)), 0n);
     g.assertCustody();
-
-    assert.equal(await g.sim.redeem(0), g.config.tier);
-    assert.equal(await g.sim.redeem(1), g.config.tier);
-    await assert.rejects(() => g.sim.redeem(2), /no such seat/);
+    await assert.rejects(() => g.sim.redeem(0), /no such seat/);
   });
 
   it('refuses to abort an empty table, at any time', async () => {
@@ -1745,14 +1771,12 @@ describe('abortTable', () => {
 // =========================================================================================
 describe('leaving a filling table, and starting one early', () => {
   // =======================================================================================
-  // Two folds into existing circuits (the table sits at the nine-circuit deploy ceiling):
-  // `eliminate(voluntary)` is legal while FILLING and refunds the whole stake (`openRound` is 0,
-  // so the resignation schedule charges 0/13), and `abortTable` STARTS a filling table with two
-  // or more players once `startAfterSecs` has passed since the last join. `redeem` pays a
-  // pre-start leaver at once, which is why `paidOut` joined the custody invariant.
+  // Section 9: a join claims a SLOT, a leave frees it and is refunded on the spot, and the
+  // START -- `abortTable`, once every seat is taken or `startAfterSecs` has passed since the last
+  // join with two or more players -- seats the joiners in join order and refunds the rest.
   const WAIT = 300n;
 
-  it('a seat may leave while the table is filling, at no cost, and is paid at once', async () => {
+  it('a player may leave while the table is filling, at no cost, paid at once, slot freed', async () => {
     const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT });
     await g.join(0);
     await g.join(1);
@@ -1761,41 +1785,128 @@ describe('leaving a filling table, and starting one early', () => {
     g.sim.asPlayer(g.players[0]!.sk);
     const refund = await g.sim.resign(0, 0n, 0n); // openRound 0: charged tier * 0 / 13
     assert.equal(refund, tier, 'leaving before the start refunds the whole stake');
-    let led = g.ledger();
+    assert.equal(g.paidTo(0), tier, 'paid straight back, no redeem');
+    assert.equal(g.paidOut().size, 1);
+    const led = g.ledger();
     assert.equal(led.phase, PHASE.filling);
-    assert.equal(led.activeSeats, 1n);
-    assert.equal(led.seatCount, 2n, 'the slot stays: seat indices are positional');
-    assert.equal(led.pot, tier);
-    assert.equal(led.seatProgress.lookup(0n).eliminated, true);
-    assert.equal(
-      led.seatProgress.lookup(0n).finishedAtRound,
-      65534n,
-      'marked as a pre-start leaver, distinct from a mid-game elimination',
-    );
+    assert.deepEqual(g.heldSlots(), [1], 'the slot is free again');
+    assert.equal(led.slotJoinedAt.lookup(0n), 0n);
+    assert.equal(led.seatCount, 0n, 'nothing counts players while filling');
+    assert.equal(led.pot, 0n);
+    assert.equal(led.seatProgress.lookup(0n).eliminated, false, 'a slot is not a seat');
     g.assertCustody();
+    await assert.rejects(() => g.sim.resign(0, 0n, 0n), /that slot is empty/);
 
-    // Paid immediately -- no waiting for a game the leaver is not in.
-    assert.equal(await g.sim.redeem(0), tier);
-    led = g.ledger();
-    assert.equal(led.seatRedeemable.lookup(0n), 0n);
-    assert.equal(led.seatPaid.lookup(0n), tier);
-    g.assertCustody();
-    await assert.rejects(() => g.sim.redeem(0), /nothing to redeem/);
+    // Someone else may take the freed slot, and the table still fills and starts.
+    await g.join(2, { start: false });
+    const p3 = makePlayers(4)[3]!;
+    g.sim.asPlayer(p3.sk);
+    assert.equal(await g.sim.join(p3.addr, g.tick(), g.clock, 0), 0n, 'the freed slot');
+    await g.start();
+    assert.equal(g.ledger().seatCount, 3n);
   });
 
   it('only a VOLUNTARY leave is possible while filling -- nobody owes anything yet', async () => {
     const g = await GameDriver.open({ seats: 2 });
     await g.join(0);
     const far = DEFAULT_BLOCK_TIME + 10_000_000;
-    await assert.rejects(() => g.sim.eliminate(0, 0n, 0n, far), /not playing/);
+    await assert.rejects(() => g.sim.eliminate(0, 0n, 0n, far), /no such seat|not playing/);
   });
 
-  it('leaving needs the seat’s own secret', async () => {
+  it('leaving needs the slot’s own secret', async () => {
     const g = await GameDriver.open({ seats: 3 });
     await g.join(0);
     await g.join(1);
     g.sim.asPlayer(g.players[1]!.sk);
     await assert.rejects(() => g.sim.resign(0, 0n, 0n), /own entropy secret/);
+    await assert.rejects(() => g.sim.resign(4, 0n, 0n), /that slot is empty/);
+  });
+
+  it('a full table starts at once, by anybody, and seats the players in join order', async () => {
+    const g = await GameDriver.open({ seats: 3 });
+    // Join order is time order, whatever the slots: player i joins at rising times into
+    // slots 5, 2 and 4, and takes seat i.
+    const slots = [5, 2, 4];
+    for (let i = 0; i < 3; i++) {
+      const p = g.players[i]!;
+      g.sim.asPlayer(p.sk);
+      assert.equal(await g.sim.join(p.addr, g.tick(), g.clock, slots[i]), BigInt(slots[i]!));
+    }
+    assert.equal(g.ledger().phase, PHASE.filling, 'a join cannot know it is the last');
+    await g.start(); // no clock: a full table needs none
+    const led = g.ledger();
+    for (let i = 0; i < 3; i++) {
+      assert.deepEqual(led.seatIdentity.lookup(BigInt(i)).addr.bytes, g.players[i]!.addr.bytes);
+    }
+    for (let i = 3; i < 6; i++) {
+      assert.ok(led.seatIdentity.lookup(BigInt(i)).addr.bytes.every((b) => b === 0));
+    }
+    assert.equal(g.paidOut().size, 0, 'nobody to refund');
+    // ...and it plays: seat 0 opens round 0.
+    await g.playTurn(0, 0, alwaysStopEarly);
+  });
+
+  it('two joins to one slot: the second is refused, nothing of it applied', async () => {
+    const g = await GameDriver.open({ seats: 3 });
+    await g.join(0);
+    const before = g.ledger();
+    g.sim.asPlayer(g.players[1]!.sk);
+    await assert.rejects(
+      () => g.sim.join(g.players[1]!.addr, g.tick(), g.clock, 0),
+      /that slot was just taken/,
+    );
+    assert.deepEqual(g.ledger().seatIdentity.lookup(0n), before.seatIdentity.lookup(0n));
+    await assert.rejects(
+      () => g.sim.join(g.players[1]!.addr, g.tick(), g.clock, 6),
+      /no such slot/,
+    );
+  });
+
+  it('joins that overfill a table: the start seats the earliest and refunds the rest', async () => {
+    const g = await GameDriver.open({ seats: 2 });
+    const [a, b, c] = makePlayers(3);
+    // Three land before the start (they were in flight together): c joins last but in slot 0.
+    g.sim.asPlayer(a!.sk);
+    await g.sim.join(a!.addr, g.tick(), g.clock, 3);
+    g.sim.asPlayer(b!.sk);
+    await g.sim.join(b!.addr, g.tick(), g.clock, 1);
+    g.sim.asPlayer(c!.sk);
+    await g.sim.join(c!.addr, g.tick(), g.clock, 0);
+    await g.start();
+    const led = g.ledger();
+    assert.equal(led.seatCount, 2n);
+    assert.deepEqual(led.seatIdentity.lookup(0n).addr.bytes, a!.addr.bytes, 'first joiner, seat 0');
+    assert.deepEqual(led.seatIdentity.lookup(1n).addr.bytes, b!.addr.bytes, 'second, seat 1');
+    assert.equal(g.paidOut().get(Buffer.from(c!.addr.bytes).toString('hex')), g.config.tier);
+    assert.equal(g.paidOut().size, 1, 'only the late joiner is refunded');
+    assert.equal(led.pot, g.config.tier * 2n);
+    // A join after the start is refused before it takes anything.
+    const d = makePlayers(4)[3]!;
+    g.sim.asPlayer(d.sk);
+    await assert.rejects(() => g.sim.join(d.addr, g.tick(), g.clock, 5), /not filling/);
+  });
+
+  it('one entropy key, two slots: seated once, the later slot refunded at the start', async () => {
+    const g = await GameDriver.open({ seats: 2 });
+    await g.join(0, { start: false });
+    // The same secret again (a double submit), paid to another address.
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.join(userAddress(0x77), g.tick(), g.clock, 4);
+    await assert.rejects(
+      () => g.start(),
+      /neither stalled/,
+      'one key is one player: two slots of it do not fill a two-seat table',
+    );
+    await g.join(1);
+    const led = g.ledger();
+    assert.equal(led.seatCount, 2n);
+    assert.deepEqual(led.seatIdentity.lookup(0n).addr.bytes, g.players[0]!.addr.bytes);
+    assert.deepEqual(led.seatIdentity.lookup(1n).addr.bytes, g.players[1]!.addr.bytes);
+    assert.equal(
+      g.paidOut().get(Buffer.from(userAddress(0x77).bytes).toString('hex')),
+      g.config.tier,
+    );
+    assert.equal(g.paidOut().size, 1);
   });
 
   it('starts early with the players present once the wait has run', async () => {
@@ -1807,17 +1918,13 @@ describe('leaving a filling table, and starting one early', () => {
     // Not before the clock -- and before it, with two players, nothing else is available.
     await assert.rejects(() => g.sim.abortTable(q, rem, startAt), /neither stalled/);
 
-    const ret = await g.sim.abortTable(q, rem, startAt + 1);
-    assert.equal(ret, 0n, 'a start shares nothing out');
+    await g.start(startAt + 1);
     const led = g.ledger();
-    assert.equal(led.phase, PHASE.playing);
     assert.equal(led.started, true);
     assert.equal(led.openRound, 0n);
     assert.equal(led.roundDeadline, BigInt(startAt + 1) + g.config.turnTimeoutSecs);
     assert.equal(led.activeSeats, 2n);
     assert.equal(led.seatCount, 2n);
-    assert.equal(led.pot, g.config.tier * 2n);
-    g.assertCustody();
 
     // ...and it is a game: both seats play round 0 and the round closes over the two of them.
     await g.playTurn(0, 0, alwaysStopEarly);
@@ -1836,6 +1943,7 @@ describe('leaving a filling table, and starting one early', () => {
     await assert.rejects(() => g.sim.abortTable(q, rem, deadline), /neither stalled/);
     await g.sim.abortTable(q, rem, deadline + 1);
     assert.equal(g.ledger().phase, PHASE.aborted, 'refunded, not started');
+    assert.equal(g.paidOut().size, 2);
   });
 
   it('with one player left the table never starts; the never-filled refund skips the leaver', async () => {
@@ -1844,7 +1952,7 @@ describe('leaving a filling table, and starting one early', () => {
     await g.join(1);
     g.sim.asPlayer(g.players[0]!.sk);
     await g.sim.resign(0, 0n, 0n);
-    assert.equal(await g.sim.redeem(0), g.config.tier, 'the leaver takes its stake now');
+    assert.equal(g.paidTo(0), g.config.tier, 'the leaver takes its stake now');
 
     const { q, rem } = perSeatRake(g.config.tier);
     const startAt = Number(g.ledger().fillOpenedAt + WAIT);
@@ -1853,12 +1961,10 @@ describe('leaving a filling table, and starting one early', () => {
     const deadline = Number(g.ledger().roundDeadline);
     const share = await g.sim.abortTable(q, rem, deadline + 1);
     assert.equal(share, g.config.tier, 'no rake on a table that never played');
-    const led = g.ledger();
-    assert.equal(led.phase, PHASE.aborted);
-    assert.equal(led.seatRedeemable.lookup(0n), 0n, 'already paid: not paid twice');
-    assert.equal(led.seatRedeemable.lookup(1n), g.config.tier);
-    assert.equal(led.pot, 0n);
-    assert.equal(await g.sim.redeem(1), g.config.tier);
+    assert.equal(g.ledger().phase, PHASE.aborted);
+    assert.equal(g.paidTo(1), g.config.tier);
+    assert.equal(g.paidOut().size, 1, 'already paid: not paid twice');
+    assert.equal(g.ledger().pot, 0n);
   });
 
   it('everyone leaves before the start: the table is empty again, and closes with no rake', async () => {
@@ -1869,97 +1975,29 @@ describe('leaving a filling table, and starting one early', () => {
     await g.sim.resign(0, 0n, 0n);
     g.sim.asPlayer(g.players[1]!.sk);
     await g.sim.resign(1, 0n, 0n);
-    let led = g.ledger();
     // NOT abandoned: only a playing table is. An empty filling table is still a table.
-    assert.equal(led.phase, PHASE.filling);
-    assert.equal(led.activeSeats, 0n);
-    assert.equal(led.pot, 0n);
+    assert.equal(g.ledger().phase, PHASE.filling);
+    assert.deepEqual(g.heldSlots(), []);
+    const { q, rem } = perSeatRake(g.config.tier);
+    await assert.rejects(
+      () => g.sim.abortTable(q, rem, Number(g.ledger().roundDeadline) + 1),
+      /neither stalled/,
+      'an empty table is never abortable',
+    );
 
     // Newcomers may still take it...
     await g.join(2);
-    assert.equal(g.ledger().activeSeats, 1n);
     assert.equal(g.ledger().phase, PHASE.filling);
 
-    // ...and if nobody else comes, the fill clock closes it: no shares (the leavers hold their
-    // full refunds already, the newcomer gets its stake), and no rake -- there was no game.
-    const { q, rem } = perSeatRake(g.config.tier);
+    // ...and if nobody else comes, the fill clock closes it: the newcomer gets its stake back,
+    // and there is no rake -- there was no game.
     const deadline = Number(g.ledger().roundDeadline);
     await assert.rejects(() => g.sim.abortTable(q, rem, deadline), /neither stalled/);
     const share = await g.sim.abortTable(q, rem, deadline + 1);
     assert.equal(share, g.config.tier, 'no rake: there was never a game to pay for');
-    led = g.ledger();
-    assert.equal(led.phase, PHASE.aborted);
-    assert.equal(
-      led.seatRedeemable.lookup(0n),
-      g.config.tier,
-      'the leave’s full refund, untouched',
-    );
-    assert.equal(led.seatRedeemable.lookup(1n), g.config.tier);
-    assert.equal(led.seatRedeemable.lookup(2n), g.config.tier);
-    assert.equal(led.pot, 0n);
-    for (let seat = 0; seat < 3; seat++) assert.equal(await g.sim.redeem(seat), g.config.tier);
-  });
-
-  it('an abandoned slot is not a seat: the next player fills the table and the game starts', async () => {
-    const g = await GameDriver.open({ seats: 2, startAfterSecs: WAIT });
-    await g.join(0);
-    g.sim.asPlayer(g.players[0]!.sk);
-    await g.sim.resign(0, 0n, 0n);
-    await g.join(1); // slot 1: one active seat, still filling
-    assert.equal(g.ledger().phase, PHASE.filling);
-
-    const third = makePlayers(3)[2]!;
-    g.sim.asPlayer(third.sk);
-    const seat = await g.sim.join(third.addr, g.tick());
-    assert.equal(seat, 2n, 'slots are positional; the third player takes slot 2');
-    const led = g.ledger();
-    assert.equal(led.phase, PHASE.playing, 'two ACTIVE seats fill a two-seat table');
-    assert.equal(led.seatCount, 3n);
-    assert.equal(led.activeSeats, 2n);
-    assert.equal(led.pot, g.config.tier * 2n);
-    g.assertCustody();
-
-    const fourth = makePlayers(4)[3]!;
-    g.sim.asPlayer(fourth.sk);
-    await assert.rejects(() => g.sim.join(fourth.addr, g.tick()), /not filling/);
-  });
-
-  it('a leaver may withdraw during a game it is not in, and the waiver skips it afterwards', async () => {
-    const g = await GameDriver.open({ seats: 3, startAfterSecs: WAIT });
-    await g.join(0);
-    await g.join(1);
-    g.sim.asPlayer(g.players[1]!.sk);
-    await g.sim.resign(1, 0n, 0n);
-    await g.join(2); // seats 0 and 2 active, slot 1 left; three slots, still filling
-    const { q, rem } = perSeatRake(g.config.tier);
-    const startAt = Number(g.ledger().fillOpenedAt + WAIT);
-    await g.sim.abortTable(q, rem, startAt + 1);
-    let led = g.ledger();
-    assert.equal(led.phase, PHASE.playing);
-    assert.equal(led.activeSeats, 2n);
-    assert.equal(led.pot, g.config.tier * 2n);
-
-    // Mid-game, the pre-start leaver withdraws; the custody invariant carries it as paidOut.
-    assert.equal(await g.sim.redeem(1), g.config.tier);
-    g.assertCustody();
-
-    // Both players then resign in round 0 (charged 0/13): abandoned, STARTED, so the waiver
-    // runs and rakes -- for the two who played. The leaver is skipped: nothing to waive.
-    g.sim.asPlayer(g.players[0]!.sk);
-    await g.sim.resign(0, 0n, 0n);
-    g.sim.asPlayer(g.players[2]!.sk);
-    await g.sim.resign(2, 0n, 0n);
-    led = g.ledger();
-    assert.equal(led.phase, PHASE.abandoned);
-    const share = await g.sim.abortTable(q, rem);
-    assert.equal(share, g.config.tier - q, 'the waiver share: stake less the 1% rake');
-    led = g.ledger();
-    assert.equal(led.phase, PHASE.aborted);
-    assert.equal(led.seatRedeemable.lookup(0n), g.config.tier - q);
-    assert.equal(led.seatRedeemable.lookup(2n), g.config.tier - q);
-    assert.equal(led.seatRedeemable.lookup(1n), 0n, 'the leaver was paid before and is skipped');
-    assert.equal(await g.sim.redeem(0), g.config.tier - q);
-    assert.equal(await g.sim.redeem(2), g.config.tier - q);
+    assert.equal(g.ledger().phase, PHASE.aborted);
+    assert.equal(g.paidTo(2), g.config.tier);
+    assert.equal(g.paidOut().size, 1);
   });
 });
 
@@ -1980,7 +2018,7 @@ describe('private tables: the invite code', () => {
     // The right one.
     g.sim.asPlayer(p.sk, CODE);
     assert.equal(await g.sim.join(p.addr, g.tick()), 0n);
-    assert.equal(g.ledger().seatCount, 1n);
+    assert.deepEqual(g.ledger().seatIdentity.lookup(0n).addr.bytes, p.addr.bytes);
   });
 
   it('a public table ignores whatever code a joiner supplies', async () => {
@@ -2296,7 +2334,7 @@ describe('the stall matrix: every reachable state has a permissionless exit', ()
     const { q, rem } = perSeatRake(g.config.tier);
     await g.sim.abortTable(q, rem, Number(g.ledger().roundDeadline) + 1);
     assert.equal(g.ledger().pot, 0n);
-    await g.sim.redeem(0);
+    assert.equal(g.paidTo(0), g.config.tier, 'refunded straight from the slot');
     g.assertFullyDrained();
   });
 
@@ -2489,7 +2527,7 @@ describe('tie-break at table level', () => {
   // is the inputs that no longer reach its second leg.
 
   it('breaks a tie between two finishers by seat order', async () => {
-    const opts: TableOptions = { seats: 2, tableId: bytes32(84) };
+    const opts: TableOptions = { seats: 2, tableId: bytes32(139) };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(2), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');
@@ -2509,7 +2547,7 @@ describe('tie-break at table level', () => {
   });
 
   it('falls back to the lowest seat at a four-seat table', async () => {
-    const opts: TableOptions = { seats: 4, tableId: bytes32(107) };
+    const opts: TableOptions = { seats: 4, tableId: bytes32(73) };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(4), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');
@@ -2603,11 +2641,12 @@ describe('the transaction cost of an interactive turn', () => {
     });
     const turns = seats * ROUND_COUNT;
 
-    // `playerTx` includes one `join` per seat; the rest is turn traffic.
+    // `playerTx` includes one `join` per seat and `operatorTx` the start; the rest is turn
+    // traffic.
     assert.equal(full.playerTx - seats, turns * 4, 'full turn: open + hold + hold + score');
-    assert.equal(full.operatorTx, turns * 3, 'full turn: three rolls');
+    assert.equal(full.operatorTx - 1, turns * 3, 'full turn: three rolls');
     assert.equal(early.playerTx - seats, turns * 2, 'early stop: open + score');
-    assert.equal(early.operatorTx, turns * 1, 'early stop: one roll');
+    assert.equal(early.operatorTx - 1, turns * 1, 'early stop: one roll');
 
     // The lever a player has over the length of a game: stopping early more than halves it.
     const fullTotal = full.playerTx + full.operatorTx;
@@ -2637,7 +2676,8 @@ describe('token custody, as far as the simulator can see it', () => {
     const g = await GameDriver.open({ seats: 4 }, { holds: alwaysStopEarly });
     for (let seat = 0; seat < 4; seat++) {
       await g.join(seat);
-      assert.equal(g.ledger().pot, g.config.tier * BigInt(seat + 1));
+      // While filling the slots hold the stakes; the start counts them into the pot at once.
+      assert.equal(g.ledger().pot, seat < 3 ? 0n : g.config.tier * 4n);
     }
     await g.playToEnd();
     const pot = g.ledger().pot;

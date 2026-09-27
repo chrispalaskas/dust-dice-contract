@@ -239,21 +239,57 @@
 // (`resolveRoll1/2/3`) touch exactly one map, and so that `closeRound` -- which must read all
 // six seats -- reads only one of the others:
 //
-//   seatIdentity    written once, at join           read by playerMove, settle, redeem
+//   seatIdentity    a join's slot, then the start   read by playerMove, settle, redeem
 //   seatCard        written by playerMove(score)    read by playerMove, redeem
 //   seatProgress    round cursor + score + dice     read by all six seats at closeRound/settle
-//   seatTurn        the interactive turn state      read/written by playerMove and all resolves
+//   seatTurn        the interactive turn state      read/written by playerMove and all resolves;
+//                                                   created by the start (section 9)
 //   seatRedeemable  money owed to a seat            eliminate, abortTable, redeem
 //
-// ALL SIX SLOTS ARE PRE-INSERTED BY THE CONSTRUCTOR, including slots no player will take. A
-// ledger `Map.lookup` of an absent key aborts, so pre-inserting makes every lookup total.
-// Whether a slot is real is `seat < seatCount`, never map membership.
+// ALL SIX SLOTS OF THE MAPS READ AT FIXED INDICES ARE PRE-INSERTED, including slots no player
+// will take -- by the constructor, except `seatTurn`, which the start writes for its seats (the
+// deploy's block limit; see the constructor). A ledger `Map.lookup` of an absent key aborts, so
+// pre-inserting makes every unguarded lookup total. Whether a slot is real is
+// `seat < seatCount`, never map membership.
 //
 // WHY `playerMove(score)` AND NOT `resolveRoll3` ADVANCES `seatProgress.round`: because a turn
 // can now end after ANY roll, there is no single resolve step that means "this seat is done".
 // Scoring is the only move that ends a turn, so scoring is what advances the cursor -- and it
 // also sets `seatTurn.stage` back to idle, which is what lets `closeRound` decide "every seat
 // has finished round r" from `seatProgress` alone without also reading six `seatTurn` entries.
+//
+// -------------------------------------------------------------------------------------------
+// 9. JOINS CLAIM SLOTS, SO TWO PLAYERS CAN JOIN IN ONE BLOCK; THE START SEATS THEM
+// -------------------------------------------------------------------------------------------
+//
+// A join used to take "the next seat": it read-modify-wrote `seatCount`, `activeSeats`, `pot`
+// and `roundDigest`, so two joins built on one state bound to the same values and exactly one
+// landed per block (docs/order-independent-join.md). Now `join(slot, ...)` claims one of the
+// six pre-inserted `seatIdentity` cells -- the client picks a free one at random -- and reads
+// nothing but `phase`, sealed constants and that one cell. Two joins to different slots touch
+// nothing in common and both land; two to the same slot both read it, so exactly one lands and
+// the other fails with its stake untouched. Nothing whose size changes is touched either (the
+// gas trap of bugs-found #36: probe L against probe M of the design note).
+//
+// While filling, nothing on chain counts the players: `seatCount`, `activeSeats`, `pot` and
+// `roundDigest` keep their constructor values, and the held slots are the account of the
+// stakes. THE START -- `abortTable`'s start branch, when every seat is taken or the early-start
+// clock has run -- seats the joiners in declared join order (the slot breaks a tie), so seat
+// order is still join order and the seats are dense, 0..n-1, exactly as before. It then writes
+// what `join` used to: the counts, the pot, the per-seat cards and receipts, and the join
+// digests folded in seat order. So from the start on, the table is the one every other circuit
+// was written for. What the start does not seat it refunds at once: a second slot held by the
+// same entropy key (one seat per key, the check `join` can no longer make), and joins beyond
+// `seatLimit` that landed together. A slot left before the start is refunded by `eliminate`,
+// directly, and freed for someone else.
+//
+// A join can no longer know it is the last, so a full table does not start itself: the operator
+// starts it straight away (one more transaction), and so may anybody.
+//
+// Join order is DECLARED time, pinned within `timeSlackSecs()` of the block (section 5), so a
+// joiner can shade it by up to the slack. All that buys is an earlier seat -- which decides only
+// an exact tie on the final total -- or, when more joins land together than there are seats,
+// being among those seated rather than refunded in full.
 //
 // -------------------------------------------------------------------------------------------
 // The randomness residual GREW with interactive holds, and the old wording no longer applies
@@ -496,9 +532,9 @@ export enum Phase {
 //
 //   phase           frozen for the whole game once `playing`
 //   openRound       written ONLY by closeRound, which cannot run while a seat may still move
-//   seatCount       written only by join, and join only runs while `filling`
+//   seatCount       written only by the start, which leaves `filling`
 //   tableId         sealed
-//   seatIdentity[s] written once, at join
+//   seatIdentity[s] written once for a seat, by the start
 //   seatCard[s]     this seat's own
 //   seatProgress[s] this seat's own
 //   seatTurn[s]     this seat's own
@@ -583,7 +619,7 @@ export sealed ledger fastMode: Boolean;
 
 export ledger phase: Phase;
 
-/** Seats taken so far. Also the next seat index while `filling`. */
+/** Seats in the game, dense from 0. Zero while `filling`: the held slots are the count then. */
 export ledger seatCount: Uint<8>;
 
 /** Seats not yet eliminated. At 0 the table is `abandoned`. */
@@ -677,6 +713,10 @@ export struct SeatIdentity {
  * after: a pre-start leaver was refunded in full and may `redeem` at once, and every later
  * share-out (`abortTable`) skips it; a mid-game elimination waits for a terminal phase and is
  * covered by the all-eliminated waiver.
+ *
+ * NO SEAT IS MARKED WITH IT ANY MORE: since section 9 a pre-start leaver frees its slot and is
+ * refunded on the spot, never becoming a seat. The checks that read it stay -- they are false
+ * for every seat, and taking them out would move `redeem`'s k for nothing.
  */
 pure circuit leftBeforeStart(): Uint<16> {
   return 65534;
@@ -854,6 +894,12 @@ export ledger fillOpenedAt: Uint<64>;
  * on chain, and the operator that deployed the table only ever saw this hash.
  */
 export sealed ledger inviteHash: Bytes<32>;
+
+/**
+ * When each SLOT's join was declared, while the table fills (section 9); 0 for a free slot.
+ * The start seats the earliest joiners first, in this order, so seat order is still join order.
+ */
+export ledger slotJoinedAt: Map<Uint<8>, Uint<64>>;
 
 /**
  * The 4 KB of transaction padding, as a COMPILE-TIME CONSTANT.
@@ -1188,6 +1234,128 @@ circuit assertCustody(): [] {
 }
 
 // ===========================================================================================
+// Slots (section 9)
+// ===========================================================================================
+
+/** A seat's turn before its first move: what the start writes for every seat. */
+pure circuit idleTurn(): SeatTurn {
+  return SeatTurn { stage: stageIdle(),
+                    round: 0,
+                    entropy: default<Bytes<32>>,
+                    mixed: default<Bytes<32>>,
+                    hold1: default<HoldMask>,
+                    hold2: default<HoldMask>,
+                    roll: Dice { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1 }, };
+}
+
+/** A free slot: the zero identity. A join refuses a zero payout address, so it is unambiguous. */
+pure circuit freeSlot(): SeatIdentity {
+  return SeatIdentity { addr: default<UserAddress>, keyCommit: default<Bytes<32>> };
+}
+
+/** One slot, as the start and the never-filled refund read it. */
+export struct SlotInfo {
+  slot: Uint<8>,
+  held: Boolean,
+  /** Declared join time, then the slot: the order the start seats in. Distinct per slot. */
+  order: Uint<64>,
+  id: SeatIdentity,
+}
+
+circuit slotInfo(i: Uint<8>): SlotInfo {
+  const id = seatIdentity.lookup(i);
+  return SlotInfo { slot: i,
+                    held: id.addr != default<UserAddress>,
+                    order: (slotJoinedAt.lookup(i) * 8 + i) as Uint<64>,
+                    id: id, };
+}
+
+/** Every slot. Read by `abortTable` only -- never by a join. */
+circuit allSlots(): Vector<6, SlotInfo> {
+  return [slotInfo(0), slotInfo(1), slotInfo(2), slotInfo(3), slotInfo(4), slotInfo(5)];
+}
+
+/** One slot weighed against every other: does an earlier slot hold its key; how many precede it. */
+struct Weigh {
+  me: SlotInfo,
+  dup: Boolean,
+  rank: Uint<8>,
+}
+
+pure circuit dupStep(acc: Weigh, o: SlotInfo): Weigh {
+  const earlier = o.held && o.order < acc.me.order;
+  return Weigh { me: acc.me,
+                 dup: acc.dup || (earlier && o.id.keyCommit == acc.me.id.keyCommit),
+                 rank: acc.rank, };
+}
+
+pure circuit rankStep(acc: Weigh, o: SlotInfo): Weigh {
+  const earlier = o.held && o.order < acc.me.order;
+  return Weigh { me: acc.me, dup: acc.dup, rank: (acc.rank + (earlier ? 1 : 0)) as Uint<8>, };
+}
+
+/**
+ * The slot as the start counts it: not held if an EARLIER slot holds the same entropy key. One
+ * seat per key -- the first -- and every later slot of that key is refunded (section 9). Only its
+ * own holder can cause a duplicate: the commitment is computed in the proof from the joiner's
+ * own secret, so nobody can hold someone else's.
+ */
+pure circuit firstOfKey(me: SlotInfo, all: Vector<6, SlotInfo>): SlotInfo {
+  const w = fold(dupStep, Weigh { me: me, dup: false, rank: 0 }, all);
+  return SlotInfo { slot: me.slot, held: me.held && !w.dup, order: me.order, id: me.id, };
+}
+
+/** A counted slot and its place in join order among the counted ones: 0 is the first joiner. */
+struct Ranked {
+  info: SlotInfo,
+  rank: Uint<8>,
+}
+
+pure circuit rankIn(me: SlotInfo, all: Vector<6, SlotInfo>): Ranked {
+  return Ranked { info: me, rank: fold(rankStep, Weigh { me: me, dup: false, rank: 0 }, all).rank, };
+}
+
+pure circuit heldStep(acc: Uint<8>, s: SlotInfo): Uint<8> {
+  return (acc + (s.held ? 1 : 0)) as Uint<8>;
+}
+
+/** Is this counted slot one of the first `n` joiners -- a seat? */
+pure circuit seated(r: Ranked, n: Uint<8>): Boolean {
+  return r.info.held && r.rank < n;
+}
+
+struct SeatPick {
+  want: Uint<8>,
+  n: Uint<8>,
+  id: SeatIdentity,
+}
+
+pure circuit seatPickStep(acc: SeatPick, r: Ranked): SeatPick {
+  return SeatPick { want: acc.want,
+                    n: acc.n,
+                    id: seated(r, acc.n) && r.rank == acc.want ? r.info.id : acc.id, };
+}
+
+/** Who sits in seat `i` once the first `n` joiners are seated: the rank-`i` joiner, or nobody. */
+pure circuit seatAt(i: Uint<8>, n: Uint<8>, ranked: Vector<6, Ranked>): SeatIdentity {
+  return fold(seatPickStep, SeatPick { want: i, n: n, id: freeSlot() }, ranked).id;
+}
+
+/** The start, as hashed into `roundDigest`: every seat, in seat order, in one hash. */
+export struct StartEvent {
+  domain: Bytes<32>,
+  prev: Bytes<32>,
+  seats: Uint<8>,
+  ids: Vector<6, SeatIdentity>,
+}
+
+pure circuit startDigest(prev: Bytes<32>, n: Uint<8>, ids: Vector<6, SeatIdentity>): Bytes<32> {
+  return persistentHash<StartEvent>(
+           StartEvent { domain: pad(32, "dust-dice:v1:start"), prev: prev, seats: n, ids: ids, }
+           );
+}
+
+// ===========================================================================================
 // Constructor
 // ===========================================================================================
 
@@ -1271,19 +1439,27 @@ constructor(id: Bytes<32>,
   // Pre-insert the three maps that are read AT A FIXED INDEX 0..5, so every runtime `lookup` is
   // total. See section 7.
   //
-  // `seatIdentity`, `seatCard` and `seatReceipt` are NOT among them: every lookup of those is at
-  // an index the caller has already asserted is below `seatCount`, so `join` writes a seat's
-  // three entries when it takes the seat. Moving them off the constructor is not tidiness -- the
-  // deploy transaction was REJECTED by the node with "Transaction would exhaust the block
-  // limits" while it wrote all six maps, and a scorecard is 27 fields. Six of those, six
-  // identities and six receipts is the difference between a deployable contract and one that
-  // is not. See docs/e2e-report.md.
+  // `seatCard` and `seatReceipt` are NOT among them: every lookup of those is at an index the
+  // caller has already asserted is below `seatCount`, so the START writes a seat's two entries
+  // when it seats it. Keeping them off the constructor is not tidiness -- the deploy transaction
+  // was REJECTED by the node with "Transaction would exhaust the block limits" while it wrote
+  // all six maps, and a scorecard is 27 fields. See docs/e2e-report.md.
   //
-  // The three that remain cannot move: `closeRound` and `settle` read `seatProgress` at 0..5,
-  // `totalRedeemable` reads `seatRedeemable` at 0..5, and `abortTable`'s `awaitingOperatorAt`
-  // reads `seatTurn` at 0..5. A circuit has no branches, so `s < seatCount && ...lookup(s)` does
-  // NOT skip the lookup for an absent slot -- the transcript op is emitted either way, and a
-  // lookup of an absent key aborts.
+  // `seatIdentity` IS pre-inserted, as the free slots a join claims (section 9), along with
+  // `slotJoinedAt`: a join then overwrites one small cell of a fixed size, so two joins touch
+  // nothing in common and neither grows a structure the other's gas was priced against.
+  //
+  // ...AND `seatTurn` MOVED TO THE START to pay for it. Six free slots put the deploy over the
+  // block limit ("would exhaust the block limits", devnet, 2026-09-27); the six idle turns cost
+  // the same bytes (cli/tools/deploy-cost.mjs measures both). Nothing reads a turn before the
+  // start: the resolves and `playerMove` need a started table, `eliminate`'s leave does not read
+  // it, and `awaitingOperatorAt` is guarded by `s < seatCount`, which is 0 while filling -- the
+  // generated transcript short-circuits the guarded lookup, so it is not emitted. (Maps whose six
+  // entries are all zero -- `seatRedeemable`, `seatPaid`, `slotJoinedAt` -- are one shared
+  // subtree in the state and cost the deploy almost nothing.)
+  //
+  // The two that remain: `closeRound` and `settle` read `seatProgress` at 0..5, and
+  // `totalRedeemable`/`totalPaid` read `seatRedeemable`/`seatPaid` at 0..5, unguarded.
   for (const s of 0..6) {
     seatProgress.insert(
       s as Uint<8>,
@@ -1293,18 +1469,10 @@ constructor(id: Bytes<32>,
                      eliminated: false,
                      dice: Dice { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1 }, }
       );
-    seatTurn.insert(
-      s as Uint<8>,
-      SeatTurn { stage: stageIdle(),
-                 round: 0,
-                 entropy: default<Bytes<32>>,
-                 mixed: default<Bytes<32>>,
-                 hold1: default<HoldMask>,
-                 hold2: default<HoldMask>,
-                 roll: Dice { d0: 1, d1: 1, d2: 1, d3: 1, d4: 1 }, }
-      );
     seatRedeemable.insert(s as Uint<8>, 0);
     seatPaid.insert(s as Uint<8>, 0);
+    seatIdentity.insert(s as Uint<8>, freeSlot());
+    slotJoinedAt.insert(s as Uint<8>, 0);
   }
 }
 
@@ -1313,7 +1481,7 @@ constructor(id: Bytes<32>,
 // ===========================================================================================
 
 /**
- * Take the next seat, stake `tier` in, and register the seat's entropy commitment.
+ * Claim `slot`, stake `tier` in, and register the seat's entropy commitment.
  *
  * `receiveUnshielded` does not name a payer -- it declares "this contract's balance rises by
  * `tier`" and the ledger's transaction-wide per-token balance check forces the surrounding
@@ -1324,22 +1492,23 @@ constructor(id: Bytes<32>,
  * `payoutTo` is recorded here and read at `settle` and `redeem`. A circuit cannot learn its
  * caller, so this is the only way the contract can pay anyone.
  *
- * NOT CONFLICT-FREE, AND THAT IS THE POINT. `join` read-modify-writes `seatCount`, so two
- * simultaneous joins bind to it and exactly one survives with a `ReadMismatch`. That is the
- * behaviour we want: if both landed they would both take the same seat index and one player's
- * identity would be silently overwritten by the other's -- experiment B in
- * docs/concurrency-probe.md, the silent lost write. A rejection the client can retry is
- * strictly better than a stake paid into a seat somebody else owns.
+ * CONFLICT-FREE ACROSS SLOTS (section 9). It reads `phase`, sealed constants and its own slot,
+ * and writes that slot, its join time and the two fill clocks -- blind writes, which do not
+ * bind. Two joins to different slots both land in one block. Two to the SAME slot both read it
+ * empty, so exactly one lands and the other fails on that read with its stake untouched: the
+ * guard is what stops the silent lost write of docs/concurrency-probe.md experiment B, where
+ * one player's identity would overwrite the other's.
  *
- * The last join flips the table to `playing` and opens round 0 with a full turn timeout.
+ * Returns the slot. The SEAT is the start's to give (in join order), so a client finds its seat
+ * afterwards by its key commitment, never by this number.
  */
-export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
+export circuit join(slot: Uint<8>, payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   assert(phase == Phase.filling, "join: table is not filling");
-  // Slots, not players: a seat that left while filling keeps its slot (indices are
-  // positional), so a table can hold more slots than its limit. The game starts when the
-  // number of ACTIVE seats reaches the limit; six slots is the hard ceiling of the maps.
-  assert(seatCount < maxSeats(), "join: no free slot");
-  assert(activeSeats < seatLimit, "join: table is full");
+  const s = disclose(slot);
+  // Six slots whatever the seat limit, so two players joining a two-seat table at once collide
+  // one time in six rather than one in two. A slot beyond the limit is refunded at the start
+  // if the seats filled without it.
+  assert(s < maxSeats(), "join: no such slot");
 
   const t = disclose(now);
   const who = disclose(payoutTo);
@@ -1347,17 +1516,22 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
 
   // A zero payout address is where a stake goes to die: `redeem` and `settle` both pay the
   // address recorded here and nothing else, so a seat that records zeros has staked into a
-  // burn. Self-harm rather than an attack, which is why it is a cheap assert -- but a client
-  // bug that leaves the field unset should cost a rejected transaction, not a lost stake.
+  // burn. It is also what marks a slot FREE, so a zero here would be a stake nobody holds.
   assert(who != default<UserAddress>, "join: payout address must not be the zero address");
+
+  // THE GUARD: two joins to one slot both read it, so exactly one lands.
+  assert(seatIdentity.lookup(s).addr == default<UserAddress>,
+         "join: that slot was just taken -- pick another"
+         );
 
   // The seat's authorisation key. Proving knowledge of `sk` is what every later `playerMove`
   // authorises against; committing to it here is what makes the per-round entropy
   // non-grindable. `entropyKeyCommitment` is a hash, so disclosing it reveals nothing about
   // `sk` -- and it has to be public, since it is the value `playerMove` checks against. It
   // binds `tableId`, so the same secret at two tables produces two unrelated commitments.
+  // One seat per key is the START's check now (section 9): reading a set of keys here would
+  // bind every join to every other.
   const commit = disclose(entropyKeyCommitment(tableId, playerEntropySecret()));
-  assert(!joinedKeys.member(commit), "join: this entropy key already holds a seat");
 
   // A private table admits only a joiner who knows the invite code. The comparison result is
   // the only thing disclosed -- a boolean -- so a wrong guess reveals nothing about the code.
@@ -1366,43 +1540,20 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
          "join: this table is private -- the invite code does not match"
          );
 
-  const seat = seatCount;
-  // The seat's own three entries, written here rather than pre-inserted by the constructor
-  // because every lookup of them is at an index below `seatCount`. See the constructor.
-  seatIdentity.insert(seat, SeatIdentity { addr: who, keyCommit: commit });
-  seatCard.insert(seat, emptyScorecard());
-  seatReceipt.insert(seat, default<Bytes<32>>);
-  joinedKeys.insert(commit);
-
+  seatIdentity.insert(s, SeatIdentity { addr: who, keyCommit: commit });
+  slotJoinedAt.insert(s, t);
   receiveUnshielded(nativeToken(), tier as Uint<128>);
-  pot = (pot + tier) as Uint<64>;
 
-  // Folded into the digest chain here, exactly as under the cursor model. Because seat order is
-  // join order and the digest absorbs every join, a player choosing `sk_s` at join time cannot
-  // know the digest their later rolls will hash against.
-  roundDigest = joinDigest(roundDigest, seat, who, commit);
-  const taken = (seatCount + 1) as Uint<8>;
-  const active = (activeSeats + 1) as Uint<8>;
-  seatCount = taken;
-  activeSeats = active;
+  // The two fill clocks, both blind writes. The early start runs from the latest join, and the
+  // never-filled refund a table timeout after it -- so a table still attracting players is
+  // never abortable. Two joins in one block leave whichever landed second; they are seconds
+  // apart. Under-declaring `now` only brings the declarer's own table's refund forward, and a
+  // refund is in full, so there is nothing to gain.
   fillOpenedAt = t;
-
-  if (active == seatLimit) {
-    started = true;
-    // Round 0 opens now, and every seat gets a full turn timeout to play its first turn.
-    phase = Phase.playing;
-    openRound = 0;
-    roundDeadline = (t + turnTimeoutSecs) as Uint<64>;
-  } else {
-    // The fill clock. Restarted by every join, so a table that is still attracting players is
-    // never abortable, and one that stops attracting them becomes abortable a table-timeout
-    // later. Under-declaring `now` here only brings the declarer's own table's abort forward,
-    // and an abort is a full refund, so there is nothing to gain.
-    roundDeadline = (t + tableTimeoutSecs) as Uint<64>;
-  }
+  roundDeadline = (t + tableTimeoutSecs) as Uint<64>;
 
   padTransaction();
-  return seat;
+  return s;
 }
 
 // ===========================================================================================
@@ -1926,20 +2077,22 @@ pure circuit roundResultOf(p: SeatProgress): RoundResult {
  */
 export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: Boolean): Uint<64> {
   const s = disclose(seat);
-  assert(s < seatCount, "eliminate: no such seat");
-
   const vol = disclose(voluntary);
   // A FILLING table may be left voluntarily -- and only voluntarily: nobody owes anything
   // before the game starts, so there is no silence to punish. `openRound` is 0 while filling,
   // so the resignation schedule below charges `tier * 0 / 13 == 0`: a full refund, with the
   // same witness split the caller already knows how to compute.
   const leaving = phase == Phase.filling && vol;
+  // While filling, `seat` names a SLOT (section 9), and leaving frees it for someone else.
+  assert(leaving ? s < maxSeats() : s < seatCount, "eliminate: no such seat");
   assert(phase == Phase.playing || leaving, "eliminate: table is not playing");
   // Resignation is self-authorised: knowing the seat's entropy secret is exactly what playerMove
   // accepts as "being" the seat. Nothing about the secret leaks -- the commitment is already on
   // chain, the comparison is boolean.
   const sk = playerEntropySecret();
-  assert(disclose(!vol || entropyKeyCommitment(tableId, sk) == seatIdentity.lookup(s).keyCommit),
+  const id = seatIdentity.lookup(s);
+  assert(!leaving || id.addr != default<UserAddress>, "eliminate: that slot is empty");
+  assert(disclose(!vol || entropyKeyCommitment(tableId, sk) == id.keyCommit),
          "eliminate: resigning needs this seat's own entropy secret"
          );
 
@@ -1951,7 +2104,8 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
   assert(!prog.eliminated, "eliminate: this seat is already out");
   assert(vol || prog.round == r, "eliminate: this seat has already played the open round");
 
-  const pend = seatTurn.lookup(s);
+  // A slot has no turn yet: turns are the start's to create (see the constructor).
+  const pend = leaving ? idleTurn() : seatTurn.lookup(s);
   // On a FAST table the stage-parity shield is waived: resolves are off-chain there, so a seat
   // parked at stage 1 past the deadline is a stalled fast turn, not an operator debt -- and
   // between transactions a fast seat can rest at no other odd stage. On-chain-mode tables keep
@@ -1981,48 +2135,55 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
 
   const refund = (tier - penalty) as Uint<64>;
 
-  seatProgress.insert(
-    s,
-    SeatProgress { round: roundCount(),
-                   total: prog.total,
-                   // An eliminated seat never completed its card, so it loses every tie-break it
-                   // would otherwise have drawn -- and `settle` excludes it from the winner
-                   // computation outright. Written for the record either way.
-                   // A pre-start leaver is marked apart for good: see `leftBeforeStart`.
-                   finishedAtRound: leaving ? leftBeforeStart() : noFinish(),
-                   eliminated: true,
-                   dice: prog.dice, }
-    );
+  if (leaving) {
+    // Leaving a filling table: the stake goes straight back and the slot is free again. Nothing
+    // on chain counted it (section 9), so there is nothing else to undo -- and nothing here is
+    // read by another join, so a leave lands beside them.
+    sendUnshielded(nativeToken(), refund as Uint<128>, right<ContractAddress, UserAddress>(id.addr));
+    seatIdentity.insert(s, freeSlot());
+    slotJoinedAt.insert(s, 0);
+  } else {
+    seatProgress.insert(
+      s,
+      SeatProgress { round: roundCount(),
+                     total: prog.total,
+                     // An eliminated seat never completed its card, so it loses every tie-break
+                     // it would otherwise have drawn -- and `settle` excludes it from the winner
+                     // computation outright. Written for the record either way.
+                     finishedAtRound: noFinish(),
+                     eliminated: true,
+                     dice: prog.dice, }
+      );
 
-  // Returning the turn to idle is not tidiness: it is what makes a half-played turn unreachable
-  // afterwards, so a `playerMove(hold)` that was already in flight cannot land on a seat that
-  // has left the game.
-  seatTurn.insert(
-    s,
-    SeatTurn { stage: stageIdle(),
-               round: pend.round,
-               entropy: pend.entropy,
-               mixed: pend.mixed,
-               hold1: pend.hold1,
-               hold2: pend.hold2,
-               roll: pend.roll, }
-    );
+    // Returning the turn to idle is not tidiness: it is what makes a half-played turn
+    // unreachable afterwards, so a `playerMove(hold)` that was already in flight cannot land on
+    // a seat that has left the game.
+    seatTurn.insert(
+      s,
+      SeatTurn { stage: stageIdle(),
+                 round: pend.round,
+                 entropy: pend.entropy,
+                 mixed: pend.mixed,
+                 hold1: pend.hold1,
+                 hold2: pend.hold2,
+                 roll: pend.roll, }
+      );
 
-  // The forfeited share stays behind; the rest leaves the pot for good.
-  pot = (pot - refund) as Uint<64>;
-  seatRedeemable.insert(s, (seatRedeemable.lookup(s) + refund) as Uint<64>);
-  seatReceipt.insert(
-    s,
-    eliminateDigest(seatReceipt.lookup(s), tableId, s, r, tier, penalty, refund)
-    );
+    // The forfeited share stays behind; the rest leaves the pot for good. The subtrahends are
+    // zero on the leaving path, so neither can underflow on the side a proof does not take.
+    const out = (leaving ? 0 : refund) as Uint<64>;
+    pot = (pot - out) as Uint<64>;
+    seatRedeemable.insert(s, (seatRedeemable.lookup(s) + refund) as Uint<64>);
+    seatReceipt.insert(
+      s,
+      eliminateDigest(seatReceipt.lookup(s), tableId, s, r, tier, penalty, refund)
+      );
 
-  const remaining = (activeSeats - 1) as Uint<8>;
-  activeSeats = remaining;
-  // Only a table that was PLAYING is abandoned when its last player goes. A filling table
-  // everyone has left is simply empty again -- its slots are spent but it holds no money, and
-  // the next arrivals may still fill it (or the fill clock closes it, sharing nothing).
-  if (remaining == 0 && phase == Phase.playing) {
-    phase = Phase.abandoned;
+    const remaining = (activeSeats - (leaving ? 0 : 1)) as Uint<8>;
+    activeSeats = remaining;
+    if (remaining == 0) {
+      phase = Phase.abandoned;
+    }
   }
 
   assertCustody();
@@ -2245,19 +2406,22 @@ export circuit redeem(seat: Uint<8>): Uint<64> {
 // ===========================================================================================
 
 /**
- * End a table that cannot finish, and turn the whole pot into per-seat refunds.
+ * End a table that cannot finish, and turn the whole pot into per-seat refunds -- or START a
+ * filling one (the fourth case, below).
  *
- * PAYS NOBODY DIRECTLY. It moves money from `pot` into `seatRedeemable` and leaves the sending
- * to `redeem`, which is the only circuit that pays a player. That keeps one payout path instead
- * of two, keeps the custody invariant a single line, and removes the old version's hazard of
- * sending to a pre-inserted zero address.
+ * A GAME'S MONEY IS NEVER SENT HERE. Once a table has started, this moves money from `pot` into
+ * `seatRedeemable` and leaves the sending to `redeem`, which keeps the custody invariant a single
+ * line. Stakes held in SLOTS (section 9) are another matter: nothing on chain counted them, the
+ * slots are the account of them, and they go straight back to the slot's own address -- every
+ * one when the table never filled, and at the start the ones it does not seat. A free slot is
+ * never paid: `refundSlot` requires it held.
  *
  * Permissionless, and legal in exactly three situations:
  *
  *   * `filling` and stalled -- the table did not fill within `tableTimeoutSecs` of the last
- *     join. An EMPTY table is deliberately not abortable: `roundDeadline` is 0 until the first
- *     join, so an empty table would look infinitely stalled, and aborting it on sight is a free
- *     griefing move against a table with no funds to protect.
+ *     join. An EMPTY table is deliberately not abortable: nobody holds a slot, so there is
+ *     nothing to refund, and aborting it on sight would be a free griefing move against a table
+ *     the operator paid to open.
  *
  *   * `playing`, some seat is waiting on the OPERATOR, and `tableTimeoutSecs` has passed on top
  *     of the round deadline. This is the documented residual of the randomness design: a
@@ -2296,33 +2460,54 @@ export circuit redeem(seat: Uint<8>): Uint<64> {
  * `tier` alone, so it is always satisfiable, and demanding it keeps the argument encoding
  * canonical instead of leaving two ignored fields a caller could stuff with anything.
  *
- * THE FOURTH CASE STARTS THE GAME INSTEAD. A filling table whose early-start clock has run --
- * `startAfterSecs` after the last join -- with at least two active seats does not refund: it
- * STARTS, with whoever is there, exactly as `join` starts a full one. This lives here and not in
- * a circuit of its own because the table sits at the nine-circuit deploy ceiling, and "the
- * filling period is over; what happens to the stakes?" is this circuit's question already. It
- * outranks the never-filled refund whenever two players are present. `now` is needed for the
- * new round deadline, pinned like `join`'s and `closeRound`'s.
+ * THE FOURTH CASE STARTS THE GAME INSTEAD (section 9). A filling table starts when every seat
+ * is taken -- at once, by anybody; a join cannot know it is the last -- or when its early-start
+ * clock has run (`startAfterSecs` after the last join) with at least two players, with whoever
+ * is there. It seats the first `seatLimit` joiners in join order and refunds the rest. This
+ * lives here and not in a circuit of its own because the table sits at the nine-circuit deploy
+ * ceiling, and "the filling period is over; what happens to the stakes?" is this circuit's
+ * question already. It outranks the never-filled refund whenever two players are present. `now`
+ * is needed for the new round deadline, pinned like `join`'s and `closeRound`'s.
  *
- * SEATS THAT LEFT BEFORE THE START are skipped by every share-out: their stake was refunded in
- * full when they left and may already have been withdrawn. A table everyone left before it
- * started closes with no shares and no rake -- there was no game to pay for.
+ * k 15, from 14: the start's one digest hash is the step (measured). The operator proves the
+ * resolves at 15 already.
+ *
+ * A PLAYER WHO LEFT BEFORE THE START is not a seat at all: leaving freed the slot and refunded
+ * the stake (section 9), so no share-out has to skip it.
  */
 export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
   const t = disclose(now);
   pinTime(t);
+  const filling = phase == Phase.filling;
 
-  // Early start: the clock runs from the LAST join, so a table still attracting players keeps
-  // waiting for a full house, and one that stopped attracting them starts with who came.
+  // The slots (section 9), weighed for a start: a key's later slots do not count, and the ones
+  // that do are ranked by declared join time. `n` is how many the start seats.
+  const slots = allSlots();
+  const counted = [firstOfKey(slots[0], slots),
+                   firstOfKey(slots[1], slots),
+                   firstOfKey(slots[2], slots),
+                   firstOfKey(slots[3], slots),
+                   firstOfKey(slots[4], slots),
+                   firstOfKey(slots[5], slots)];
+  const ranked = [rankIn(counted[0], counted),
+                  rankIn(counted[1], counted),
+                  rankIn(counted[2], counted),
+                  rankIn(counted[3], counted),
+                  rankIn(counted[4], counted),
+                  rankIn(counted[5], counted)];
+  const held = fold(heldStep, 0, slots);
+  const players = fold(heldStep, 0, counted);
+  const n = (players < seatLimit ? players : seatLimit) as Uint<8>;
+
+  // A FULL table starts at once. Early start: the clock runs from the LAST join, so a table
+  // still attracting players keeps waiting for a full house, and one that stopped attracting
+  // them starts with who came.
   const startClock = (fillOpenedAt + startAfterSecs) as Uint<64>;
-  const starting =
-          phase == Phase.filling &&
-          startAfterSecs > 0 &&
-          activeSeats >= 2 &&
-          blockTimeGt(startClock);
+  const full = players >= seatLimit;
+  const early = startAfterSecs > 0 && players >= 2 && blockTimeGt(startClock);
+  const starting = filling && (full || early);
 
-  const fillingStalled =
-          phase == Phase.filling && seatCount > 0 && blockTimeGt(roundDeadline) && !starting;
+  const fillingStalled = filling && held > 0 && blockTimeGt(roundDeadline) && !starting;
 
   const graceExpired = blockTimeGt((roundDeadline + tableTimeoutSecs) as Uint<64>);
   const waiting = awaitingOperatorAt(0) ||
@@ -2399,9 +2584,46 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
       );
   }
 
+  // Every held slot the table does not keep gets its stake straight back: all of them when it
+  // never filled, and at the start a key's second slot and any joiner beyond the seats.
+  refundSlot(slots[0], ranked[0], n, fillingStalled, starting);
+  refundSlot(slots[1], ranked[1], n, fillingStalled, starting);
+  refundSlot(slots[2], ranked[2], n, fillingStalled, starting);
+  refundSlot(slots[3], ranked[3], n, fillingStalled, starting);
+  refundSlot(slots[4], ranked[4], n, fillingStalled, starting);
+  refundSlot(slots[5], ranked[5], n, fillingStalled, starting);
+
   if (starting) {
-    // Round 0 opens now for the seats that are here. The pot already holds exactly their
-    // stakes: every leaver took its own back at `eliminate`.
+    // THE START (section 9): the first `n` joiners take seats 0..n-1 in join order, and the
+    // table becomes the one every other circuit was written for -- dense seats, their cards and
+    // receipts, the counts, the pot, and the join digests folded in seat order.
+    const s0 = seatAt(0, n, ranked);
+    const s1 = seatAt(1, n, ranked);
+    const s2 = seatAt(2, n, ranked);
+    const s3 = seatAt(3, n, ranked);
+    const s4 = seatAt(4, n, ranked);
+    const s5 = seatAt(5, n, ranked);
+    seatIdentity.insert(0, s0);
+    seatIdentity.insert(1, s1);
+    seatIdentity.insert(2, s2);
+    seatIdentity.insert(3, s3);
+    seatIdentity.insert(4, s4);
+    seatIdentity.insert(5, s5);
+    for (const i of 0..6) {
+      if ((i as Uint<8>) < n) {
+        seatCard.insert(i as Uint<8>, emptyScorecard());
+        seatReceipt.insert(i as Uint<8>, default<Bytes<32>>);
+        seatTurn.insert(i as Uint<8>, idleTurn());
+      }
+    }
+    // Seat order is join order, and the digest absorbs every seat: nobody who chose a secret
+    // at join could know the digest their rolls hash against.
+    roundDigest = startDigest(roundDigest, n, [s0, s1, s2, s3, s4, s5]);
+    seatCount = n;
+    activeSeats = n;
+    pot = (tier * (n as Uint<64>)) as Uint<64>;
+
+    // Round 0 opens now, and every seat gets a full turn timeout to play its first turn.
     phase = Phase.playing;
     started = true;
     openRound = 0;
@@ -2426,6 +2648,17 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
   padTransaction();
   // A start shares nothing out; the refund paths return the per-seat share.
   return starting ? 0 : share;
+}
+
+/** Refund a held slot the table is not keeping (see `abortTable`). */
+circuit refundSlot(slot: SlotInfo, r: Ranked, n: Uint<8>, stalled: Boolean, starting: Boolean): [] {
+  if (slot.held && (stalled || (starting && !seated(r, n)))) {
+    sendUnshielded(
+      nativeToken(),
+      tier as Uint<128>,
+      right<ContractAddress, UserAddress>(slot.id.addr)
+      );
+  }
 }
 
 /** Is this slot's next move the operator's -- i.e. is a roll outstanding? */

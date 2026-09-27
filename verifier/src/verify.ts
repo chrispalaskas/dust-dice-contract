@@ -75,11 +75,12 @@ import {
   emptyRoundResult,
   firstRollTs,
   genesisDigestTs,
-  joinDigestTs,
+  startDigestTs,
   mixEntropyTs,
   rerollUnderMaskTs,
   roundDigestTs,
   seedCommitmentTs,
+  tableStartOrder,
   type RoundResultTs,
 } from '@dust-dice/contract';
 
@@ -192,6 +193,11 @@ async function readHistory(address: string): Promise<LogGroup[]> {
 }
 
 /** The seat whose `seatTurn` entry changed between two states, or -1. */
+/** The key commitments the start should seat, in seat order, from the slots just before it. */
+function startOrder(prev: TableLedger): Uint8Array[] {
+  return tableStartOrder(prev).map((i) => prev.seatIdentity.lookup(BigInt(i)).keyCommit);
+}
+
 function movedSeat(prev: TableLedger, led: TableLedger): number {
   for (let s = 0; s < Number(led.seatCount); s++) {
     const a = prev.seatTurn.lookup(BigInt(s));
@@ -315,6 +321,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     finishedAtRound: Number.POSITIVE_INFINITY,
   }));
   let joins = 0;
+  let starts = 0;
   let opens = 0;
   let holds = 0;
   let scores = 0;
@@ -534,33 +541,11 @@ async function verify(address: string, verbose: boolean): Promise<number> {
 
     switch (g.entryPoints[0]) {
       case 'join': {
-        // A CALL THAT LANDED AND DID NOTHING. A transaction whose fallible section fails is
-        // still recorded in the public log, so a rejected join appears here with the seat count
-        // unmoved. Folding the digest for it would corrupt the chain from that point on (this
-        // replay counts joins itself rather than trusting one action to be one seat).
-        if (Number(led.seatCount) <= joins) {
-          console.log(
-            `  (a join in block ${g.blockHeight} left the seat count at ${joins} -- it landed ` +
-              'on chain but its fallible section failed; nothing to replay)',
-          );
-          break;
-        }
-        // Seat order is join order, so the seat this call took is the one that did not exist
-        // before it. The digest binds the seat's payout address and its entropy commitment.
-        const seat = Number(led.seatCount) - 1;
-        const id = led.seatIdentity.lookup(BigInt(seat));
-        digest = joinDigestTs(digest, seat, id.addr.bytes, id.keyCommit);
+        // A join claims a SLOT (table.compact section 9) and moves nothing shared: no seat, no
+        // pot, no digest. The start is where those are checked. A join that landed and did
+        // nothing (its fallible section failed) is simply one more of these.
         joins += 1;
-        c.ok(
-          `join ${seat}: digest chain`,
-          same(led.roundDigest, digest),
-          `chain ${hex(led.roundDigest)} vs replay ${hex(digest)}`,
-        );
-        c.ok(
-          `join ${seat}: pot rose by exactly the tier`,
-          led.pot === final.tier * BigInt(seat + 1),
-          `pot ${led.pot}`,
-        );
+        console.log(`  (a join in block ${g.blockHeight}: a slot claimed while filling)`);
         break;
       }
 
@@ -762,8 +747,11 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         }
         if (seat < 0) {
           console.log(
-            `  (an eliminate in block ${g.blockHeight} marked no new seat -- it landed on ` +
-              'chain without effect, or the replay had already accounted for it)',
+            led.phase === Table.Phase.filling
+              ? `  (a player left the filling table in block ${g.blockHeight}: its stake went ` +
+                  'straight back and its slot was freed)'
+              : `  (an eliminate in block ${g.blockHeight} marked no new seat -- it landed on ` +
+                  'chain without effect, or the replay had already accounted for it)',
           );
           break;
         }
@@ -812,9 +800,44 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         break;
       }
 
+      case 'abortTable': {
+        // THE START (section 9) is this circuit on a filling table: the joiners take seats
+        // 0..n-1 in join order, and the digest absorbs every seat in one hash. A terminal abort
+        // is handled below, against the final state and the transaction.
+        if (led.phase !== Table.Phase.playing || (prev && prev.phase !== Table.Phase.filling))
+          break;
+        starts += 1;
+        const n = Number(led.seatCount);
+        const ids = Array.from({ length: n }, (_, s) => {
+          const id = led.seatIdentity.lookup(BigInt(s));
+          return { addr: id.addr.bytes, keyCommit: id.keyCommit };
+        });
+        digest = startDigestTs(digest, n, ids);
+        c.ok(
+          `the start: digest over its ${n} seats`,
+          same(led.roundDigest, digest),
+          `chain ${hex(led.roundDigest)} vs replay ${hex(digest)}`,
+        );
+        c.ok(
+          'the start: the pot is exactly the seated stakes',
+          led.pot === final.tier * BigInt(n) && led.activeSeats === BigInt(n),
+          `pot ${led.pot}, active ${led.activeSeats}`,
+        );
+        // Who was seated, and in what order, from the slots just before -- readable only where
+        // the start had its block to itself.
+        if (prev && !g.sharesBlock) {
+          const want = startOrder(prev);
+          c.ok(
+            'the start seated the earliest joiners, in join order, one seat per key',
+            want.length === n && want.every((k, s) => same(k, ids[s]!.keyCommit)),
+            `${want.length} expected, ${n} seated`,
+          );
+        }
+        break;
+      }
+
       case 'settle':
       case 'redeem':
-      case 'abortTable':
         // Handled below, against the final state and the transaction.
         break;
 
@@ -844,7 +867,11 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     `\n── replayed ${joins} joins, ${opens} opens, ${holds} holds, ${scores} scores, ` +
       `${rollChecks} rolls, ${closes} round closes, ${eliminations} eliminations ──`,
   );
-  c.ok('every seat joined', joins === seatCount, `${joins} joins for ${seatCount} seats`);
+  c.ok(
+    'the table started once, seating every seat',
+    starts === 1 && joins >= seatCount,
+    `${starts} start(s), ${joins} join(s) for ${seatCount} seats`,
+  );
   // On a walkover the survivor's in-flight turn is legitimately cut off by the settle: opened,
   // dice possibly delivered, never scored. At most ONE such dangling open, and only theirs.
   const danglingAllowed = seats.filter((s) => !s.eliminated).length === 1 ? 1 : 0;

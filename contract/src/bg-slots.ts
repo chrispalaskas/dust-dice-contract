@@ -11,6 +11,7 @@
  */
 
 import type { Ledger } from './managed/backgammon/contract/index.js';
+import { freeSlots, heldSlots, randomFreeSlot, slotHeldBy } from './slots.ts';
 
 /** The contract's `slotCount()`; src/test/backgammon.test.ts holds the two together. */
 export const BG_SLOT_COUNT = 8;
@@ -20,21 +21,14 @@ const FILLING = 0;
 
 type SlotLedger = Pick<Ledger, 'phase' | 'seatCount' | 'slotIdentity' | 'slotJoinedAt'>;
 
-const isEmpty = (b: Uint8Array): boolean => b.every((x) => x === 0);
-
 /** The slots someone holds, in index order. */
 export function bgHeldSlots(l: SlotLedger): number[] {
-  const out: number[] = [];
-  for (let i = 0; i < BG_SLOT_COUNT; i++) {
-    if (!isEmpty(l.slotIdentity.lookup(BigInt(i)).addr.bytes)) out.push(i);
-  }
-  return out;
+  return heldSlots(l.slotIdentity, BG_SLOT_COUNT);
 }
 
 /** The slots nobody holds, in index order. */
 export function bgFreeSlots(l: SlotLedger): number[] {
-  const held = new Set(bgHeldSlots(l));
-  return [...Array(BG_SLOT_COUNT).keys()].filter((i) => !held.has(i));
+  return freeSlots(l.slotIdentity, BG_SLOT_COUNT);
 }
 
 /** Players at the table: the held slots while it fills, the seats once it has started. */
@@ -54,12 +48,7 @@ export function bgLastJoinAt(l: SlotLedger): bigint {
 
 /** The slot a seat key holds while the table fills, or null. */
 export function bgSlotHeldBy(l: SlotLedger, keyCommit: Uint8Array): number | null {
-  const same = (x: Uint8Array): boolean =>
-    x.length === keyCommit.length && x.every((b, j) => b === keyCommit[j]);
-  for (const i of bgHeldSlots(l)) {
-    if (same(l.slotIdentity.lookup(BigInt(i)).keyCommit)) return i;
-  }
-  return null;
+  return slotHeldBy(l.slotIdentity, BG_SLOT_COUNT, keyCommit);
 }
 
 /**
@@ -67,6 +56,5 @@ export function bgSlotHeldBy(l: SlotLedger, keyCommit: Uint8Array): number | nul
  * collide one time in `BG_SLOT_COUNT` rather than every time.
  */
 export function bgRandomFreeSlot(l: SlotLedger, random: () => number = Math.random): number | null {
-  const free = bgFreeSlots(l);
-  return free.length === 0 ? null : free[Math.floor(random() * free.length)]!;
+  return randomFreeSlot(l.slotIdentity, BG_SLOT_COUNT, random);
 }

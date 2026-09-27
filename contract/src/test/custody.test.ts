@@ -11,10 +11,11 @@
  * staked, which is the shape of a solvency alarm. The balances are in the serialised
  * `ContractState` the same indexer hands out, and `src/custody.ts` reads them from there.
  *
- * The fixture is a capture of a live tier-1 table mid-game, two seats joined, nothing redeemed:
- * `fixtures/table-state-two-seats.hex` is the `contractAction { state }` hex for
- * ff0e437589bdb945dd9eeab482ade1c8b00e9785bae9a3451b6db4434e452398 at block 2566 of a local
- * ledger-8 chain. Being a real state, it also fails if a future runtime stops carrying balances
+ * The fixture is a capture of a live two-seat table just started, nothing redeemed:
+ * `fixtures/table-state-two-seats.hex` is the `contractAction { state }` hex that table
+ * 8af4dff6c3cd1f5a3cf162d4ff55390688a87bb19fac8a3e868f5cee992d55db's START (abortTable, tx
+ * 1e8153a1…, block 22383 of a local ledger-8 chain, 2026-09-27) left -- contract 0.4.7, whose
+ * two joins landed in one block (table.compact section 9). Tier 5,000,025. Being a real state, it also fails if a future runtime stops carrying balances
  * in the serialisation at all -- which is the failure mode the indexer already has.
  */
 
@@ -46,7 +47,7 @@ describe('custody: a real table state', () => {
   it('carries the staked NIGHT in its balance map', () => {
     const state = fixtureState();
     assert.equal(state.balance.size, 1, 'the fixture table holds exactly one token type');
-    assert.equal(nativeBalanceOf(state), 2_000_000_000n);
+    assert.equal(nativeBalanceOf(state), 10_000_050n);
   });
 
   it('backs the pot the contract itself claims -- the custody invariant', () => {
@@ -60,7 +61,7 @@ describe('custody: a real table state', () => {
 
     // docs/table-interface.md §6: the ledger holds the pot plus anything owed but not yet paid.
     assert.equal(nativeBalanceOf(state), led.pot + redeemable);
-    // and this particular capture is two seats' worth of a tier-1 stake, nothing eliminated
+    // and this particular capture is two seats' worth of its stake, nothing eliminated
     assert.equal(led.seatCount, 2n);
     assert.equal(redeemable, 0n);
     assert.equal(led.pot, led.tier * led.seatCount);
