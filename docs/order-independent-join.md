@@ -1,12 +1,13 @@
 # Order-independent joins — design note
 
 Make concurrent `join`s to one table all land, instead of one per block with the rest rejected.
-Status: **design, probed 2026-09-26, not built.** The probe cleared two of the risks and
-confirmed the gas one: disjoint joins do not conflict, but a crowd of them still lands one per
-block — see "Probe results". Target: the next ledger-9 table contract (the
+Status: **design, probed 2026-09-26/27, not built.** Disjoint joins do not conflict, but the design
+as first written still landed a crowd one per block (gas). **Option 1** — the same join with the key
+set taken off its path — landed six concurrent joins in one block, three rounds out of three: see
+"Option 1, probed". That is the design to build. Target: the next ledger-9 table contract (the
 `dust-dice-vrf` line and `fast-dleq-check`, whose `join` differs from `dust-dice-vrf` by one line —
-it also stamps `roundOpenedAt`). Not for ledger 8: nothing about contention has been measured
-there, and ledger 8's tables would all have to be redeployed for it.
+it also stamps `roundOpenedAt`). Not for ledger 8: nothing about contention has been measured there,
+and ledger 8's tables would all have to be redeployed for it.
 
 ## Why bother
 
@@ -45,17 +46,17 @@ fixable". §4 should be amended when this is built.
 What today's `join` (`contract/src/table.compact`, `export circuit join`) reads and writes, and
 what each costs:
 
-| Field                                        | Today                                         | Conflicts with another join?   | In this design                                       |
-| -------------------------------------------- | --------------------------------------------- | ------------------------------ | ---------------------------------------------------- |
-| `phase`                                      | read                                          | no — only start/abort write it | read, unchanged                                      |
-| `seatCount`                                  | read-modify-write; `seat = seatCount` (:1505) | **yes**                        | not touched until the start                          |
-| `activeSeats`                                | read-modify-write; auto-start test (:1530)    | **yes**                        | not touched until the start                          |
-| `pot`                                        | `pot = pot + tier` (:1518)                    | **yes**                        | not touched; the start sets it                       |
-| `roundDigest`                                | folded per join, in landing order (:1523)     | **yes**                        | not touched; the start folds all seats in slot order |
-| `seatIdentity[seat]`                         | inserted at `seatCount`                       | via `seatCount`                | lookup + overwrite of the claimed slot only          |
-| `seatCard`, `seatReceipt`, `vrfAnswer[seat]` | inserted                                      | gas, see "risks"               | created by the start instead                         |
-| `joinedKeys`                                 | `member` + `insert` of the commitment         | untested for distinct keys     | unchanged — must be probed                           |
-| `fillOpenedAt`, `roundDeadline`              | written                                       | no — write-only                | written, last write wins (harmless)                  |
+| Field                                        | Today                                         | Conflicts with another join?   | In this design                                             |
+| -------------------------------------------- | --------------------------------------------- | ------------------------------ | ---------------------------------------------------------- |
+| `phase`                                      | read                                          | no — only start/abort write it | read, unchanged                                            |
+| `seatCount`                                  | read-modify-write; `seat = seatCount` (:1505) | **yes**                        | not touched until the start                                |
+| `activeSeats`                                | read-modify-write; auto-start test (:1530)    | **yes**                        | not touched until the start                                |
+| `pot`                                        | `pot = pot + tier` (:1518)                    | **yes**                        | not touched; the start sets it                             |
+| `roundDigest`                                | folded per join, in landing order (:1523)     | **yes**                        | not touched; the start folds all seats in slot order       |
+| `seatIdentity[seat]`                         | inserted at `seatCount`                       | via `seatCount`                | lookup + overwrite of the claimed slot only                |
+| `seatCard`, `seatReceipt`, `vrfAnswer[seat]` | inserted                                      | gas, see "risks"               | created by the start instead                               |
+| `joinedKeys`                                 | `member` + `insert` of the commitment         | untested for distinct keys     | moved to the start (option 1): `join` no longer touches it |
+| `fillOpenedAt`, `roundDeadline`              | written                                       | no — write-only                | written, last write wins (harmless)                        |
 
 ## The design
 
@@ -83,6 +84,8 @@ then holds from.
 work `join` used to do incrementally:
 
 - count the occupied slots → `seatCount`, `activeSeats`;
+- refuse a second seat for one commitment, the check `join` no longer makes (option 1; open
+  decision 5);
 - set `pot = tier × seated`;
 - fold `roundDigest` over the occupied slots **in slot order** — the same principle as
   `closeRound`'s round digest, which is ordered "by seat index rather than by landing time"
@@ -113,8 +116,8 @@ slot.
   applies nothing. A join racing a start:
   if the start lands first, the join's `phase` read fails; if the join lands first, the start's
   read of that slot fails and it is retried. Neither half-applies.
-- **One seat per key.** `joinedKeys` still refuses a second seat for a commitment already
-  registered — provided `Set.member` behaves like `Map.lookup` (see "open questions").
+- **One seat per key** — checked at the start rather than at `join` under option 1, which the
+  probe shows is what lets a crowd land (see "Option 1, probed" for why that is safe).
 - **The digest property.** Today no joiner can know the digest their rolls will hash against,
   because it absorbs every later join. Folding at the start preserves that: the digest is fixed
   only once every seat is in. The last joiner knows every earlier seat's commitment in both
@@ -155,8 +158,9 @@ What that settles:
   and fail `OutOfGas` — bugs-found #36's mechanism, measured here on joins. Pairs landed
   together on a contract already holding 3–5 keys, while the storms — started from 0 keys and
   from 1 — never landed more than one (pairs from 0 or 1 key were not tried): the cost of the
-  `Set` and `Map` operations moves with the structures' contents, in steps. The guaranteed budget cannot be inflated, so the design as
-  written does **not** lift the one-join-per-block cap under a real crowd.
+  `Set` and `Map` operations moves with the structures' contents, in steps. The guaranteed
+  budget cannot be inflated, so the design as written does **not** lift the one-join-per-block
+  cap under a real crowd.
 - **Admission is tight.** The probe's join sits at the node's time-to-dismiss rule:
   18.16–18.49 ms of guaranteed-phase work against ~18.1 ms allowed for its ~9 KB, refused
   (`OutsideTimeToDismiss`) as the contract's structures filled. Four words of argument ballast
@@ -184,8 +188,38 @@ ways round it, each needing its own probe before `table.compact` is touched:
    inclusion, and "every assert and substantive write is guaranteed-phase" (security-review.md
    §4) no longer describes it. Must show that the stake is not taken on `FailFallible`.
 
-Suggested order: (1) first — it keeps the guaranteed-phase safety story intact — probed with the
-same six-wallet storm; then (2) if (1) does not flatten the cost.
+(1) was probed first — it keeps the guaranteed-phase safety story intact — and it works; (2) is
+not needed.
+
+## Option 1, probed (2026-09-27)
+
+Same harness, a fresh isolated ledger-9.1 devnet, the circuits `claimA` / `claimB` in
+`joins.compact`: read `phase`, look up and overwrite one pre-inserted slot (the commitment rides
+in the slot, for the start's check), receive the stake. No `joinedKeys`.
+
+| Exp | Concurrent group                | Result                                                                                                                                         |
+| --- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| CB  | two claims, one after the other | 2/2 (baseline)                                                                                                                                 |
+| M.1 | six claims, **empty** table     | **6/6 in one block** (129), submitted within 4 ms, the node refused nothing; balance +6 stakes                                                 |
+| M.2 | six claims, 6 seats taken       | **6/6 in one block** (134)                                                                                                                     |
+| M.3 | six claims, 12 seats taken      | **6/6 in one block** (139)                                                                                                                     |
+| CS  | two claims, the same slot       | **exactly one**, 3/3; the other refused before inclusion with `ReadMismatch { expected: <[-, -]> … }` on the slot; balance +1 stake each round |
+
+The same storm with the key set on the path landed 1 of 6, twice. So the set was the cost that
+moved: overwriting a pre-inserted fixed-width cell costs the same whatever the other slots hold
+(tested at 0, 6 and 12 of 24 taken), and a join that touches nothing else lands beside five
+rivals in one block. The slot guard still does its job, so the stake-safety argument in "What it
+keeps" is unchanged.
+
+**Moving the key check to the start is safe.** `join` does not take the commitment as an
+argument: it computes `entropyKeyCommitment(tableId, playerEntropySecret())` inside the proof,
+from the player's own secret. Producing someone else's commitment means inverting the hash, so a
+duplicate can only be the same secret in two slots — one player, twice, paying twice — and never
+one player displacing another. The start (which reads every slot anyway) resolves it as in open
+decision 5.
+
+Still open, and unchanged by this probe: risk 3 (the real table's constructor with pre-inserted
+identities) and the real `join`'s admission margin.
 
 ## Risks, in the order they could kill it
 
@@ -199,7 +233,7 @@ same six-wallet storm; then (2) if (1) does not flatten the cost.
    cells should keep the cost flat, which is why `seatIdentity` is pre-inserted in (1) — but the
    guaranteed transcript cannot be inflated by the `MIDNIGHT_GAS_FACTOR` patch, so this needs a
    measurement, not an argument. **Measured: confirmed** (probe L, 1 of 6 twice, the rest
-   `OutOfGas`) — see "What the probe changes".
+   `OutOfGas`) — and **removed by option 1** (probe M, 6 of 6 in one block, three rounds).
 3. **Pre-inserting everything does not fit.** The deploy transaction was rejected ("would
    exhaust the block limits") when the constructor wrote all six scorecards (27 fields each),
    identities and receipts — the reason those three maps are inserted at `join` today (see the
@@ -212,8 +246,8 @@ same six-wallet storm; then (2) if (1) does not flatten the cost.
    and 3. Anything that assumes seats `0..seatCount` are dense must use "occupied and not left"
    instead. Point (4) keeps that to the places that do not already skip leavers.
    `contract/src/test/ledger-access.ts` re-derives each circuit's reads from the compiled transcript and
-   should gain an assertion that `join` reads only `phase`, its own slot, its own `joinedKeys`
-   entry and constants.
+   should gain an assertion that `join` reads only `phase`, its own slot and constants — and
+   touches no structure whose size changes (option 1).
 
 ## Open decisions
 
@@ -227,15 +261,20 @@ same six-wallet storm; then (2) if (1) does not flatten the cost.
    (e.g. from the commitment) collides no less and is easier to predict.
 4. **Whether to do this at all** before a public launch needs it. The UI warning already removes
    the surprise; this removes the second approval and the one-per-block cap.
+5. **A duplicate key at the start.** Proposed: keep the lowest slot holding that commitment and
+   treat every other one as a seat that left before the start (full refund, no seat), so a
+   duplicate can never stop a table from starting. Only one player can cause it (see "Option 1,
+   probed"), and it costs them nothing but a wasted join.
 
 ## Verification plan
 
-1. **Probe first** — done for (a)–(c) on 2026-09-26 ("Probe results"); (d) and the two ways round
-   the gas trap are next. As planned: extend `docs/concurrency-probe.md`'s harness on the
-   ledger-9 devnet, before editing `table.compact`: (a) two concurrent `receiveUnshielded` into one contract; (b)
-   `Set.member` + `insert` on distinct keys; (c) concurrent inserts of new keys into one map vs
-   overwrites of pre-inserted keys, for the #36 gas failure; (d) the constructor with six
-   pre-inserted `SeatIdentity`s still deploys. Stop at the first failure of (a).
+1. **Probe first** — done for (a)–(c) on 2026-09-26 ("Probe results") and for option 1 on 2026-09-27
+   ("Option 1, probed"); (d), the real constructor, is next. As planned: extend
+   `docs/concurrency-probe.md`'s harness on the ledger-9 devnet, before editing `table.compact`: (a)
+   two concurrent `receiveUnshielded` into one contract; (b) `Set.member` + `insert` on distinct
+   keys; (c) concurrent inserts of new keys into one map vs overwrites of pre-inserted keys, for the
+   #36 gas failure; (d) the constructor with six pre-inserted `SeatIdentity`s still deploys. Stop at
+   the first failure of (a).
 2. **Contract** — compile and execute through `/midnight-verify:verify`; `npm run k -w cli`
    (no circuit above today's maximum, and `abortTable` is the one to watch); `ls
 src/managed/table/keys/*.verifier | wc -l` still 9; the `ledger-access` assertion from risk 4.
