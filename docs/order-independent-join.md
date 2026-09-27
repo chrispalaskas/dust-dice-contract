@@ -1,7 +1,9 @@
 # Order-independent joins — design note
 
 Make concurrent `join`s to one table all land, instead of one per block with the rest rejected.
-Status: **design, not built, not probed.** Target: the next ledger-9 table contract (the
+Status: **design, probed 2026-09-26, not built.** The probe cleared two of the risks and
+confirmed the gas one: disjoint joins do not conflict, but a crowd of them still lands one per
+block — see "Probe results". Target: the next ledger-9 table contract (the
 `dust-dice-vrf` line and `fast-dleq-check`, whose `join` differs from `dust-dice-vrf` by one line —
 it also stamps `roundOpenedAt`). Not for ledger 8: nothing about contention has been measured
 there, and ledger 8's tables would all have to be redeployed for it.
@@ -122,19 +124,82 @@ slot.
   `fast-dleq-check` — and **the review has to redo this argument for that scheme**, not take this
   paragraph's word for it.
 
+## Probe results (2026-09-26)
+
+Run with `probes/concurrency/src/joins.compact` and `run-joins.ts` in the dust-dice repo, on an
+isolated ledger-9.1 devnet (node 2.0.0-rc.4, the probe's own genesis, nothing else on the chain),
+by the concurrency probe's harness: one wallet per process, every transaction proved and
+balanced against one starting state and submitted within a millisecond, the node's own reason
+recorded for every rejection. The probe's `join` is the design's: read `phase`, look up and
+overwrite one pre-inserted `SeatIdentity` slot, `Set.member` + `insert` the key, receive the
+stake. It leaves out the fill-clock write (see "admission", below), which reads nothing and
+cannot conflict (probe experiments A/B/F).
+
+| Exp | Concurrent group                          | Result                                                                                                                                                                                                   |
+| --- | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H   | two `receiveUnshielded` into one contract | **both land, same block**, 3/3 rounds (blocks 117, 121, 126); balance +2 stakes each time                                                                                                                |
+| K   | `Set.member` + `insert`, distinct keys    | **both land, same block**, 3/3 (130, 134, 138)                                                                                                                                                           |
+| KS  | the same key twice                        | **exactly one**, 2/2; the other refused before inclusion: `ReadMismatch { expected: <[-]: b1>, actual: <[01]: b1> }`                                                                                     |
+| J   | two joins, the same slot                  | **exactly one**, 3/3; the other refused before inclusion with `ReadMismatch` on the slot (expected the empty identity, actual the winner's); balance +1 stake each round — the loser's stake never moved |
+| I   | two joins, different slots                | **both land, same block**, in all three rounds on a contract already holding 3–5 keys (blocks 186, 233, 237); not one `ReadMismatch`                                                                     |
+| L   | six joins, six slots                      | **1 of 6**, twice (blocks 248, 253); the other five refused at pre-dispatch with `Transcript(Execution(OutOfGas))`                                                                                       |
+
+What that settles:
+
+- **Risk 1 is cleared.** Stakes received concurrently into one contract do not conflict.
+- **The read set is right.** Disjoint joins do not conflict; the same slot and the same key do,
+  with `ReadMismatch` before inclusion, the stake untouched. `Set.member` binds per key, like
+  `Map.lookup`.
+- **Risk 2 is real, and it is what caps a crowd.** Every join declares its guaranteed-phase gas
+  for the state it was built against. Once one lands, the others cost more than they declared
+  and fail `OutOfGas` — bugs-found #36's mechanism, measured here on joins. Pairs landed
+  together on a contract already holding 3–5 keys, while the storms — started from 0 keys and
+  from 1 — never landed more than one (pairs from 0 or 1 key were not tried): the cost of the
+  `Set` and `Map` operations moves with the structures' contents, in steps. The guaranteed budget cannot be inflated, so the design as
+  written does **not** lift the one-join-per-block cap under a real crowd.
+- **Admission is tight.** The probe's join sits at the node's time-to-dismiss rule:
+  18.16–18.49 ms of guaranteed-phase work against ~18.1 ms allowed for its ~9 KB, refused
+  (`OutsideTimeToDismiss`) as the contract's structures filled. Four words of argument ballast
+  moved the transaction's size by 0–2 bytes, so that dial does not help here; dropping the
+  fill-clock write did. The real `join` is a bigger transaction with a bigger allowance, so this
+  bound has to be measured on the real contract before anything is built.
+- A constructor pre-inserting 16 `SeatIdentity`s deploys (the probe contract). Whether the real
+  table's constructor still fits with six more (risk 3) is **untested**.
+
+## What the probe changes
+
+Claiming a slot is necessary but not sufficient: the conflict is gone, the gas trap is not. Two
+ways round it, each needing its own probe before `table.compact` is touched:
+
+1. **Take the growing set off the join path.** `join` would overwrite only its own
+   pre-inserted slot and receive the stake — no `joinedKeys` insert — and the start, which reads
+   every slot anyway, would check that no key holds two. The storm then touches nothing whose
+   size changes. Open: what the start does with a duplicate (refuse to start, or refund one), and
+   whether overwriting a pre-inserted cell is really flat in cost — the storm result does not yet
+   say whether the `Set`, the `Map` or both moved it.
+2. **Make `join` wholly fallible,** as `table.compact` did to the resolve for #36
+   (`resolveBallast`): heavy enough to be classified fallible, its budget takes the
+   `MIDNIGHT_GAS_FACTOR` ×4 and time-to-dismiss no longer counts it. The price: a join that loses
+   a race lands as `FailFallible` — fee paid, nothing applied — instead of being refused before
+   inclusion, and "every assert and substantive write is guaranteed-phase" (security-review.md
+   §4) no longer describes it. Must show that the stake is not taken on `FailFallible`.
+
+Suggested order: (1) first — it keeps the guaranteed-phase safety story intact — probed with the
+same six-wallet storm; then (2) if (1) does not flatten the cost.
+
 ## Risks, in the order they could kill it
 
-1. **Two `receiveUnshielded` calls into one contract in one block — untested.** Every join
-   receives its stake. If the contract's balance update binds like a read, concurrent joins
-   conflict on it and this design buys nothing. Probe this first; everything else is moot if it
-   fails.
+1. **Two `receiveUnshielded` calls into one contract in one block — cleared** (probe H: both
+   land, same block, 3/3). Every join receives its stake; had the contract's balance update bound
+   like a read, concurrent joins would have conflicted on it.
 2. **Gas, not reads (bugs-found #36).** Measured on ledger 9: two settlements built on one state
    touched disjoint cells, the first landed, and the second failed `OutOfGas` three times,
    because the first had made a map heavier than the second's budget declared. Concurrent joins
    inserting _new_ keys into the same maps are exactly that shape. Overwriting pre-inserted
    cells should keep the cost flat, which is why `seatIdentity` is pre-inserted in (1) — but the
    guaranteed transcript cannot be inflated by the `MIDNIGHT_GAS_FACTOR` patch, so this needs a
-   measurement, not an argument.
+   measurement, not an argument. **Measured: confirmed** (probe L, 1 of 6 twice, the rest
+   `OutOfGas`) — see "What the probe changes".
 3. **Pre-inserting everything does not fit.** The deploy transaction was rejected ("would
    exhaust the block limits") when the constructor wrote all six scorecards (27 fields each),
    identities and receipts — the reason those three maps are inserted at `join` today (see the
@@ -165,8 +230,9 @@ slot.
 
 ## Verification plan
 
-1. **Probe first** — extend `docs/concurrency-probe.md`'s harness on the ledger-9 devnet, before
-   editing `table.compact`: (a) two concurrent `receiveUnshielded` into one contract; (b)
+1. **Probe first** — done for (a)–(c) on 2026-09-26 ("Probe results"); (d) and the two ways round
+   the gas trap are next. As planned: extend `docs/concurrency-probe.md`'s harness on the
+   ledger-9 devnet, before editing `table.compact`: (a) two concurrent `receiveUnshielded` into one contract; (b)
    `Set.member` + `insert` on distinct keys; (c) concurrent inserts of new keys into one map vs
    overwrites of pre-inserted keys, for the #36 gas failure; (d) the constructor with six
    pre-inserted `SeatIdentity`s still deploys. Stop at the first failure of (a).
