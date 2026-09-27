@@ -2,3 +2,4 @@ export * from './indexer-retry.js';
 export * from './rules.js';
 export * from './policies.js';
 export * from './bech32.js';
+export * as Backgammon from './backgammon.js';
