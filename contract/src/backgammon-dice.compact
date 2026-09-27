@@ -29,12 +29,18 @@
 // operator's help it can compute its own Gamma early (it knows its own `v`), but its dice also
 // hash the secret the HONEST player reveals with the move in between, which does not exist yet.
 //
-// THE COFACTOR IS CLEARED. Jubjub's group has order 8r. `S == rho*Gamma` pins Gamma only up to a
-// point of order dividing 8 when `rho` is a multiple of 2, 4 or 8, and a hostile operator can
-// grind a small-order point into its answer and still pass the DLEQ half the time. Hashing
-// `8*Gamma` instead of `Gamma` removes both: every Gamma that passes gives the same `8*Gamma`.
-// `rho` is also DERIVED in the circuit, not witnessed, so a player cannot pick rho = 0 -- which
-// would make `S == rho*Gamma` hold for any Gamma at all.
+// `rho` IS DERIVED IN THE CIRCUIT, NOT WITNESSED. With `rho` a witness, a player could post the
+// identity as its query, get the identity back (an honest operator's DLEQ on it is valid), and
+// reveal with rho = 0 -- or r, 3r, 7r: the reduction happens inside `ecMul` -- whereupon
+// `S == rho*Gamma` holds for ANY Gamma and the player picks its own dice. Measured at proof level
+// on 2026-09-27 (compactc 0.34, zkir-v2 2.1.1) against the Yacht reveal, which takes rho as a
+// witness. Derived from `sk`, rho is fixed per ply and is 0 mod r with negligible probability.
+//
+// THE COFACTOR IS CLEARED, as defence in depth. Jubjub's group has order 8r, and `S == rho*Gamma`
+// alone pins Gamma only up to a point of order dividing 8. The same measurement found the stack
+// refuses any point outside the prime-order subgroup as an EC operand (runtime, VM and the
+// circuit's `EccChip::assign`), so no such Gamma can be supplied today; hashing `8*Gamma` keeps the
+// dice unique if that ever changes.
 //
 // THE OPENING (ply 0) is thrown by the operator in the clear: `S = x*P_open` with `P_open`
 // hashed from both seats' join entropies, the DLEQ checked on chain, a die per seat from `8*S`.

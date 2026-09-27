@@ -79,11 +79,15 @@ dice  = ladder(H(8*Gamma, e, t))      e = the secret the previous move revealed
 - After the opening, the resolve only answers a blinded point. The dice exist once the mover
   unblinds them, and become public with the move, which proves the unblinding: the query on
   chain is `rho*P` for this seat's forced `v`, and `S == rho*Gamma`.
-- **The cofactor is cleared.** `S == rho*Gamma` fixes Gamma only up to a point of order
-  dividing 8, and a hostile operator can grind a small-order point into an answer that still
-  passes the DLEQ. The dice hash `8*Gamma`, which every passing Gamma shares. `rho` is derived in
-  the circuit, not witnessed, so a player cannot pick `rho = 0` (which would let any Gamma pass).
-  The JS runtime also refuses points outside the prime-order subgroup outright.
+- **`rho` is derived in the circuit, not witnessed.** With `rho` a witness, a player can post
+  the identity as its query, get the identity back with a valid DLEQ, and reveal with `rho = 0`
+  (or any multiple of r): `S == rho*Gamma` then holds for any Gamma, and the player picks its
+  dice. Measured at proof level on 2026-09-27 against the Yacht reveal on this line, which takes
+  `rho` as a witness.
+- **The cofactor is cleared, as defence in depth.** `S == rho*Gamma` alone fixes Gamma only up to
+  a point of order dividing 8. The same measurement found the stack refuses every point outside
+  the prime-order subgroup as an EC operand (runtime, VM and circuit), so none can be supplied
+  today; the dice hash `8*Gamma` so they stay unique if that changes.
 - `settle` reveals `x` (checked against `PK`), so anyone can replay every roll from the public
   log: each move revealed its `v`, so `Gamma = x*P` is computable after the fact.
 
