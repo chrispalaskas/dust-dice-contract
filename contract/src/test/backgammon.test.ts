@@ -316,7 +316,7 @@ describe('joining', () => {
     assert.equal(l.phase, BG_PHASE.playing);
     assert.equal(l.stage, STAGE_ROLL);
     assert.equal(l.pot, 20_000n);
-    assert.equal(l.deadline, BigInt(T0 + 50 + 300));
+    assert.equal(l.deadline, BigInt(T0 + 50 + 180));
     // e(1) is revealed at join, forced from the seat key.
     assert.equal(
       hex(l.pendingEntropy.lookup(1n)),
@@ -361,11 +361,13 @@ describe('joining', () => {
 });
 
 describe('the constructor', () => {
-  it('refuses timeouts inside the declared-time floor, and a tier too small to rake', async () => {
+  it('refuses a move clock under two minutes, a table clock inside the floor, and a tier too small to rake', async () => {
     await rejects(
-      BackgammonSimulator.create(defaultBgConfig({ moveTimeoutSecs: 240n })),
-      /move timeout/,
+      BackgammonSimulator.create(defaultBgConfig({ moveTimeoutSecs: 119n })),
+      /at least two minutes/,
     );
+    // Three minutes is fine: the deadline is stamped a slack ahead, so it cannot be shaved.
+    await BackgammonSimulator.create(defaultBgConfig({ moveTimeoutSecs: 180n }));
     await rejects(
       BackgammonSimulator.create(defaultBgConfig({ tableTimeoutSecs: 240n })),
       /table timeout/,
@@ -395,8 +397,18 @@ describe('rolling and moving', () => {
     await sim.resolveRoll(T0 + 10);
     const l = sim.getLedger();
     assert.equal(l.stage, STAGE_MOVE);
-    assert.equal(l.deadline, BigInt(T0 + 10 + 300));
+    // Stamped a roll-slack ahead of the declared time: at least the move timeout of real time.
+    assert.equal(l.deadline, BigInt(T0 + 10 + 60 + 180));
     await rejects(sim.resolveRoll(T0 + 11), /no roll is owed/);
+  });
+
+  it("pins the operator's declared time within the roll's 60 s slack", async () => {
+    const { sim } = await startedGame();
+    sim.asOperator();
+    await rejects(sim.resolveRoll(T0 + 10, T0 + 70), /the roll's slack/);
+    await sim.resolveRoll(T0 + 11, T0 + 70);
+    // However far behind the operator declared, the player's clock runs from the real block.
+    assert.ok(sim.getLedger().deadline >= BigInt(T0 + 70 + 180));
   });
 
   it('refuses a move by the wrong seat, and a move before the roll', async () => {
@@ -455,8 +467,9 @@ describe('rolling and moving', () => {
     const ply = Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), dice)[0];
     sim.asPlayer(players[mover].sk);
     const deadline = Number(sim.getLedger().deadline);
-    await rejects(sim.move(ply, deadline + 300), /too late/);
-    await sim.move(ply, deadline + 299);
+    const move = Number(sim.config.moveTimeoutSecs);
+    await rejects(sim.move(ply, deadline + move), /too late/);
+    await sim.move(ply, deadline + move - 1);
   });
 
   it('refuses entering onto a closed board and accepts the forced pass', async () => {

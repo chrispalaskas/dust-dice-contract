@@ -61,7 +61,7 @@ export function defaultBgConfig(overrides: Partial<BgConfig> = {}): BgConfig {
     rakeAddress: userAddress(0xaa),
     seed,
     seedCommitment: seedCommitmentTs(tableId, seed),
-    moveTimeoutSecs: 300n,
+    moveTimeoutSecs: 180n,
     tableTimeoutSecs: 600n,
     inviteHash: new Uint8Array(32),
     ...overrides,

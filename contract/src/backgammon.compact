@@ -37,9 +37,9 @@
 // 3. TIME
 // -------------------------------------------------------------------------------------------
 //
-// Declared-and-sandwiched, exactly as table.compact section 5: `join` and `resolveRoll` declare
-// `now` and `pinTime` traps it within `timeSlackSecs()` of block time. Everything else compares
-// block time against the stored `deadline` with a kernel predicate:
+// Declared-and-sandwiched, as table.compact section 5: `join` and `resolveRoll` declare `now`,
+// pinned within a slack of block time. Everything else compares block time against the stored
+// `deadline` with a kernel predicate:
 //
 //     eliminate (timeout)    stage 1, blockTimeGt(deadline)                  -> opponent wins
 //     move                   refused once blockTimeGte(deadline + moveTimeoutSecs)
@@ -55,6 +55,18 @@
 //
 // `abortTable` on the operator's stall requires stage 0 -- the roll is the OPERATOR'S -- so a
 // player losing a game cannot stall into a refund: its own silence is answered by `eliminate`.
+//
+// THE MOVE CLOCK IS STAMPED A SLACK AHEAD, so it is a guaranteed minimum. The operator's roll
+// declares `now`, which the chain accepts up to `rollSlackSecs()` behind real block time -- so a
+// deadline of `now + moveTimeoutSecs` would let a hostile operator start the player's clock in
+// the past and shave up to that slack off it (security-review C1, the Yacht table's reason for a
+// 240 s floor on every timeout). Stamping `now + rollSlackSecs() + moveTimeoutSecs` instead means
+// the player has AT LEAST `moveTimeoutSecs` from the block its dice landed in, whatever the
+// operator declared; an honest operator's declared time trails by a few blocks, so in practice
+// it is a little more. That is what lets the move clock be three minutes rather than four.
+//
+// The roll's slack is 60 s, not the 120 s `join` keeps: only the operator declares it, from its
+// own tip read to inclusion, with no wallet prompt in between (the reason for join's 120 s).
 //
 // -------------------------------------------------------------------------------------------
 // 4. THE RANDOMNESS RESIDUAL, STATED
@@ -100,9 +112,22 @@ pure circuit timeSlackSecs(): Uint<64> {
   return 120;
 }
 
-/** Every timeout must strictly exceed `timeSlackSecs() * timeoutSlackFactor()` = 240 s. */
+/** The table timeout must strictly exceed `timeSlackSecs() * timeoutSlackFactor()` = 240 s. */
 pure circuit timeoutSlackFactor(): Uint<64> {
   return 2;
+}
+
+/**
+ * Slack on the operator's declared `now` in `resolveRoll`. See section 3: the move deadline is
+ * stamped this far ahead, so it can never be shaved.
+ */
+pure circuit rollSlackSecs(): Uint<64> {
+  return 60;
+}
+
+/** The shortest move clock a table may seal: time to prove, approve and land a move. */
+pure circuit minMoveSecs(): Uint<64> {
+  return 120;
 }
 
 /** Smallest stake: the 1% rake is never zero. */
@@ -302,6 +327,14 @@ circuit pinTime(now: Uint<64>): [] {
          );
 }
 
+/** `pinTime` with the operator's tighter roll slack. */
+circuit pinRollTime(now: Uint<64>): [] {
+  assert(blockTimeGte(now), "declared time is ahead of block time");
+  assert(blockTimeLt((now + rollSlackSecs()) as Uint<64>),
+         "declared time is further behind block time than the roll's slack"
+         );
+}
+
 /** Every stake received is still in the pot: nothing leaves before the end. */
 circuit assertCustody(): [] {
   assert(pot == (tier * (seatCount as Uint<64>)) as Uint<64>,
@@ -333,7 +366,7 @@ constructor(id: Bytes<32>,
   assert(stake >= minTier(), "tier must be at least 100 so the 1% rake is non-zero");
   assert(stake <= maxTier(), "tier is above the maximum a table may stake");
   const floor = (timeSlackSecs() * timeoutSlackFactor()) as Uint<64>;
-  assert(moveTimeout > floor, "move timeout must exceed the declared-time floor");
+  assert(moveTimeout >= minMoveSecs(), "move timeout must be at least two minutes");
   assert(tableTimeout > floor, "table timeout must exceed the declared-time floor");
   // Section 3: after the latest move `move` accepts, the operator still has
   // `tableTimeout - moveTimeout` to roll before it can be aborted; that must beat the floor too.
@@ -440,7 +473,7 @@ export circuit resolveRoll(now: Uint<64>): BgDice {
   assert(stage == stageRoll(), "resolveRoll: no roll is owed");
 
   const t = disclose(now);
-  pinTime(t);
+  pinRollTime(t);
 
   const seed = rollSeed();
   assert(disclose(seedCommitmentOf(tableId, seed) == seedCommitment),
@@ -462,7 +495,8 @@ export circuit resolveRoll(now: Uint<64>): BgDice {
   }
   dice = d;
   stage = stageMove();
-  deadline = (t + moveTimeoutSecs) as Uint<64>;
+  // A slack ahead of the declared time: at least `moveTimeoutSecs` of real time (section 3).
+  deadline = (t + rollSlackSecs() + moveTimeoutSecs) as Uint<64>;
 
   padTransaction();
   return d;

@@ -3,14 +3,14 @@
 The second Dust Dice game. Two seats, one flat pot, Yacht's dust dice. The winner takes the
 pot less a 1% rake. There is no doubling cube and there are no gammons: a win is a win.
 
-| File | What it holds |
-| --- | --- |
-| `contract/src/backgammon.compact` | The table: ledger, the six circuits, the time model. Its header is the design record. |
-| `contract/src/backgammon-dice.compact` | The rolls: `dice-core`'s byte ladder, two dice at a time, and the opening. |
-| `contract/src/backgammon-board.compact` | The board rules, **generated** by `contract/scripts/gen-backgammon-board.mjs`. |
-| `contract/src/bg-mirror.ts` | TypeScript mirror of the rolls and the forced entropy. |
-| `api/src/backgammon.ts` | The rules engine: `applyPly` (the circuit's twin), `legalPlies` (the full rules), `plyRuleViolation`. |
-| `verifier/src/backgammon.ts` | The chain-only verifier. `dust-dice-verify <address>` picks it by the contract's entry points. |
+| File                                    | What it holds                                                                                         |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `contract/src/backgammon.compact`       | The table: ledger, the six circuits, the time model. Its header is the design record.                 |
+| `contract/src/backgammon-dice.compact`  | The rolls: `dice-core`'s byte ladder, two dice at a time, and the opening.                            |
+| `contract/src/backgammon-board.compact` | The board rules, **generated** by `contract/scripts/gen-backgammon-board.mjs`.                        |
+| `contract/src/bg-mirror.ts`             | TypeScript mirror of the rolls and the forced entropy.                                                |
+| `api/src/backgammon.ts`                 | The rules engine: `applyPly` (the circuit's twin), `legalPlies` (the full rules), `plyRuleViolation`. |
+| `verifier/src/backgammon.ts`            | The chain-only verifier. `dust-dice-verify <address>` picks it by the contract's entry points.        |
 
 ## The board
 
@@ -42,17 +42,17 @@ checker moves:
 - a die the ply leaves unplayed must be unplayable on the final board.
 
 **The chain does not enforce** the full "play as many dice as you can" rule (a different
-*order* might have played both), nor the rule that a lone playable die must be the larger.
+_order_ might have played both), nor the rule that a lone playable die must be the larger.
 Both need a search over orders, which is too large for a circuit. The website offers only plies
-from `legalPlies`. The verifier reports any ply that broke either rule as a *finding* (exit
+from `legalPlies`. The verifier reports any ply that broke either rule as a _finding_ (exit
 code 2), separate from the chain's checks.
 
 ## The turn: two transactions, entropy pipelined
 
-| Stage | Who owes | Circuit |
-| --- | --- | --- |
-| 0 | the operator owes the roll | `resolveRoll(now)` |
-| 1 | the player to move owes the ply | `move(ply, count)` |
+| Stage | Who owes                        | Circuit            |
+| ----- | ------------------------------- | ------------------ |
+| 0     | the operator owes the roll      | `resolveRoll(now)` |
+| 1     | the player to move owes the ply | `move(ply, count)` |
 
 - `roll(t) = H(tableId, seed, e_mover(t), e_opponent(t+1), t, stream)`, where `e_s(t) = H(sk_s, tableId, t)` is forced.
 - `join` reveals e(1). A `move` at ply t reveals the mover's own e(t+2).
@@ -69,15 +69,18 @@ The **opening** (ply 0) hashes both seats' e(1) on stream 1 and gives one die to
 
 The kernel has block-time predicates only.
 
-- **Declaring time:** `join` and `resolveRoll` declare `now`, pinned within 120 s of block time.
+- **Declaring time:** `join` and `resolveRoll` declare `now`. `join` is pinned within 120 s of block time, for the wallet prompt. The operator's `resolveRoll` is pinned within 60 s.
+- **The move clock is a guaranteed minimum.** The roll stamps `deadline = now + 60 + moveTimeout`, a slack ahead of what it declared. However far behind the operator declares, the player has at least `moveTimeout` from the block its dice landed in. An honest operator trails by a few blocks, so in practice it is a little more. This is why the clock can be three minutes; the Yacht table's 240 s floor exists because its deadlines are not stamped ahead. The floor here is two minutes, the time to prove, approve and land a move.
 - **`move` is time-checked but declares nothing:** it is refused once a whole move timeout has passed since the deadline. That guarantees the operator at least `tableTimeout − moveTimeout` to roll. The constructor requires that margin to exceed the 240 s floor.
 
-| Exit | When |
-| --- | --- |
-| `eliminate(seat, false)` | stage 1, `seat` is to move, block time past `deadline`: the opponent wins |
-| `eliminate(seat, true)` | resign while playing (the opponent wins), or leave a filling table (full refund) |
-| `abortTable()` | one seat, past the fill clock; or stage 0 (the operator owes) past `deadline + tableTimeout`: full refunds, no rake |
-| `settle(seed, q, r)` | decided: the seed must open the commitment until `deadline + tableTimeout`, then it is waived |
+Operator defaults: 180 s to move, 900 s table timeout (the fill clock and the operator's grace).
+
+| Exit                     | When                                                                                                                |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `eliminate(seat, false)` | stage 1, `seat` is to move, block time past `deadline`: the opponent wins                                           |
+| `eliminate(seat, true)`  | resign while playing (the opponent wins), or leave a filling table (full refund)                                    |
+| `abortTable()`           | one seat, past the fill clock; or stage 0 (the operator owes) past `deadline + tableTimeout`: full refunds, no rake |
+| `settle(seed, q, r)`     | decided: the seed must open the commitment until `deadline + tableTimeout`, then it is waived                       |
 
 A player cannot stall its way into a refund. When the player owes the move, the only exit is
 `eliminate`.
@@ -89,7 +92,7 @@ The operator cannot choose or change a roll:
 - the seed is committed before either player exists;
 - every entropy is forced.
 
-The operator *can* stall, and a stall ends in a full refund with no rake.
+The operator _can_ stall, and a stall ends in a full refund with no rake.
 
 The table assumes, as Yacht's does, that the operator neither plays at its own tables nor leaks
 the seed. If the operator colludes with one player anyway:
@@ -107,14 +110,14 @@ compactc 0.31.1 (ledger 8):
 - `--skip-zk` compile: 2.6 s.
 - Six verifier keys: 12,714 bytes, against about 19 KB measured to deploy.
 
-| Circuit | k | Instructions |
-| --- | ---: | ---: |
-| `join` | 14 | 851 |
-| `resolveRoll` | 15 | 795 |
-| `move` (strict) | 14 | 3,196 |
-| `eliminate` | 13 | 841 |
-| `settle` | 14 | 970 |
-| `abortTable` | 13 | 1,130 |
+| Circuit         |   k | Instructions |
+| --------------- | --: | -----------: |
+| `join`          |  14 |          851 |
+| `resolveRoll`   |  15 |          795 |
+| `move` (strict) |  14 |        3,196 |
+| `eliminate`     |  13 |          841 |
+| `settle`        |  14 |          970 |
+| `abortTable`    |  13 |        1,130 |
 
 The maximality check costs `move` about 490 instructions and no k.
 
