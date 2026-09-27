@@ -111,9 +111,17 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
     this.privateState = createTablePrivateState({ playerSecret: sk, inviteCode });
   }
 
-  join(payoutTo: UserAddress, now: number, blockTime = now): Promise<bigint> {
+  /** Claim `slot` (the lowest free one when omitted, so tests stay deterministic). */
+  join(
+    payoutTo: UserAddress,
+    now: number,
+    blockTime = now,
+    slot: number = freeSlots(this.getLedger())[0] ?? 0,
+  ): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('join', (ctx) => this.bg.impureCircuits.join(ctx, payoutTo, BigInt(now)));
+    return this.run('join', (ctx) =>
+      this.bg.impureCircuits.join(ctx, BigInt(slot), payoutTo, BigInt(now)),
+    );
   }
 
   resolveRoll(now: number, blockTime = now): Promise<{ a: bigint; b: bigint }> {
@@ -165,6 +173,18 @@ export function boardOf(ledger: BgLedger): Rules.Board {
 
 export function diceOf(ledger: BgLedger): [number, number] {
   return [Number(ledger.dice.a), Number(ledger.dice.b)];
+}
+
+/** How many slots a filling table has (the contract's `slotCount()`). */
+export const SLOT_COUNT = 8;
+
+/** The slots nobody holds, in index order. */
+export function freeSlots(ledger: BgLedger): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < SLOT_COUNT; i++) {
+    if (ledger.slotIdentity.lookup(BigInt(i)).addr.bytes.every((b) => b === 0)) out.push(i);
+  }
+  return out;
 }
 
 /** The two seats' pending entropies, as `resolveRoll` reads them. */
@@ -230,18 +250,21 @@ export async function playOut(
   for (let guard = 0; guard < 4000; guard++) {
     const before = sim.getLedger();
     const turn = Number(before.turn);
-    // The mirror's view of the roll, from nothing but the public ledger and the seed.
-    const expected = bgRollForPly(
-      sim.config.tableId,
-      sim.config.seed,
-      pendingOf(before),
-      turn,
-      Number(before.toMove),
-    );
+    const toMoveBefore = Number(before.toMove);
     sim.asOperator();
     t += 5;
     await sim.resolveRoll(t);
     const rolled = sim.getLedger();
+    // The mirror's view of the roll, from nothing but the public ledger and the seed. The
+    // entropies are read AFTER the resolve: at the opening they are only put in the seats by the
+    // start, which is this very call, and no roll changes them.
+    const expected = bgRollForPly(
+      sim.config.tableId,
+      sim.config.seed,
+      pendingOf(rolled),
+      turn,
+      toMoveBefore,
+    );
     const chain = diceOf(rolled);
     const mover = Number(rolled.toMove);
     rolls.push({ turn, mover, chain, mirror: [expected.a, expected.b] });

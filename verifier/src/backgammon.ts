@@ -22,7 +22,13 @@
  */
 
 import { Backgammon as Rules } from '@dust-dice/api';
-import { bgRollForPly, bgStarter, nativeBalanceOf, seedCommitmentTs } from '@dust-dice/contract';
+import {
+  bgHeldSlots,
+  bgRollForPly,
+  bgStarter,
+  nativeBalanceOf,
+  seedCommitmentTs,
+} from '@dust-dice/contract';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 
 import { Checks, addressOf } from './checks.ts';
@@ -40,6 +46,13 @@ const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 
 const STAGE_ROLL = 0n;
 const STAGE_MOVE = 1n;
+/** Slots someone holds. While filling nothing else counts the players -- the contract's §6. */
+const occupied = (led: BackgammonLedger): number => bgHeldSlots(led).length;
+
+/** What the contract should hold: the pot once started, one stake per held slot while filling. */
+function expectedBalance(led: BackgammonLedger): bigint {
+  return led.phase === Backgammon.BgPhase.filling ? led.tier * BigInt(occupied(led)) : led.pot;
+}
 
 /** One transaction of the table's log, and what it left behind. */
 interface Step {
@@ -59,8 +72,7 @@ interface Step {
 function progress(led: BackgammonLedger): number {
   const phaseRank = led.phase >= Backgammon.BgPhase.decided ? 1 : 0;
   return (
-    (phaseRank * 1_000_000 + Number(led.turn) * 4 + Number(led.stage) * 2 + Number(led.seatCount)) *
-      10 +
+    (phaseRank * 1_000_000 + Number(led.turn) * 4 + Number(led.stage) * 2 + occupied(led)) * 10 +
     (led.phase === Backgammon.BgPhase.settled ? 1 : 0)
   );
 }
@@ -95,10 +107,10 @@ function produces(eps: readonly string[], p: BackgammonLedger, s: BackgammonLedg
   if (eps.includes('resolveRoll')) {
     return p.stage === STAGE_ROLL && s.stage === STAGE_MOVE && s.turn === p.turn;
   }
-  if (eps.includes('join')) return s.seatCount === p.seatCount + 1n;
+  if (eps.includes('join')) return occupied(s) === occupied(p) + 1;
   if (eps.includes('eliminate')) {
     return (
-      (p.phase === P.filling && s.seatCount < p.seatCount) ||
+      (p.phase === P.filling && occupied(s) === occupied(p) - 1) ||
       (p.phase === P.playing && s.phase === P.decided && s.turn === p.turn)
     );
   }
@@ -149,6 +161,7 @@ function stateKey(l: BackgammonLedger): string {
     l.dice.a,
     l.dice.b,
     l.pot,
+    occupied(l),
     l.winner,
     l.deadline,
     l.board.s0.join(','),
@@ -246,7 +259,10 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
       console.log(
         `  tx ${i} (${what}): landed without effect -- a racing call changed the table first`,
       );
-      c.ok(`tx ${i} (${what}): the contract holds exactly its pot`, s.balance === led.pot);
+      c.ok(
+        `tx ${i} (${what}): the contract holds exactly its stakes`,
+        s.balance === expectedBalance(led),
+      );
       continue;
     }
 
@@ -261,13 +277,21 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
             break;
           }
           const turn = Number(prev.turn);
+          // The seats' entropies as the roll read them: a roll never changes them, and at the
+          // opening they only exist once this call -- the START, §6 -- has seated the players.
           const expected = bgRollForPly(
             tableId,
             seed,
-            [prev.pendingEntropy.lookup(0n), prev.pendingEntropy.lookup(1n)],
+            [led.pendingEntropy.lookup(0n), led.pendingEntropy.lookup(1n)],
             turn,
             Number(prev.toMove),
           );
+          if (prev.phase === Backgammon.BgPhase.filling) {
+            console.log(
+              `  tx ${i}: the start seated the two earliest of ${occupied(prev)} joiner(s)` +
+                (occupied(prev) > 2 ? ' and refunded the rest' : ''),
+            );
+          }
           c.ok(
             `roll ${turn}: re-derives from the seed`,
             Number(led.dice.a) === expected.a && Number(led.dice.b) === expected.b,
@@ -359,11 +383,11 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
       }
     }
 
-    // Custody, from the chain itself: while the table holds stakes, its native balance is its pot.
+    // Custody, from the chain itself: the pot once started, one stake per held slot before.
     c.ok(
-      `tx ${i} (${what}): the contract holds exactly its pot`,
-      s.balance === led.pot,
-      `balance ${s.balance}, pot ${led.pot}`,
+      `tx ${i} (${what}): the contract holds exactly its stakes`,
+      s.balance === expectedBalance(led),
+      `balance ${s.balance}, expected ${expectedBalance(led)}`,
     );
     prev = led;
   }

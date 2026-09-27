@@ -24,6 +24,14 @@ import * as vm from 'node:vm';
 import * as Rules from '../../../api/src/backgammon.ts';
 import { pureCircuits as bgPure } from '../managed/backgammon/contract/index.js';
 import { bgDiceTs, bgForcedEntropyTs, bgStarter } from '../bg-mirror.ts';
+import {
+  BG_SLOT_COUNT,
+  bgHeldSlots,
+  bgLastJoinAt,
+  bgPlayerCount,
+  bgRandomFreeSlot,
+  bgSlotHeldBy,
+} from '../bg-slots.ts';
 import { entropyKeyCommitmentTs, inviteCommitmentTs } from '../policy-mirror.ts';
 import {
   BG_PHASE,
@@ -35,6 +43,8 @@ import {
   boardOf,
   bytes32,
   defaultBgConfig,
+  freeSlots,
+  SLOT_COUNT,
   diceOf,
   playOut,
   rng,
@@ -302,43 +312,127 @@ describe('whole games', () => {
 // =============================================================================================
 
 describe('joining', () => {
-  it('starts the game on the second seat, with the operator owing the opening roll', async () => {
+  it('claims a slot and counts nothing: the table fills without starting', async () => {
     const sim = await BackgammonSimulator.create(defaultBgConfig());
     const [p0, p1] = seats();
     sim.asPlayer(p0.sk);
-    assert.equal(await sim.join(p0.addr, T0), 0n);
-    let l = sim.getLedger();
-    assert.equal(l.phase, BG_PHASE.filling);
-    assert.equal(l.deadline, BigInt(T0 + 600));
+    assert.equal(await sim.join(p0.addr, T0, T0, 3), 3n);
     sim.asPlayer(p1.sk);
-    assert.equal(await sim.join(p1.addr, T0 + 50), 1n);
-    l = sim.getLedger();
-    assert.equal(l.phase, BG_PHASE.playing);
-    assert.equal(l.stage, STAGE_ROLL);
-    assert.equal(l.pot, 20_000n);
-    assert.equal(l.deadline, BigInt(T0 + 50 + 180));
-    // e(1) is revealed at join, forced from the seat key.
+    assert.equal(await sim.join(p1.addr, T0 + 50, T0 + 50, 6), 6n);
+    const l = sim.getLedger();
+    // Nothing shared moved: no counter, no pot, no clock -- which is what lets joins land together.
+    assert.equal(l.phase, BG_PHASE.filling);
+    assert.equal(l.seatCount, 0n);
+    assert.equal(l.pot, 0n);
+    assert.equal(l.deadline, 0n);
     assert.equal(
-      hex(l.pendingEntropy.lookup(1n)),
-      hex(bgForcedEntropyTs(p1.sk, sim.config.tableId, 1)),
-    );
-    assert.equal(
-      hex(l.seatIdentity.lookup(0n).keyCommit),
+      hex(l.slotIdentity.lookup(3n).keyCommit),
       hex(entropyKeyCommitmentTs(sim.config.tableId, p0.sk)),
     );
+    // e(1) is revealed at join, forced from the seat key.
+    assert.equal(
+      hex(l.slotEntropy.lookup(6n)),
+      hex(bgForcedEntropyTs(p1.sk, sim.config.tableId, 1)),
+    );
+    assert.equal(l.slotJoinedAt.lookup(6n), BigInt(T0 + 50));
+    assert.deepEqual(freeSlots(l), [0, 1, 2, 4, 5, 7]);
   });
 
-  it('refuses a third seat, a reused key, and a zero payout address', async () => {
-    const { sim } = await startedGame();
-    sim.asPlayer(bytes32(0x33));
-    await rejects(sim.join(userAddress(0x03), T0 + 5), /not filling/);
+  it('refuses a slot someone holds and a slot past the last, and takes a free one', async () => {
+    const sim = await BackgammonSimulator.create(defaultBgConfig());
+    const [p0, p1] = seats();
+    sim.asPlayer(p0.sk);
+    await sim.join(p0.addr, T0, T0, 2);
+    sim.asPlayer(p1.sk);
+    await rejects(sim.join(p1.addr, T0 + 1, T0 + 1, 2), /taken a moment ago/);
+    await rejects(sim.join(p1.addr, T0 + 1, T0 + 1, SLOT_COUNT), /no such seat/);
+    assert.equal(await sim.join(p1.addr, T0 + 1, T0 + 1, 5), 5n);
+  });
 
-    const fresh = await BackgammonSimulator.create(defaultBgConfig());
-    fresh.asPlayer(bytes32(0x11));
-    await fresh.join(userAddress(0x01), T0);
-    await rejects(fresh.join(userAddress(0x02), T0 + 1), /already holds a seat/);
-    fresh.asPlayer(bytes32(0x12));
-    await rejects(fresh.join({ bytes: new Uint8Array(32) }, T0 + 1), /zero address/);
+  it('lets one secret hold two slots -- there is no set of keys for a join to grow', async () => {
+    const sim = await BackgammonSimulator.create(defaultBgConfig());
+    const [p0] = seats();
+    sim.asPlayer(p0.sk);
+    await sim.join(p0.addr, T0, T0, 0);
+    await sim.join(p0.addr, T0 + 1, T0 + 1, 1);
+    assert.deepEqual(freeSlots(sim.getLedger()), [2, 3, 4, 5, 6, 7]);
+  });
+
+  it("starts with the operator's opening roll: the two earliest joiners take the seats", async () => {
+    const sim = await BackgammonSimulator.create(defaultBgConfig());
+    const [pA, pB] = seats();
+    const pC = { sk: bytes32(0x33), addr: userAddress(0x03) };
+    // Joined out of slot order; declared times decide.
+    sim.asPlayer(pA.sk);
+    await sim.join(pA.addr, T0 + 5, T0 + 5, 6);
+    sim.asPlayer(pB.sk);
+    await sim.join(pB.addr, T0 + 1, T0 + 5, 2);
+    sim.asPlayer(pC.sk);
+    await sim.join(pC.addr, T0 + 3, T0 + 5, 4);
+    sim.asOperator();
+    await sim.resolveRoll(T0 + 20);
+    const l = sim.getLedger();
+    assert.equal(l.phase, BG_PHASE.playing);
+    assert.equal(l.stage, STAGE_MOVE, 'the opening is thrown in the same call');
+    assert.equal(l.seatCount, 2n);
+    // The pot is the two seated stakes; the third (pA, the latest) was refunded by this call.
+    assert.equal(l.pot, 20_000n);
+    assert.deepEqual(l.seatIdentity.lookup(0n).addr, pB.addr);
+    assert.deepEqual(l.seatIdentity.lookup(1n).addr, pC.addr);
+    assert.equal(
+      hex(l.pendingEntropy.lookup(0n)),
+      hex(bgForcedEntropyTs(pB.sk, sim.config.tableId, 1)),
+    );
+    // Once started, nobody else can sit down.
+    sim.asPlayer(bytes32(0x44));
+    await rejects(sim.join(userAddress(0x04), T0 + 21), /not filling/);
+  });
+
+  it('breaks a tie on the declared time by the lower slot', async () => {
+    const sim = await BackgammonSimulator.create(defaultBgConfig());
+    const [p0, p1] = seats();
+    sim.asPlayer(p0.sk);
+    await sim.join(p0.addr, T0, T0, 5);
+    sim.asPlayer(p1.sk);
+    await sim.join(p1.addr, T0, T0, 1);
+    sim.asOperator();
+    await sim.resolveRoll(T0 + 10);
+    assert.deepEqual(sim.getLedger().seatIdentity.lookup(0n).addr, p1.addr);
+  });
+
+  it('will not start with fewer than two players', async () => {
+    const sim = await BackgammonSimulator.create(defaultBgConfig());
+    const [p0] = seats();
+    sim.asPlayer(p0.sk);
+    await sim.join(p0.addr, T0);
+    sim.asOperator();
+    await rejects(sim.resolveRoll(T0 + 10), /fewer than two/);
+  });
+
+  it('agrees with the TypeScript reading of the slots', async () => {
+    assert.equal(Number(bgPure.slotCount()), BG_SLOT_COUNT);
+    const sim = await BackgammonSimulator.create(defaultBgConfig());
+    const [p0, p1] = seats();
+    sim.asPlayer(p0.sk);
+    await sim.join(p0.addr, T0 + 2, T0 + 2, 5);
+    sim.asPlayer(p1.sk);
+    await sim.join(p1.addr, T0 + 9, T0 + 9, 1);
+    let l = sim.getLedger();
+    assert.deepEqual(bgHeldSlots(l), [1, 5]);
+    assert.equal(bgPlayerCount(l), 2);
+    assert.equal(bgLastJoinAt(l), BigInt(T0 + 9));
+    assert.equal(bgSlotHeldBy(l, entropyKeyCommitmentTs(sim.config.tableId, p0.sk)), 5);
+    assert.ok(![1, 5].includes(bgRandomFreeSlot(l)!));
+    sim.asOperator();
+    await sim.resolveRoll(T0 + 20);
+    l = sim.getLedger();
+    assert.equal(bgPlayerCount(l), 2, 'the seats, once started');
+  });
+
+  it('refuses a zero payout address', async () => {
+    const sim = await BackgammonSimulator.create(defaultBgConfig());
+    sim.asPlayer(bytes32(0x12));
+    await rejects(sim.join({ bytes: new Uint8Array(32) }, T0), /zero address/);
   });
 
   it('admits only the invite code on a private table', async () => {
@@ -510,7 +604,12 @@ describe('timeouts, resignation and leaving', () => {
   });
 
   it('cannot eliminate a player while the operator owes the roll', async () => {
-    const { sim } = await startedGame();
+    // Played to ply 1's roll: the opening ply is in, and the operator owes the next roll.
+    const { sim, players, mover } = await rolledGame();
+    const dice = diceOf(sim.getLedger());
+    sim.asPlayer(players[mover].sk);
+    await sim.move(Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), dice)[0]!, T0 + 20);
+    assert.equal(sim.getLedger().stage, STAGE_ROLL);
     const deadline = Number(sim.getLedger().deadline);
     sim.asOperator();
     await rejects(sim.eliminate(0, false, deadline + 1), /not past its deadline/);
@@ -518,33 +617,39 @@ describe('timeouts, resignation and leaving', () => {
   });
 
   it('lets a seat resign at any time during play, proving its key', async () => {
-    const { sim, players } = await startedGame();
+    const { sim, players } = await rolledGame();
     sim.asPlayer(players[1].sk);
-    await rejects(sim.eliminate(0, true, T0 + 5), /wrong entropy secret/);
-    await sim.eliminate(1, true, T0 + 5);
+    await rejects(sim.eliminate(0, true, T0 + 15), /wrong entropy secret/);
+    await sim.eliminate(1, true, T0 + 15);
     const l = sim.getLedger();
     assert.equal(l.phase, BG_PHASE.decided);
     assert.equal(l.winner, 0n);
     sim.asOperator();
-    await sim.settle(sim.config.seed, T0 + 6);
+    await sim.settle(sim.config.seed, T0 + 16);
     assert.equal(sim.getLedger().phase, BG_PHASE.settled);
   });
 
-  it('refunds the only seat when it leaves a filling table, and the table stays open', async () => {
+  it('refunds a seat that leaves a filling table and frees its slot for anyone', async () => {
     const sim = await BackgammonSimulator.create(defaultBgConfig());
     const [p0, p1] = seats();
     sim.asPlayer(p0.sk);
-    await sim.join(p0.addr, T0);
-    await sim.eliminate(0, true, T0 + 5);
+    await sim.join(p0.addr, T0, T0, 4);
+    // Leaving names the slot. Someone else's slot cannot be left, and an empty one is refused.
+    sim.asPlayer(p1.sk);
+    await rejects(sim.eliminate(4, true, T0 + 5), /wrong entropy secret/);
+    await rejects(sim.eliminate(3, true, T0 + 5), /wrong entropy secret|empty/);
+    sim.asPlayer(p0.sk);
+    await sim.eliminate(4, true, T0 + 5);
     let l = sim.getLedger();
     assert.equal(l.phase, BG_PHASE.filling);
-    assert.equal(l.seatCount, 0n);
-    assert.equal(l.pot, 0n);
-    assert.equal(l.deadline, 0n);
-    // The same key may sit down again, and so may someone else.
-    await sim.join(p0.addr, T0 + 10);
+    assert.deepEqual(freeSlots(l), [0, 1, 2, 3, 4, 5, 6, 7]);
+    assert.equal(l.slotJoinedAt.lookup(4n), 0n);
+    // The same key may sit down again, in the same slot or another, and so may someone else.
+    await sim.join(p0.addr, T0 + 10, T0 + 10, 4);
     sim.asPlayer(p1.sk);
     await sim.join(p1.addr, T0 + 11);
+    sim.asOperator();
+    await sim.resolveRoll(T0 + 20);
     l = sim.getLedger();
     assert.equal(l.phase, BG_PHASE.playing);
     assert.equal(l.pot, 20_000n);
@@ -563,8 +668,20 @@ describe('aborting', () => {
     assert.equal(sim.getLedger().phase, BG_PHASE.aborted);
   });
 
+  it('refunds every joiner of a table the operator never starts, a table timeout after the last join', async () => {
+    const { sim } = await startedGame(); // joins at T0 and T0 + 1
+    await rejects(sim.abortTable(T0 + 1 + 600), /not stalled/);
+    assert.equal(await sim.abortTable(T0 + 1 + 601), 20_000n);
+    const l = sim.getLedger();
+    assert.equal(l.phase, BG_PHASE.aborted);
+    assert.equal(l.pot, 0n);
+  });
+
   it('refunds both seats when the operator stalls a roll past the grace', async () => {
-    const { sim } = await startedGame();
+    const { sim, players, mover } = await rolledGame();
+    const dice = diceOf(sim.getLedger());
+    sim.asPlayer(players[mover].sk);
+    await sim.move(Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), dice)[0]!, T0 + 20);
     const deadline = Number(sim.getLedger().deadline);
     await rejects(sim.abortTable(deadline + 600), /not stalled/);
     assert.equal(await sim.abortTable(deadline + 601), 20_000n);

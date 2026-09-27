@@ -84,6 +84,32 @@
 // the roll hash: it would let the pair choose among their legal moves to steer that roll.
 //
 // -------------------------------------------------------------------------------------------
+// 6. JOINS DO NOT CONFLICT
+// -------------------------------------------------------------------------------------------
+//
+// A proof is bound to every ledger value its transaction READ, and the node refuses it if any of
+// them moved (per read, not per write -- docs/order-independent-join.md). So a join that read a
+// shared seat counter could never land in the same block as another join. Here a join claims one
+// of `slotCount()` pre-inserted SLOTS, at random (the client picks a free one), and reads nothing
+// but `phase`, constants and its own slot: two joins to different slots touch nothing in common
+// and both land. Two to the same slot both read it, so exactly one lands and the other is refused
+// before inclusion, its stake untouched -- the read is the guard, and it is mandatory: without it
+// both would land and one player's identity would silently overwrite the other's.
+//
+// Nothing shared is counted while the table fills -- no seat counter, no pot, no set of keys --
+// because counting is a read-modify-write. The operator's opening `resolveRoll` is the START: it
+// reads every slot, seats the two EARLIEST joiners (by declared join time, slot breaking ties) as
+// seats 0 and 1, refunds anyone else who joined in the same moment, sets the pot, and throws the
+// opening -- one transaction, the one the operator sent anyway.
+//
+// Consequences, stated: the same secret may sit in two slots (seated twice, it plays itself for
+// its own stake -- the old one-seat-per-key set was the growing structure that made concurrent
+// joins run out of gas, docs/order-independent-join.md "Probe results"); and a join declares its
+// time within `timeSlackSecs()` of block time, so among joiners minutes apart a later one can
+// claim to be up to that much earlier. Only a third joiner, before the start, can lose a seat to
+// that -- and it is refunded in full.
+//
+// -------------------------------------------------------------------------------------------
 // 5. k, AND THE DEPLOY
 // -------------------------------------------------------------------------------------------
 //
@@ -138,6 +164,15 @@ pure circuit minTier(): Uint<64> {
 /** Largest stake, 10^15, so `tier * 2` stays far inside `Uint<64>`. */
 pure circuit maxTier(): Uint<64> {
   return 1000000000000000;
+}
+
+/**
+ * Seat slots a join may claim (section 6). More than the two seats so that two players joining
+ * at once collide only one time in eight; the start seats two and refunds the rest. Must match
+ * the `Vector<8, SlotInfo>` of `allSlots`.
+ */
+export pure circuit slotCount(): Uint<8> {
+  return 8;
 }
 
 /** "Nobody": the value of `winner` until someone has won. */
@@ -201,7 +236,7 @@ export sealed ledger inviteHash: Bytes<32>;
 
 export ledger phase: BgPhase;
 
-/** Seats taken: 0, 1 or 2. The second join starts the game. */
+/** 0 while filling (nothing is counted then -- section 6), 2 from the start. */
 export ledger seatCount: Uint<8>;
 
 /** The seat whose ply it is. Set by the opening roll; meaningless before. */
@@ -242,8 +277,12 @@ export ledger seatIdentity: Map<Uint<8>, SeatIdentity>;
  */
 export ledger pendingEntropy: Map<Uint<8>, Bytes<32>>;
 
-/** Every seat key registered so far, so one secret cannot take both seats. */
-export ledger joinedKeys: Set<Bytes<32>>;
+/** The filling table's slots (section 6): who joined each, its e(1), and its declared time. */
+export ledger slotIdentity: Map<Uint<8>, SeatIdentity>;
+
+export ledger slotEntropy: Map<Uint<8>, Bytes<32>>;
+
+export ledger slotJoinedAt: Map<Uint<8>, Uint<64>>;
 
 /** Sink for the transaction padding. See table.compact section 3. */
 export ledger padStore: Bytes<4096>;
@@ -351,6 +390,67 @@ circuit proveSeat(s: Uint<8>): Bytes<32> {
   return sk;
 }
 
+/** One slot, as the start and the filling abort read it. */
+export struct SlotInfo {
+  slot: Uint<8>,
+  occupied: Boolean,
+  joinedAt: Uint<64>,
+  addr: UserAddress,
+}
+
+circuit slotInfo(i: Uint<8>): SlotInfo {
+  const id = slotIdentity.lookup(i);
+  return SlotInfo { slot: i,
+                    occupied: id.addr != default<UserAddress>,
+                    joinedAt: slotJoinedAt.lookup(i),
+                    addr: id.addr, };
+}
+
+/** Every slot. Read only by the start and the filling abort -- never by a join. */
+circuit allSlots(): Vector<8, SlotInfo> {
+  return [slotInfo(0), slotInfo(1), slotInfo(2), slotInfo(3),
+          slotInfo(4), slotInfo(5), slotInfo(6), slotInfo(7)];
+}
+
+/** The two earliest joiners, how many joined, and when the last did. */
+export struct Pick2 {
+  count: Uint<8>,
+  a: Uint<8>,
+  aKey: Uint<64>,
+  b: Uint<8>,
+  bKey: Uint<64>,
+  latest: Uint<64>,
+}
+
+pure circuit noPick2(): Pick2 {
+  return Pick2 { count: 0, a: 0, aKey: 18446744073709551615, b: 0, bKey: 18446744073709551615,
+                 latest: 0 };
+}
+
+/** Earlier declared join first; the slot index breaks a tie, so the order is total. */
+pure circuit pickTwo(acc: Pick2, s: SlotInfo): Pick2 {
+  const key = (s.joinedAt * 16 + s.slot) as Uint<64>;
+  const beforeA = key < acc.aKey;
+  const beforeB = key < acc.bKey;
+  return !s.occupied
+           ? acc
+           : Pick2 { count: (acc.count + 1) as Uint<8>,
+                     a: beforeA ? s.slot : acc.a,
+                     aKey: beforeA ? key : acc.aKey,
+                     b: beforeA ? acc.a : (beforeB ? s.slot : acc.b),
+                     bKey: beforeA ? acc.aKey : (beforeB ? key : acc.bKey),
+                     latest: s.joinedAt > acc.latest ? s.joinedAt : acc.latest, };
+}
+
+/** Refund every occupied slot, except the two seated ones when `keep`. */
+circuit refundSlots(slots: Vector<8, SlotInfo>, keepA: Uint<8>, keepB: Uint<8>, keep: Boolean): [] {
+  for (const s of slots) {
+    if (s.occupied && !(keep && (s.slot == keepA || s.slot == keepB))) {
+      sendUnshielded(nativeToken(), tier as Uint<128>, right<ContractAddress, UserAddress>(s.addr));
+    }
+  }
+}
+
 // ===========================================================================================
 // Constructor
 // ===========================================================================================
@@ -390,7 +490,7 @@ constructor(id: Bytes<32>,
   dice = BgDice { a: 0, b: 0 };
   board = Board { s0: bgInitialSide(), s1: bgInitialSide() };
   lastPly = default<Ply>;
-  // Stays 0 until the first join, so an empty table has no fill clock and cannot be aborted.
+  // Stays 0 until the start: a filling table's clock is its latest join (see `abortTable`).
   deadline = 0;
   pot = 0;
   winner = noWinner();
@@ -405,6 +505,16 @@ constructor(id: Bytes<32>,
       );
     pendingEntropy.insert(s as Uint<8>, default<Bytes<32>>);
   }
+  // Every slot pre-inserted: a join then overwrites one cell of a fixed size, so its cost does
+  // not depend on how many others joined first (the gas trap of docs/order-independent-join.md).
+  for (const s of 0..8) {
+    slotIdentity.insert(
+      s as Uint<8>,
+      SeatIdentity { addr: default<UserAddress>, keyCommit: default<Bytes<32>> }
+      );
+    slotEntropy.insert(s as Uint<8>, default<Bytes<32>>);
+    slotJoinedAt.insert(s as Uint<8>, 0);
+  }
 }
 
 // ===========================================================================================
@@ -412,50 +522,41 @@ constructor(id: Bytes<32>,
 // ===========================================================================================
 
 /**
- * Take the next seat, stake `tier`, register the seat key and reveal its e(1).
+ * Claim `slot`, stake `tier`, register the seat key and reveal its e(1).
  *
- * The second join starts the game: the operator owes the opening roll, and has a move timeout
- * (plus the table grace) to make it. Two simultaneous joins both read `seatCount`, so exactly
- * one lands -- the silent lost write of docs/concurrency-probe.md cannot happen.
+ * Reads `phase`, constants and this slot, and nothing else (section 6), so joins to different
+ * slots land together. The game starts with the operator's opening roll, not with a join: a join
+ * cannot know it is the second without reading what the other joins wrote.
  */
-export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
+export circuit join(slot: Uint<8>, payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   assert(phase == BgPhase.filling, "join: table is not filling");
-  assert(seatCount < 2, "join: table is full");
 
+  const s = disclose(slot);
   const t = disclose(now);
   const who = disclose(payoutTo);
+  assert(s < slotCount(), "join: no such seat");
   pinTime(t);
   assert(who != default<UserAddress>, "join: payout address must not be the zero address");
+  // THE GUARD: two joins to one slot both read it, so exactly one lands.
+  assert(slotIdentity.lookup(s).addr == default<UserAddress>,
+         "join: that seat was taken a moment ago -- pick another"
+         );
 
   const sk = playerEntropySecret();
   const commit = disclose(entropyKeyCommitment(tableId, sk));
-  assert(!joinedKeys.member(commit), "join: this entropy key already holds a seat");
 
   const code = inviteCode();
   assert(disclose(inviteHash == default<Bytes<32>> || inviteCommitment(code) == inviteHash),
          "join: this table is private -- the invite code does not match"
          );
 
-  const seat = seatCount;
-  seatIdentity.insert(seat, SeatIdentity { addr: who, keyCommit: commit });
-  joinedKeys.insert(commit);
-  pendingEntropy.insert(seat, disclose(bgForcedEntropy(sk, tableId, 1)));
-
+  slotIdentity.insert(s, SeatIdentity { addr: who, keyCommit: commit });
+  slotEntropy.insert(s, disclose(bgForcedEntropy(sk, tableId, 1)));
+  slotJoinedAt.insert(s, t);
   receiveUnshielded(nativeToken(), tier as Uint<128>);
-  pot = (pot + tier) as Uint<64>;
-  seatCount = (seat + 1) as Uint<8>;
-
-  if (seat == 1) {
-    phase = BgPhase.playing;
-    stage = stageRoll();
-    turn = 0;
-    deadline = (t + moveTimeoutSecs) as Uint<64>;
-  } else {
-    deadline = (t + tableTimeoutSecs) as Uint<64>;
-  }
 
   padTransaction();
-  return seat;
+  return s;
 }
 
 // ===========================================================================================
@@ -469,8 +570,10 @@ export circuit join(payoutTo: UserAddress, now: Uint<64>): Uint<8> {
  * opening, the seat with the higher die moves first and plays both numbers.
  */
 export circuit resolveRoll(now: Uint<64>): BgDice {
-  assert(phase == BgPhase.playing, "resolveRoll: table is not playing");
-  assert(stage == stageRoll(), "resolveRoll: no roll is owed");
+  // A filling table is started by this call (section 6); a playing one must owe the roll.
+  const starting = phase == BgPhase.filling;
+  assert(starting || phase == BgPhase.playing, "resolveRoll: table is not playing");
+  assert(starting || stage == stageRoll(), "resolveRoll: no roll is owed");
 
   const t = disclose(now);
   pinRollTime(t);
@@ -480,11 +583,30 @@ export circuit resolveRoll(now: Uint<64>): BgDice {
          "resolveRoll: seed does not open the table's seed commitment"
          );
 
-  const n = turn;
+  // ---- the start: seat the two earliest joiners, refund anyone else -------------------------
+  const slots = allSlots();
+  const p = fold(pickTwo, noPick2(), slots);
+  assert(!starting || p.count >= 2, "resolveRoll: fewer than two players have joined");
+  const sa = slotIdentity.lookup(p.a);
+  const sb = slotIdentity.lookup(p.b);
+  const ea = slotEntropy.lookup(p.a);
+  const eb = slotEntropy.lookup(p.b);
+  if (starting) {
+    seatIdentity.insert(0, sa);
+    seatIdentity.insert(1, sb);
+    pendingEntropy.insert(0, ea);
+    pendingEntropy.insert(1, eb);
+    refundSlots(slots, p.a, p.b, true);
+    pot = (tier * 2) as Uint<64>;
+    seatCount = 2;
+    phase = BgPhase.playing;
+  }
+
+  const n = starting ? 0 : turn;
   const opening = n == 0;
   const mover = toMove;
-  const e0 = pendingEntropy.lookup(0);
-  const e1 = pendingEntropy.lookup(1);
+  const e0 = starting ? ea : pendingEntropy.lookup(0);
+  const e1 = starting ? eb : pendingEntropy.lookup(1);
   // The opening hashes seat 0's and seat 1's e(1); a ply hashes the mover's and the opponent's.
   const mine = opening || mover == 0 ? e0 : e1;
   const theirs = opening || mover == 0 ? e1 : e0;
@@ -565,27 +687,30 @@ export circuit move(ply: Vector<4, SubMove>, count: Uint<8>): Uint<16> {
 export circuit eliminate(seat: Uint<8>, voluntary: Boolean): Uint<8> {
   const s = disclose(seat);
   const vol = disclose(voluntary);
-  assert(s < seatCount, "eliminate: no such seat");
+  const filling = phase == BgPhase.filling;
+  const playing = phase == BgPhase.playing;
+  // While filling, `seat` names a SLOT (leaving it); in play, seat 0 or 1.
+  assert(filling ? s < slotCount() : s < seatCount, "eliminate: no such seat");
 
   const sk = playerEntropySecret();
-  const who = seatIdentity.lookup(s);
+  const who = filling ? slotIdentity.lookup(s < slotCount() ? s : 0)
+                      : seatIdentity.lookup(s < 2 ? s : 0);
+  assert(!filling || who.addr != default<UserAddress>, "eliminate: that seat is empty");
   assert(disclose(!vol || entropyKeyCommitment(tableId, sk) == who.keyCommit),
          "eliminate: wrong entropy secret for this seat"
          );
 
-  const filling = phase == BgPhase.filling;
-  const playing = phase == BgPhase.playing;
   const timedOut = playing && !vol && stage == stageMove() && s == toMove && blockTimeGt(deadline);
   assert((filling && vol) || (playing && vol) || timedOut,
          "eliminate: this seat is not past its deadline, and is not leaving of its own accord"
          );
 
   if (filling) {
+    // Leaving empties the slot for someone else, and reads nothing another join writes.
     sendUnshielded(nativeToken(), tier as Uint<128>, right<ContractAddress, UserAddress>(who.addr));
-    pot = (pot - tier) as Uint<64>;
-    joinedKeys.remove(who.keyCommit);
-    seatCount = 0;
-    deadline = 0;
+    slotIdentity.insert(s, SeatIdentity { addr: default<UserAddress>, keyCommit: default<Bytes<32>> });
+    slotEntropy.insert(s, default<Bytes<32>>);
+    slotJoinedAt.insert(s, 0);
   } else {
     winner = (1 - s) as Uint<8>;
     phase = BgPhase.decided;
@@ -651,8 +776,13 @@ export circuit settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8> {
  *     deadline. Requiring stage 0 is load-bearing: see section 3.
  */
 export circuit abortTable(): Uint<64> {
-  const n = seatCount;
-  const fillingStalled = phase == BgPhase.filling && n > 0 && blockTimeGt(deadline);
+  const filling = phase == BgPhase.filling;
+  const slots = allSlots();
+  const p = fold(pickTwo, noPick2(), slots);
+  // Filling: nobody new has joined for a whole table timeout -- a lone player waiting, or a full
+  // table the operator never started (section 6).
+  const fillingStalled =
+          filling && p.count > 0 && blockTimeGt((p.latest + tableTimeoutSecs) as Uint<64>);
   const operatorStalled =
           phase == BgPhase.playing &&
           stage == stageRoll() &&
@@ -661,14 +791,18 @@ export circuit abortTable(): Uint<64> {
          "abortTable: the table is not stalled past its deadline"
          );
 
+  // While filling, nothing counted the stakes (section 6): the slots are the account of them.
+  // After the start the seated players are still in their slots, so those are refunded as SEATS
+  // and the slots are not touched -- refunding both would pay them twice.
   assertCustody();
-
-  sendUnshielded(
-    nativeToken(),
-    tier as Uint<128>,
-    right<ContractAddress, UserAddress>(seatIdentity.lookup(0).addr)
-    );
-  if (n == 2) {
+  if (filling) {
+    refundSlots(slots, 0, 0, false);
+  } else {
+    sendUnshielded(
+      nativeToken(),
+      tier as Uint<128>,
+      right<ContractAddress, UserAddress>(seatIdentity.lookup(0).addr)
+      );
     sendUnshielded(
       nativeToken(),
       tier as Uint<128>,
@@ -676,7 +810,7 @@ export circuit abortTable(): Uint<64> {
       );
   }
 
-  const refunded = pot;
+  const refunded = filling ? (tier * (p.count as Uint<64>)) as Uint<64> : pot;
   pot = 0;
   finalDigest =
     finalDigestOf(tableId, BgPhase.aborted as Uint<8>, noWinner(), turn, 0, 0, false, board);

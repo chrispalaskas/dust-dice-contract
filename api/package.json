@@ -1,6 +1,6 @@
 {
   "name": "@dust-dice/api",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "type": "module",
   "description": "Contract interaction layer + pure game rules. No React imports — framework-swap seam. The './node' entry carries wallet/provider plumbing and must never be imported from browser code.",
   "main": "dist/index.js",
