@@ -54,12 +54,6 @@ export interface RevealInputs {
   turn: RevealTurn;
   /** The seat's answer cell for the roll `turn.stage` is asking about. */
   cell: RevealCell;
-  /**
-   * The blinding to unblind with. Derived from the secret and the roll's position when omitted
-   * (`deriveBlinding`, what every client uses); a caller that blinded with something else -- the
-   * contract simulator's tests do -- passes it.
-   */
-  rho?: bigint;
 }
 
 export interface Reveal {
@@ -84,15 +78,15 @@ export function revealFor(inputs: RevealInputs): Reveal | null {
   if (Number(turn.stage) === STAGE.idle || !answered(turn, cell)) return null;
   const index = askedIndex(turn.stage);
   const priorHold = index === 0 ? NO_HOLD : [...(index === 1 ? turn.hold1 : turn.hold2).bits];
-  const rho =
-    inputs.rho ??
-    deriveBlinding({
-      seatSecret,
-      tableId,
-      round: turn.round,
-      rollIndex: BigInt(index),
-      holdMask: packHoldMask(priorHold),
-    });
+  // The contract derives the same blinding to check the reveal (table.compact `playerMove`),
+  // so no other one could be used.
+  const rho = deriveBlinding({
+    seatSecret,
+    tableId,
+    round: turn.round,
+    rollIndex: BigInt(index),
+    holdMask: packHoldMask(priorHold),
+  });
   const gamma = unblind(cell.response, rho);
   const digest = rollDigest(gamma);
   const round = Number(turn.round);

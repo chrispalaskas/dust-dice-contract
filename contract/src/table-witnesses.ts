@@ -41,13 +41,12 @@ export type TablePrivateState = {
   /** A private table's invite code. 32 bytes. Joiner only; zeros on a public table. */
   readonly inviteCode: Uint8Array;
   /**
-   * The blinding factor for the roll the player is about to reveal. Player only.
+   * The unblinded VRF output for the roll being revealed, `Gamma = rho^-1 * S`. Player only.
    *
-   * UNLIKE THE OTHER TWO, THIS ROTATES. A fresh one per roll — reusing a blinding across two
-   * rolls would let the operator link the two queries. The client sets it before each reveal.
+   * UNLIKE THE OTHER TWO, THIS ROTATES: the client sets it before each reveal. The blinding
+   * `rho` behind it is not held here -- both contracts derive it in the circuit from the seat
+   * secret and the roll's position (`deriveBlinding` in vrf.ts is its twin).
    */
-  readonly vrfBlinding: bigint;
-  /** The unblinded VRF output for the roll being revealed, `Gamma = rho^-1 * S`. Player only. */
   readonly vrfGamma: JubjubPoint;
 };
 
@@ -65,14 +64,12 @@ export function createTablePrivateState(
   parts: {
     playerSecret?: Uint8Array;
     inviteCode?: Uint8Array;
-    vrfBlinding?: bigint;
     vrfGamma?: JubjubPoint;
   } = {},
 ): TablePrivateState {
   return {
     playerSecret: requireBytes32('playerSecret', parts.playerSecret ?? THIRTY_TWO_ZEROS()),
     inviteCode: requireBytes32('inviteCode', parts.inviteCode ?? THIRTY_TWO_ZEROS()),
-    vrfBlinding: parts.vrfBlinding ?? 1n,
     vrfGamma: parts.vrfGamma ?? NO_GAMMA,
   };
 }
@@ -101,21 +98,11 @@ export const tableWitnesses = {
   ],
 
   /**
-   * The blinding factor for the roll this move reveals.
-   *
-   * The operator has NO witness here any more. It used to hold `rollSeed`, and knowledge of
-   * that preimage was its authority; its authority is now the DLEQ it publishes with each
-   * answer, which is checked on chain against the sealed public key.
-   */
-  vrfBlinding: <L>({
-    privateState,
-  }: WitnessContext<L, TablePrivateState>): [TablePrivateState, bigint] => [
-    privateState,
-    privateState.vrfBlinding,
-  ],
-
-  /**
    * The unblinded VRF output for the roll this move reveals.
+   *
+   * The operator has NO witness at all. It used to hold `rollSeed`, and knowledge of that
+   * preimage was its authority; its authority is now the DLEQ it publishes with each answer,
+   * which is checked on chain against the sealed public key.
    *
    * A wrong value here does not corrupt a game, it produces no transaction: the circuit proves
    * `S == rho*Gamma` against the response the operator already put on chain.

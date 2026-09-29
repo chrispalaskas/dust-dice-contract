@@ -17,7 +17,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { TableSimulator, diceToArray, userAddress, ZERO_BYTES32 } from './simulator.ts';
+import {
+  MOVE_OPEN,
+  MOVE_SCORE,
+  NO_MASK,
+  TableSimulator,
+  diceToArray,
+  userAddress,
+  ZERO_BYTES32,
+} from './simulator.ts';
+import { NO_GAMMA } from '../table-witnesses.ts';
 import * as vrf from '../vrf.ts';
 import { pureCircuits } from '../managed/table/contract/index.js';
 
@@ -148,6 +157,41 @@ describe('a turn played through the blind VRF', () => {
     const again = vrf.evaluate(SECRET, q1);
     assert.ok(vrf.samePoint(again.proof.a1, e1.proof.a1), 'same query must be deterministic');
     assert.equal(again.proof.z, e1.proof.z, 'same query must reproduce the same z');
+  });
+
+  it('refuses a reveal against the identity query: rho is derived, so it is never zero', async () => {
+    // The exploit this closes (found 2026-09-27, confirmed at proof level): while `rho` was a
+    // free witness, a seat could post the IDENTITY as its query, get the identity back from an
+    // honest operator (x * 0 = 0, with a valid DLEQ), and pass both unblinding checks with
+    // rho = 0 and ANY Gamma -- dice of its own choosing, with nobody's help.
+    const sim = await TableSimulator.create(config());
+    const skA = bytes32(0xa1);
+    sim.asPlayer(skA);
+    await sim.join(userAddress(0x01), 1_000);
+    sim.asPlayer(bytes32(0xb2));
+    await sim.join(userAddress(0x02), 1_010);
+    await sim.start(1_010);
+
+    sim.asPlayer(skA);
+    const round = sim.getLedger().openRound;
+    const entropy = pureCircuits.forcedEntropy(skA, config().tableId, round);
+    await sim.playerMove(0, MOVE_OPEN, entropy, NO_MASK(), 0, NO_GAMMA); // B = the identity
+    assert.ok(vrf.samePoint(sim.getLedger().seatTurn.lookup(0n).blinded, NO_GAMMA));
+
+    // The operator cannot tell a blinded point from any other, so it answers: S = x * 0 = 0.
+    sim.asOperator();
+    await sim.resolveRoll(0);
+    const cell = sim.getLedger().vrfAnswer.lookup(vrf.answerKey(0, 0));
+    assert.ok(vrf.samePoint(cell.response, NO_GAMMA));
+
+    // Any Gamma the player likes. With rho derived in the circuit, `rho * P` is not the
+    // identity, so the query on chain is refused as not this seat's.
+    sim.asPlayer(skA);
+    sim.privateState = { ...sim.privateState, vrfGamma: pureCircuits.vrfGeneratorMul(4242n) };
+    await assert.rejects(
+      () => sim.playerMove(0, MOVE_SCORE, ZERO_BYTES32(), NO_MASK(), 6, NO_GAMMA),
+      /not this seat's input point blinded/,
+    );
   });
 
   it("refuses an answer that is not this table's VRF", async () => {

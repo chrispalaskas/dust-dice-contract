@@ -46,14 +46,8 @@ describe('revealFor agrees with the contract on every roll', () => {
       const led = sim.getLedger();
       const turn = led.seatTurn.lookup(BigInt(seat));
       const cell = led.vrfAnswer.lookup(vrf.answerKey(seat, vrf.askedIndex(turn.stage)));
-      // The simulator blinds with its own counter, not the derived rho -- pass it.
-      const r = revealFor({
-        tableId: config().tableId,
-        seatSecret: skA,
-        turn,
-        cell,
-        rho: sim.blindings.get(seat),
-      });
+      // The simulator blinds with the derived rho, as every client does: nothing to pass.
+      const r = revealFor({ tableId: config().tableId, seatSecret: skA, turn, cell });
       return r === null ? null : r.dice;
     };
 
@@ -107,15 +101,6 @@ describe('revealFor agrees with the contract on every roll', () => {
     sim.asOperator();
     await sim.resolveRollRaw(0, 0, 9n, turn.blinded); // right query, wrong round
     const cell = sim.getLedger().vrfAnswer.lookup(vrf.answerKey(0, 0));
-    assert.equal(
-      revealFor({
-        tableId: config().tableId,
-        seatSecret: skA,
-        turn,
-        cell,
-        rho: sim.blindings.get(0),
-      }),
-      null,
-    );
+    assert.equal(revealFor({ tableId: config().tableId, seatSecret: skA, turn, cell }), null);
   });
 });

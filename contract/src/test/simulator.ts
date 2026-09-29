@@ -561,18 +561,6 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   /** The secret of whoever `asPlayer` last made current. */
   actingSecret: Uint8Array = new Uint8Array(32);
 
-  /** A fresh blinding. Deterministic per call so a failing test replays identically. */
-  #nextBlinding(): bigint {
-    this.blindingCounter += 1n;
-    return vrf.randomScalar(
-      Uint8Array.from(
-        { length: 48 },
-        (_, i) => Number((this.blindingCounter * 1315423911n + BigInt(i * 7 + 1)) % 251n) + 1,
-      ),
-    );
-  }
-  blindingCounter = 0n;
-
   /**
    * The query for the roll a move is about to unlock, and the blinding kept to unblind it.
    *
@@ -587,7 +575,14 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     holdMask: boolean[],
   ): { blinded: JubjubPoint; rho: bigint } {
     void seat;
-    const rho = this.#nextBlinding();
+    // The blinding every client uses, and the one `playerMove` derives to check the reveal.
+    const rho = vrf.deriveBlinding({
+      seatSecret: this.actingSecret,
+      tableId: this.config.tableId,
+      round,
+      rollIndex,
+      holdMask: BigInt(packMask(holdMask)),
+    });
     const { blinded } = vrf.blindQuery({
       tableId: this.config.tableId,
       round,
@@ -635,7 +630,6 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         : led.vrfAnswer.lookup(vrf.answerKey(seat, vrf.askedIndex(t.stage)));
     this.privateState = {
       ...this.privateState,
-      vrfBlinding: rho ?? 1n,
       vrfGamma:
         rho === undefined || cell === undefined ? NO_GAMMA : vrf.unblind(cell.response, rho),
     };

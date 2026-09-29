@@ -1030,19 +1030,11 @@ witness playerEntropySecret(): Bytes<32>;
 witness inviteCode(): Bytes<32>;
 
 /**
- * The player's blinding factor for the roll it is about to reveal.
- *
- * Fresh and random per roll, chosen in the browser and never sent anywhere. It is what stops
- * the operator recognising the point it was asked to evaluate: it sees `B = rho*P` and, with
- * `rho` uniform, that tells it nothing about `P`.
- */
-witness vrfBlinding(): Field;
-
-/**
  * The unblinded VRF output for the roll being revealed: `Gamma = rho^-1 * S = x * P`.
  *
  * Computed in the browser from the operator's on-chain response. The contract never inverts a
- * scalar — it checks `S == rho*Gamma`, which says the same thing.
+ * scalar — it checks `S == rho*Gamma`, which says the same thing. `rho` itself is NOT a
+ * witness: `playerMove` derives it (`vrfBlindingFor`), see the reveal there.
  */
 witness vrfGamma(): JubjubPoint;
 
@@ -1839,7 +1831,14 @@ export circuit playerMove(
   //
   // Together they say: this Gamma is `x*P` for this exact roll, and the operator's DLEQ at
   // resolve time already said the `x` was the sealed one. The dice follow from Gamma alone.
-  const rho = vrfBlinding();
+  //
+  // `rho` IS DERIVED HERE, from the seat secret and the roll's position -- the same
+  // `vrfBlindingFor` every client blinds with -- and never taken from the prover. As a free
+  // witness it let a player pick its own dice without anyone's help: post the identity as its
+  // query (`B = 0*P`), and the honest operator's answer is the identity too (`S = x*0`, with a
+  // valid DLEQ), so checks 3 and 4 hold for `rho = 0` and ANY Gamma the player grinds for
+  // (found 2026-09-27 on backgammon-vrf, confirmed at proof level). A derived `rho` is a hash,
+  // non-zero but with negligible probability, and pins the query to exactly one point.
   const gamma = vrfGamma();
   const revealIndex = askedIndex(pend.stage);
   // The hold that the roll being revealed was taken UNDER. Roll 1 is taken under no hold, so
@@ -1847,6 +1846,7 @@ export circuit playerMove(
   const priorHold = pend.stage == stageAskedRoll1()
                       ? default<Vector<5, Boolean>>
                       : (pend.stage == stageAskedRoll2() ? pend.hold1.bits : pend.hold2.bits);
+  const rho = vrfBlindingFor(sk, tableId, pend.round, revealIndex, packHoldMask(priorHold));
   // An idle seat (an open) reads the never-written sentinel cell instead of a real one.
   const answer = vrfAnswer.lookup(between ? answerKey(s, revealIndex) : noAnswerKey());
   assert(!between || (answer.round == pend.round && answer.blinded == pend.blinded),
