@@ -185,6 +185,10 @@ export class BaseSimulator<PS> {
    */
   readonly gasCost = new Map<string, unknown>();
 
+  /** What the last circuit claimed to spend and receive -- its payouts are here. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  lastEffects: any;
+
   /** Run a generated circuit and commit its resulting ledger and private state. */
   async run<R>(
     circuitId: string,
@@ -193,6 +197,10 @@ export class BaseSimulator<PS> {
     const res = await call(this.context(circuitId));
     if ('gasCost' in res) this.gasCost.set(circuitId, (res as { gasCost: unknown }).gasCost);
     this.state = res.context.callContext.currentQueryContext.state;
+    // `effects` is on the runtime's QueryContext but not on the type this generic sees.
+    this.lastEffects = (
+      res.context.callContext.currentQueryContext as unknown as { effects: unknown }
+    ).effects;
     if (res.context.callContext.currentPrivateState !== undefined) {
       this.privateState = res.context.callContext.currentPrivateState;
     }
@@ -633,9 +641,25 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     };
   }
 
-  join(payoutTo: UserAddress, now: number, blockTime = now): Promise<bigint> {
+  /**
+   * Claim a slot (table.compact section 9) -- the lowest free one unless `slot` says which.
+   * Returns the slot; the seat is the start's to give.
+   */
+  join(payoutTo: UserAddress, now: number, blockTime = now, slot?: number): Promise<bigint> {
     this.blockTime = blockTime;
-    return this.run('join', (ctx) => this.table.impureCircuits.join(ctx, payoutTo, BigInt(now)));
+    const at = slot ?? this.lowestFreeSlot();
+    return this.run('join', (ctx) =>
+      this.table.impureCircuits.join(ctx, BigInt(at), payoutTo, BigInt(now)),
+    );
+  }
+
+  /** The lowest slot nobody holds, or 0 on a started table (where a join is refused anyway). */
+  lowestFreeSlot(): number {
+    const led = this.getLedger();
+    for (let i = 0; i < 6; i++) {
+      if (led.seatIdentity.lookup(BigInt(i)).addr.bytes.every((b) => b === 0)) return i;
+    }
+    return 0;
   }
 
   /**
@@ -827,6 +851,15 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
     return this.run('abortTable', (ctx) =>
       this.table.impureCircuits.abortTable(ctx, q, rem, BigInt(now)),
     );
+  }
+
+  /**
+   * The start (table.compact section 9): `abortTable` on a full filling table, as the operator
+   * sends it -- a join can no longer start a table. The rake split is required but unused.
+   */
+  start(blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+    const tier = this.config.tier;
+    return this.abortTable(tier / 100n, tier % 100n, blockTime);
   }
 }
 

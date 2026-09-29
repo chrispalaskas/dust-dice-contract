@@ -27,6 +27,7 @@ import * as Rules from '../../../api/src/backgammon.ts';
 import {
   bgAnswer,
   bgMyRoll,
+  bgOpeningPointTs,
   bgQueryFor,
   bgReplayOpening,
   bgReplayRoll,
@@ -35,6 +36,7 @@ import {
   type BgDiceTs,
   type BgJoinEntropies,
 } from '../bg-mirror.ts';
+import { bgStartPick } from '../bg-slots.ts';
 import { entropyKeyCommitmentTs } from '../policy-mirror.ts';
 import {
   createTablePrivateState,
@@ -144,21 +146,34 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
     return this.sk ? bgQueryFor(this.sk, this.config.tableId, turn) : NO_GAMMA;
   }
 
+  /** Claim `slot` (the lowest free one when omitted, so tests stay deterministic). */
   join(
     payoutTo: UserAddress,
     now: number,
     blockTime = now,
+    slot: number = freeSlots(this.getLedger())[0] ?? 0,
     firstQuery = this.queryFor(1),
   ): Promise<bigint> {
     this.blockTime = blockTime;
     return this.run('join', (ctx) =>
-      this.bg.impureCircuits.join(ctx, payoutTo, BigInt(now), firstQuery),
+      this.bg.impureCircuits.join(ctx, BigInt(slot), payoutTo, BigInt(now), firstQuery),
     );
   }
 
-  /** The point the operator owes an answer to, read off the ledger as the daemon reads it. */
+  /**
+   * The point the operator owes an answer to, read off the ledger as the daemon reads it: at a
+   * filling table the opening, from the two joiners `start` will seat; after it the mover's query.
+   */
   owedPoint(): JubjubPoint {
     const l = this.getLedger();
+    if (Number(l.phase) === BG_PHASE.filling) {
+      const pick = bgStartPick(l);
+      if (!pick) throw new Error('owedPoint: fewer than two players have joined');
+      return bgOpeningPointTs(this.config.tableId, [
+        l.joinSlots.lookup(BigInt(pick[0])).entropy,
+        l.joinSlots.lookup(BigInt(pick[1])).entropy,
+      ]);
+    }
     return bgResolvePoint({
       tableId: this.config.tableId,
       turn: l.turn,
@@ -172,12 +187,27 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
     return bgAnswer(secret, this.owedPoint());
   }
 
-  resolveRoll(now: number, blockTime = now, answer?: BgAnswer): Promise<{ a: bigint; b: bigint }> {
+  /** The start: seat the two earliest joiners and throw the opening. */
+  start(now: number, blockTime = now, answer?: BgAnswer): Promise<{ a: bigint; b: bigint }> {
+    this.blockTime = blockTime;
+    const { response, proof } = answer ?? this.answer();
+    return this.run('start', (ctx) =>
+      this.bg.impureCircuits.start(ctx, BigInt(now), response, proof.a1, proof.a2, proof.z),
+    );
+  }
+
+  resolveRoll(now: number, blockTime = now, answer?: BgAnswer): Promise<[]> {
     this.blockTime = blockTime;
     const { response, proof } = answer ?? this.answer();
     return this.run('resolveRoll', (ctx) =>
       this.bg.impureCircuits.resolveRoll(ctx, BigInt(now), response, proof.a1, proof.a2, proof.z),
     );
+  }
+
+  /** Whatever the operator owes: the start at a filling table, else the mover's roll. */
+  async roll(now: number, blockTime = now): Promise<void> {
+    if (Number(this.getLedger().phase) === BG_PHASE.filling) await this.start(now, blockTime);
+    else await this.resolveRoll(now, blockTime);
   }
 
   /**
@@ -264,6 +294,18 @@ export function joinOf(ledger: BgLedger): BgJoinEntropies {
   return [ledger.joinEntropy.lookup(0n), ledger.joinEntropy.lookup(1n)];
 }
 
+/** How many slots a filling table has (the contract's `slotCount()`). */
+export const SLOT_COUNT = 8;
+
+/** The slots nobody holds, in index order. */
+export function freeSlots(ledger: BgLedger): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < SLOT_COUNT; i++) {
+    if (ledger.joinSlots.lookup(BigInt(i)).addr.bytes.every((b) => b === 0)) out.push(i);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------------------------
 // A whole game
 // ---------------------------------------------------------------------------------------------
@@ -288,7 +330,7 @@ export function rng(seed: number): () => number {
   };
 }
 
-/** Seat both players at `t`, the second join starting the game. */
+/** Seat both players at `t`: two joins; the operator's `start` then seats them. */
 export async function seatBoth(sim: BackgammonSimulator, players: [Seat, Seat], t: number) {
   sim.asPlayer(players[0].sk);
   await sim.join(players[0].addr, t);
@@ -325,7 +367,7 @@ export async function playOut(
     const turn = Number(sim.getLedger().turn);
     sim.asOperator();
     t += 5;
-    await sim.resolveRoll(t);
+    await sim.roll(t);
     const rolled = sim.getLedger();
     const mover = Number(rolled.toMove);
 

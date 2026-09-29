@@ -48,6 +48,7 @@ describe('a turn played through the blind VRF', () => {
     await sim.join(userAddress(0x01), 1_000);
     sim.asPlayer(skB);
     await sim.join(userAddress(0x02), 1_010);
+    await sim.start(1_010);
 
     const seat = 0;
     sim.asPlayer(skA);
@@ -156,6 +157,7 @@ describe('a turn played through the blind VRF', () => {
     await sim.join(userAddress(0x01), 1_000);
     sim.asPlayer(bytes32(0xb2));
     await sim.join(userAddress(0x02), 1_010);
+    await sim.start(1_010);
 
     sim.asPlayer(skA);
     const round = sim.getLedger().openRound;

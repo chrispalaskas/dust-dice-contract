@@ -91,11 +91,40 @@ dice  = ladder(H(8*Gamma, e, t))      e = the secret the previous move revealed
 - `settle` reveals `x` (checked against `PK`), so anyone can replay every roll from the public
   log: each move revealed its `v`, so `Gamma = x*P` is computable after the fact.
 
+## Joining: two players at once
+
+A proof is bound to every ledger value its transaction read, so a join that counted seats could
+never land in the same block as another join (seen live: the second player was turned away and
+had to approve again). Since 0.4.6 a join claims one of **eight seat slots**, at random, and
+reads only `phase`, constants and that slot:
+
+- Joins to different slots touch nothing in common and land together. Measured on the ledger-8
+  devnet on 2026-09-27: two wallets, built against one state, landed in one block (slots 3 and 1).
+- Joins to the same slot (1 in 8 for two at once) both read it: one lands, the other is refused
+  (`ReadMismatch`; on ledger 8 an included `FailFallible`, fee spent, stake untouched) and the
+  client retries with another free slot.
+- Nothing is counted while filling: no seat counter, no pot, no set of keys (the growing set is
+  what ran concurrent joins out of gas in docs/order-independent-join.md). One secret may hold
+  two slots.
+- The operator's `start` circuit is the **start**: it seats the two earliest joiners (by declared
+  join time, the lower slot breaking a tie) as seats 0 and 1, refunds anyone else, sets the pot
+  and throws the opening, all in one transaction. On ledger 9 it is a circuit of its own (k=16,
+  once a game) rather than a branch of `resolveRoll`, which would otherwise be k=16 for every
+  roll; `resolveRoll` is k=12.
+- On ledger 9 a slot also holds the joiner's blinded query for ply 1, and the slots are ONE map
+  of records (`joinSlots`) rather than one map per field: four maps of eight put the deploy over
+  the node's block limit.
+- A filling table's clock is its latest join: `abortTable` refunds every slot once nobody has
+  joined for a table timeout. `eliminate(slot, true)` leaves and frees the slot.
+
+`bg-slots.ts` is the one reading of the slots for every client (the operator, CLI, website,
+verifiers): `bgPlayerCount`, `bgHeldSlots`, `bgRandomFreeSlot`, `bgSlotHeldBy`, `bgLastJoinAt`.
+
 ## Time
 
 The kernel has block-time predicates only.
 
-- **Declaring time:** `join` and `resolveRoll` declare `now`. `join` is pinned within 120 s of block time, for the wallet prompt. The operator's `resolveRoll` is pinned within 60 s.
+- **Declaring time:** `join`, `start` and `resolveRoll` declare `now`. `join` is pinned within 120 s of block time, for the wallet prompt. The operator's `resolveRoll` is pinned within 60 s.
 - **The move clock is a guaranteed minimum.** The roll stamps `deadline = now + 60 + moveTimeout`, a slack ahead of what it declared. However far behind the operator declares, the player has at least `moveTimeout` from the block its dice landed in. An honest operator trails by a few blocks, so in practice it is a little more. This is why the clock can be three minutes; the Yacht table's 240 s floor exists because its deadlines are not stamped ahead. The floor here is two minutes, the time to prove, approve and land a move.
 - **`move` is time-checked but declares nothing:** it is refused once a whole move timeout has passed since the deadline. That guarantees the operator at least `tableTimeout − moveTimeout` to roll. The constructor requires that margin to exceed the 240 s floor.
 

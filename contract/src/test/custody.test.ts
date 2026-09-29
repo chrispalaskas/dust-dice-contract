@@ -11,19 +11,19 @@
  * staked, which is the shape of a solvency alarm. The balances are in the serialised
  * `ContractState` the same indexer hands out, and `src/custody.ts` reads them from there.
  *
- * The fixture is a capture of a live table mid-game, both seats joined, nothing redeemed:
- * `fixtures/table-state-two-seats.hex` is the `contractAction { state }` hex for
- * b0c93a40887c9547b6d7b13de74c1cfcbcfdd96e0f70735eb3082d0ee1bc9e4a at block 112 (the second
- * join) of a local ledger-9 chain running the oracle-map VRF contract (the `npm run demo -w cli` table,
- * tier 5000025, two seats; captured 2026-09-21 with
- * `contractAction(address, offset: { blockOffset: { height } }) { state }`). Being a real
- * state, it also fails if a future runtime stops carrying balances in the serialisation at all
- * -- which is the failure mode the indexer already has.
+ * The fixture is a capture of a live two-seat table just STARTED, nothing redeemed:
+ * `fixtures/table-state-two-seats.hex` is the `contractAction { state }` hex that table
+ * 15838ed7d8850262c5541556b6d568d5df7562cb2b41322e16e6e0f0c6ad6ebb's start (`abortTable`, tx ff5a9116…, block 111) left
+ * on a local ledger-9 chain, 2026-09-29 -- contract 0.5.6, the blind-VRF table with slot joins
+ * (table.compact section 9): the practice bot's 1-NIGHT fast table, whose two joins landed in
+ * blocks 102 and 107. Captured with `contractAction(address, offset: { transactionOffset: { hash } })`.
+ * Being a real state, it also fails if a future runtime stops carrying balances in the
+ * serialisation at all -- which is the failure mode the indexer already has.
  *
  * A serialised ContractState is generation-specific: its header tag is
- * `midnight:contract-state[v8]:` here, and the ledger-8 capture this replaced said `[v6]`, which
- * the ledger-9 runtime refuses outright. Re-capture rather than translate when the generation
- * moves.
+ * `midnight:contract-state[v8]:` here, and a ledger-8 capture says `[v6]`, which the ledger-9
+ * runtime refuses outright. Re-capture rather than translate when the generation or the ledger
+ * layout moves.
  */
 
 import { describe, it } from 'node:test';
@@ -54,7 +54,8 @@ describe('custody: a real table state', () => {
   it('carries the staked NIGHT in its balance map', () => {
     const state = fixtureState();
     assert.equal(state.balance.size, 1, 'the fixture table holds exactly one token type');
-    assert.equal(nativeBalanceOf(state), 10_000_050n);
+    // Two seats of the practice table's 1 NIGHT (1,000,000 atomic units) each.
+    assert.equal(nativeBalanceOf(state), 2_000_000n);
   });
 
   it('backs the pot the contract itself claims -- the custody invariant', () => {
@@ -68,7 +69,7 @@ describe('custody: a real table state', () => {
 
     // docs/table-interface.md §6: the ledger holds the pot plus anything owed but not yet paid.
     assert.equal(nativeBalanceOf(state), led.pot + redeemable);
-    // and this particular capture is two seats' worth of the tier's stake, nothing eliminated
+    // and this particular capture is two seats' worth of its stake, nothing eliminated
     assert.equal(led.seatCount, 2n);
     assert.equal(redeemable, 0n);
     assert.equal(led.pot, led.tier * led.seatCount);

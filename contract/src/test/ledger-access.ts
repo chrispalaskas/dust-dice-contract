@@ -107,24 +107,24 @@ const FIELDS = fieldNames();
  * `assertFieldMapIsComplete` rather than as a silently mislabelled read.
  */
 const ADT_FIELDS: ReadonlyArray<readonly [PathKey, string]> = [
-  // `vrfAnswer` (the operator's answer cells) is declared right after `seatTurn`. Its arrival
-  // took the field count from 32 to 33 and the compiler rebalanced again: `winnerSeatIndex`
-  // slid up into bucket 1, so bucket 2 now opens with `finalDigest` at 2,0 and the whole ADT
-  // block sits one lower than before (2,1..2,8), while bucket 1's tail moved down by one
-  // (`phase` 1,6 -> 1,5, `seatSecretRevealed` 1,14 -> 1,13). Re-derived from the generated
-  // accessor on 2026-09-21, reading each Map's own method paths rather than by arithmetic.
-  ['2,1', 'seatIdentity'],
-  ['2,2', 'seatCard'],
-  ['2,3', 'seatProgress'],
-  ['2,4', 'seatTurn'],
-  ['2,5', 'vrfAnswer'],
-  ['2,6', 'seatRedeemable'],
-  ['2,7', 'seatReceipt'],
-  ['2,8', 'joinedKeys'],
-  // Declared after `padStore` (2,9) with the other late fields, between `started` and
-  // `fillOpenedAt`.
-  ['2,12', 'seatPaid'],
-  ['1,13', 'seatSecretRevealed'],
+  // `vrfAnswer` (the operator's answer cells, ledger 9) is declared right after `seatTurn`, and
+  // `slotJoinedAt` (table.compact section 9) is the last field of all. With both, the compiler
+  // rebalanced again: bucket 1 runs vrfPublicKey..finalDigest, and bucket 2 opens with the ADT
+  // block at 2,0..2,7. Re-derived from the generated accessor on 2026-09-29, reading each Map's
+  // own method paths rather than by arithmetic.
+  ['2,0', 'seatIdentity'],
+  ['2,1', 'seatCard'],
+  ['2,2', 'seatProgress'],
+  ['2,3', 'seatTurn'],
+  ['2,4', 'vrfAnswer'],
+  ['2,5', 'seatRedeemable'],
+  ['2,6', 'seatReceipt'],
+  ['2,7', 'joinedKeys'],
+  // Declared after `padStore` (2,8) with the other late fields, between `started` and
+  // `fillOpenedAt` -- and `slotJoinedAt`, the last field of all.
+  ['2,11', 'seatPaid'],
+  ['2,14', 'slotJoinedAt'],
+  ['1,12', 'seatSecretRevealed'],
 ];
 for (const [key, name] of ADT_FIELDS) FIELDS.set(key, name);
 
@@ -152,16 +152,16 @@ export function assertFieldMapIsComplete(): void {
   // 0,0, the rest of the plain fields in bucket 1, and bucket 2 holding winnerSeatIndex,
   // finalDigest, the ADT block (2,2..2,8), padStore and the late fields. Re-derived from the
   // generated accessor on 2026-09-04.
-  // Bucket 1 begins at `seatLimit` since the VRF field count pushed `tier` into bucket 0; see
-  // the `seatSecretRevealed` entry above.
-  // The `vrfAnswer` map (2026-09-21) rebalanced once more: bucket 2 opens with `finalDigest`.
-  expect('1,5', 'phase');
-  expect('1,13', 'seatSecretRevealed');
-  expect('2,0', 'finalDigest');
-  expect('2,9', 'padStore');
-  expect('2,10', 'startAfterSecs');
-  expect('2,13', 'fillOpenedAt');
-  expect('2,14', 'inviteHash');
+  // With `vrfAnswer` (ledger 9) and `slotJoinedAt` (section 9) the compiler rebalanced again:
+  // bucket 1 runs vrfPublicKey..finalDigest, and bucket 2 starts with the ADT block at
+  // 2,0..2,7. Re-derived from the generated accessor on 2026-09-29.
+  expect('1,4', 'phase');
+  expect('1,12', 'seatSecretRevealed');
+  expect('1,14', 'finalDigest');
+  expect('2,8', 'padStore');
+  expect('2,9', 'startAfterSecs');
+  expect('2,12', 'fillOpenedAt');
+  expect('2,13', 'inviteHash');
 }
 
 /**

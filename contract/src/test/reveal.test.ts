@@ -39,6 +39,7 @@ describe('revealFor agrees with the contract on every roll', () => {
     await sim.join(userAddress(0x01), 1_000);
     sim.asPlayer(bytes32(0xb8));
     await sim.join(userAddress(0x02), 1_010);
+    await sim.start(1_010);
 
     const seat = 0;
     const seen = (): number[] | null => {
@@ -98,6 +99,7 @@ describe('revealFor agrees with the contract on every roll', () => {
     await sim.join(userAddress(0x01), 1_000);
     sim.asPlayer(bytes32(0xb8));
     await sim.join(userAddress(0x02), 1_010);
+    await sim.start(1_010);
     sim.asPlayer(skA);
     const round = sim.getLedger().openRound;
     await sim.openTurn(0, pureCircuits.forcedEntropy(skA, config().tableId, round));

@@ -25,8 +25,10 @@
 
 import { Backgammon as Rules } from '@dust-dice/api';
 import {
+  bgHeldSlots,
   bgReplayOpening,
   bgReplayRoll,
+  bgStartPick,
   bgStarter,
   nativeBalanceOf,
   vrfPublicKeyOf,
@@ -48,6 +50,13 @@ const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 
 const STAGE_ROLL = 0n;
 const STAGE_MOVE = 1n;
+/** Slots someone holds. While filling nothing else counts the players -- the contract's §6. */
+const occupied = (led: BackgammonLedger): number => bgHeldSlots(led).length;
+
+/** What the contract should hold: the pot once started, one stake per held slot while filling. */
+function expectedBalance(led: BackgammonLedger): bigint {
+  return led.phase === Backgammon.BgPhase.filling ? led.tier * BigInt(occupied(led)) : led.pot;
+}
 
 /** One transaction of the table's log, and what it left behind. */
 interface Step {
@@ -67,8 +76,7 @@ interface Step {
 function progress(led: BackgammonLedger): number {
   const phaseRank = led.phase >= Backgammon.BgPhase.decided ? 1 : 0;
   return (
-    (phaseRank * 1_000_000 + Number(led.turn) * 4 + Number(led.stage) * 2 + Number(led.seatCount)) *
-      10 +
+    (phaseRank * 1_000_000 + Number(led.turn) * 4 + Number(led.stage) * 2 + occupied(led)) * 10 +
     (led.phase === Backgammon.BgPhase.settled ? 1 : 0)
   );
 }
@@ -100,13 +108,14 @@ async function readSteps(address: string): Promise<Step[]> {
 function produces(eps: readonly string[], p: BackgammonLedger, s: BackgammonLedger): boolean {
   const P = Backgammon.BgPhase;
   if (eps.includes('move')) return s.turn === p.turn + 1n;
+  if (eps.includes('start')) return p.phase === P.filling && s.phase === P.playing;
   if (eps.includes('resolveRoll')) {
     return p.stage === STAGE_ROLL && s.stage === STAGE_MOVE && s.turn === p.turn;
   }
-  if (eps.includes('join')) return s.seatCount === p.seatCount + 1n;
+  if (eps.includes('join')) return occupied(s) === occupied(p) + 1;
   if (eps.includes('eliminate')) {
     return (
-      (p.phase === P.filling && s.seatCount < p.seatCount) ||
+      (p.phase === P.filling && occupied(s) === occupied(p) - 1) ||
       (p.phase === P.playing && s.phase === P.decided && s.turn === p.turn)
     );
   }
@@ -157,6 +166,7 @@ function stateKey(l: BackgammonLedger): string {
     l.dice.a,
     l.dice.b,
     l.pot,
+    occupied(l),
     l.winner,
     l.deadline,
     l.board.s0.join(','),
@@ -257,7 +267,10 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
       console.log(
         `  tx ${i} (${what}): landed without effect -- a racing call changed the table first`,
       );
-      c.ok(`tx ${i} (${what}): the contract holds exactly its pot`, s.balance === led.pot);
+      c.ok(
+        `tx ${i} (${what}): the contract holds exactly its stakes`,
+        s.balance === expectedBalance(led),
+      );
       continue;
     }
 
@@ -271,24 +284,49 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
             c.ok(`tx ${i}: a roll has a state before it`, false);
             break;
           }
-          const turn = Number(prev.turn);
-          if (turn === 0) {
-            // The opening is thrown in the clear: its dice are on the ledger from this call.
-            const join = [led.joinEntropy.lookup(0n), led.joinEntropy.lookup(1n)] as const;
-            const expected = bgReplayOpening(secret, tableId, join);
-            c.ok(
-              'the opening replays from the key and both join entropies',
-              Number(led.dice.a) === expected.a && Number(led.dice.b) === expected.b,
-              `chain ${led.dice.a}-${led.dice.b}, replay ${expected.a}-${expected.b}`,
-            );
-            c.ok(
-              'the opening: the higher die moves first',
-              Number(led.toMove) === bgStarter(expected),
-              `seat 0 threw ${expected.a}, seat 1 threw ${expected.b}; seat ${led.toMove} moved first`,
-            );
-          }
-          // After the opening the answer is blind: its dice appear with the move that plays them.
+          // The roll is for the ply the table is now at: in a one-transaction ply that is the ply
+          // AFTER the move it rides with.
+          const turn = Number(led.turn);
+          // The answer is blind: its dice appear with the move that plays them.
           c.ok(`roll ${turn}: the player now owes the move`, led.stage === STAGE_MOVE);
+          break;
+        }
+
+        case 'start': {
+          if (!prev || prev.phase !== Backgammon.BgPhase.filling) {
+            c.ok(`tx ${i}: the start has a filling table before it`, false);
+            break;
+          }
+          // The two earliest joiners by declared time (slot breaking a tie) take seats 0 and 1.
+          const pick = bgStartPick(prev);
+          const n = occupied(prev);
+          console.log(
+            `  tx ${i}: the start seated the two earliest of ${n} joiner(s)` +
+              (n > 2 ? ' and refunded the rest' : ''),
+          );
+          c.ok(
+            'the start seated the two earliest joiners',
+            pick !== null &&
+              pick.every(
+                (slot, seat) =>
+                  hex(prev!.joinSlots.lookup(BigInt(slot)).keyCommit) ===
+                  hex(led.seatIdentity.lookup(BigInt(seat)).keyCommit),
+              ),
+          );
+          // The opening is thrown in the clear: its dice are on the ledger from this call.
+          const join = [led.joinEntropy.lookup(0n), led.joinEntropy.lookup(1n)] as const;
+          const expected = bgReplayOpening(secret, tableId, join);
+          c.ok(
+            'the opening replays from the key and both join entropies',
+            Number(led.dice.a) === expected.a && Number(led.dice.b) === expected.b,
+            `chain ${led.dice.a}-${led.dice.b}, replay ${expected.a}-${expected.b}`,
+          );
+          c.ok(
+            'the opening: the higher die moves first',
+            Number(led.toMove) === bgStarter(expected),
+            `seat 0 threw ${expected.a}, seat 1 threw ${expected.b}; seat ${led.toMove} moved first`,
+          );
+          c.ok('the opening: the player now owes the move', led.stage === STAGE_MOVE);
           break;
         }
 
@@ -352,9 +390,12 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
               Rules.hasWon(Rules.sidesFor(board, mover).mine) && Number(led.winner) === mover,
             );
           } else {
+            // The other seat is to roll -- or, in a one-transaction ply, has been rolled for.
+            const rolledToo = s.entryPoints.includes('resolveRoll');
             c.ok(
-              `ply ${turn}: the other seat is to roll`,
-              Number(led.toMove) === 1 - mover && led.stage === STAGE_ROLL,
+              `ply ${turn}: the other seat is to ${rolledToo ? 'move, rolled for in the same transaction' : 'roll'}`,
+              Number(led.toMove) === 1 - mover &&
+                led.stage === (rolledToo ? STAGE_MOVE : STAGE_ROLL),
             );
           }
           break;
@@ -387,11 +428,11 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
       }
     }
 
-    // Custody, from the chain itself: while the table holds stakes, its native balance is its pot.
+    // Custody, from the chain itself: the pot once started, one stake per held slot before.
     c.ok(
-      `tx ${i} (${what}): the contract holds exactly its pot`,
-      s.balance === led.pot,
-      `balance ${s.balance}, pot ${led.pot}`,
+      `tx ${i} (${what}): the contract holds exactly its stakes`,
+      s.balance === expectedBalance(led),
+      `balance ${s.balance}, expected ${expectedBalance(led)}`,
     );
     prev = led;
   }

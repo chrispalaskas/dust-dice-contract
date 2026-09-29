@@ -20,6 +20,7 @@
  */
 
 import type { Ledger as TableLedger } from './managed/table/contract/index.js';
+import { tableHeldSlots, tableJoinedPlayers } from './table-slots.ts';
 
 /** Rounds per seat, as `table.compact`'s `roundCount()` fixes it. */
 const ROUND_COUNT = 13;
@@ -67,12 +68,16 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
   if (phase === PHASE.filling) {
     // The SAME circuit that rescues a stalled table also starts a waiting one, and the contract
     // picks the branch. Saying "abort" while it would in fact start the game would be a lie on
-    // the button, so this branch is named separately.
-    if (
-      led.startAfterSecs > 0n &&
-      led.activeSeats >= 2n &&
-      past(led.fillOpenedAt + led.startAfterSecs)
-    ) {
+    // the button, so this branch is named separately. The players are the held slots
+    // (table.compact section 9): nothing on chain counts them while the table fills.
+    const players = tableJoinedPlayers(led);
+    if (players >= Number(led.seatLimit)) {
+      return {
+        kind: 'start',
+        why: 'Every seat is taken. This starts the game -- anyone may send it.',
+      };
+    }
+    if (led.startAfterSecs > 0n && players >= 2 && past(led.fillOpenedAt + led.startAfterSecs)) {
       return {
         kind: 'start',
         why:
@@ -80,13 +85,13 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
           'starts the game with who is here.',
       };
     }
-    // `seatCount > 0` is the contract's own condition, and the reason matters: with nobody
-    // seated there is nothing to refund and the circuit refuses. An empty table waiting to fill
-    // is not stuck, it is just empty.
-    return led.seatCount > 0n && past(led.roundDeadline)
+    // A held slot is the contract's own condition, and the reason matters: with nobody there
+    // there is nothing to refund and the circuit refuses. An empty table waiting to fill is not
+    // stuck, it is just empty.
+    return tableHeldSlots(led).length > 0 && past(led.roundDeadline)
       ? {
           kind: 'abort',
-          why: 'This table never filled and its deadline has passed. Aborting refunds every seat in full.',
+          why: 'This table never filled and its deadline has passed. Aborting refunds every player in full.',
         }
       : { kind: 'none', why: 'The table is still filling; nothing is stuck.' };
   }
