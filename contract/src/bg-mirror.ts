@@ -80,15 +80,20 @@ export const bgDiceOf = (
 /**
  * The mover's roll, as its browser sees it the moment the operator's answer lands: nobody else
  * can compute this until the move reveals it.
+ *
+ * `formedAt` is the index the mover's query was formed for (`BgQuery.formedAt`), which is `turn`
+ * unless an automatic pass carried the query forward (backgammon.compact section 7); the dice
+ * always hash `turn`.
  */
 export function bgMyRoll(args: {
   sk: Uint8Array;
   tableId: Uint8Array;
   turn: number | bigint;
+  formedAt?: number | bigint;
   response: JubjubPoint;
   lastSecret: Uint8Array;
 }): { gamma: JubjubPoint; dice: BgDiceTs } {
-  const gamma = bgGammaFor(args.sk, args.tableId, args.turn, args.response);
+  const gamma = bgGammaFor(args.sk, args.tableId, args.formedAt ?? args.turn, args.response);
   return { gamma, dice: bgDiceOf(args.tableId, gamma, args.lastSecret, args.turn) };
 }
 
@@ -111,7 +116,7 @@ export function bgResolvePoint(args: {
   tableId: Uint8Array;
   turn: number | bigint;
   join: BgJoinEntropies;
-  query: { turn: bigint; blinded: JubjubPoint };
+  query: { turn: bigint; formedAt?: bigint; blinded: JubjubPoint };
 }): JubjubPoint {
   if (BigInt(args.turn) === 0n) return bgOpeningPointTs(args.tableId, args.join);
   if (args.query.turn !== BigInt(args.turn)) {
@@ -161,21 +166,33 @@ export const bgReplayOpening = (
 
 /**
  * A ply's roll, recomputed from the key and the public log: `rollSecret` is what the move at
- * this ply revealed, `lastSecret` what the move before it revealed.
+ * this ply revealed, `lastSecret` what the move before it revealed, and `formedAt` the index its
+ * query was formed for (the mover's `BgQuery.formedAt` before the move; `turn` unless an
+ * automatic pass carried it forward).
  */
 export function bgReplayRoll(args: {
   secret: bigint;
   tableId: Uint8Array;
   turn: number | bigint;
+  formedAt?: number | bigint;
   rollSecret: Uint8Array;
   lastSecret: Uint8Array;
 }): BgDiceTs {
   const t = BigInt(args.turn);
   const gamma = bg.vrfScalarMul(
-    bg.bgVrfInputPoint(args.tableId, t, args.rollSecret),
+    bg.bgVrfInputPoint(args.tableId, BigInt(args.formedAt ?? t), args.rollSecret),
     modR(args.secret),
   );
   return bgDiceOf(args.tableId, gamma, args.lastSecret, t);
+}
+
+/**
+ * Does this ply leave the OTHER seat shut out -- a checker on its bar and all six of its entry
+ * points held by two or more of the mover's? Then the contract records its pass (backgammon.compact
+ * `closedOutBy`, section 7). `mine`/`opp` are the board after the ply, from the mover's side.
+ */
+export function bgClosesOut(mine: readonly number[], opp: readonly number[]): boolean {
+  return opp[25]! > 0 && [1, 2, 3, 4, 5, 6].every((p) => mine[p]! >= 2);
 }
 
 // ---------------------------------------------------------------------------------------------
