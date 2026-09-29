@@ -16,8 +16,8 @@ export const NETWORK: NetworkConfig = resolveNetwork();
 
 const CONTRACT_ROOT = path.dirname(require.resolve('@dust-dice/contract/package.json'));
 /**
- * Where `@dust-dice/contract` keeps compactc's output for the two deployables. The PUBLISHED
- * package ships them under `dist/managed` (keys and ZKIR for table and lobby only); a source
+ * Where `@dust-dice/contract` keeps compactc's output for the three deployables. The PUBLISHED
+ * package ships them under `dist/managed` (keys and ZKIR for table, lobby and backgammon only); a source
  * checkout that has compiled but not built has them under `src/managed`. Prefer the built copy,
  * which is what a consumer installs, and fall back to the source tree for development.
  */
@@ -29,3 +29,4 @@ const managedRoot = ((): string => {
 })();
 export const MANAGED_TABLE = path.join(managedRoot, 'table');
 export const MANAGED_LOBBY = path.join(managedRoot, 'lobby');
+export const MANAGED_BACKGAMMON = path.join(managedRoot, 'backgammon');

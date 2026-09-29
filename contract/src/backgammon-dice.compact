@@ -1,0 +1,209 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+//
+// The Backgammon table's dice on ledger 9: Yacht's blind VRF (vrf-core.compact), two dice a ply.
+//
+// `include`d by backgammon.compact AFTER dice-core.compact and vrf-core.compact, whose byte
+// ladder (`dieFromBytes`, the `Pick` accumulator) and curve primitives it reuses unchanged -- so
+// this file carries no pragma and no import of its own. Editing it changes the Backgammon
+// table's verifier keys; it does not touch Yacht's, which never include it.
+//
+// ---------------------------------------------------------------------------------------------
+// Who knows a roll, and when
+// ---------------------------------------------------------------------------------------------
+//
+// The table holds a VRF key `x`; `PK = x*G` is sealed at deploy. A seat's roll for ply t is
+//
+//     v      = bgRollSecret(sk, tableId, t)        forced, secret until the move at t reveals it
+//     P      = bgVrfInputPoint(tableId, t, v)       only this seat can form it
+//     B      = rho*P, rho = bgBlindingFor(sk, t)    posted two plies ahead (or at join)
+//     S      = x*B                                  the operator's answer, DLEQ-checked on chain
+//     Gamma  = rho^-1 * S = x*P                     unblinded in the mover's browser
+//     dice   = ladder(H(8*Gamma, e, t))             e = the secret the opponent's last move revealed
+//
+// The operator sees only `B` and so never learns the roll; the mover learns it first, from its
+// own answer. A colluding opponent and operator cannot compute it either: `P` needs the mover's
+// `v`. That closes the ledger-8 table's "one roll ahead" residual.
+//
+// `e` is what stops a colluder seeing its OWN next roll while it chooses a move: with the
+// operator's help it can compute its own Gamma early (it knows its own `v`), but its dice also
+// hash the secret the HONEST player reveals with the move in between, which does not exist yet.
+//
+// `rho` IS DERIVED IN THE CIRCUIT, NOT WITNESSED. With `rho` a witness, a player could post the
+// identity as its query, get the identity back (an honest operator's DLEQ on it is valid), and
+// reveal with rho = 0 -- or r, 3r, 7r: the reduction happens inside `ecMul` -- whereupon
+// `S == rho*Gamma` holds for ANY Gamma and the player picks its own dice. Measured at proof level
+// on 2026-09-27 (compactc 0.34, zkir-v2 2.1.1) against the Yacht reveal, which takes rho as a
+// witness. Derived from `sk`, rho is fixed per ply and is 0 mod r with negligible probability.
+//
+// THE COFACTOR IS CLEARED, as defence in depth. Jubjub's group has order 8r, and `S == rho*Gamma`
+// alone pins Gamma only up to a point of order dividing 8. The same measurement found the stack
+// refuses any point outside the prime-order subgroup as an EC operand (runtime, VM and the
+// circuit's `EccChip::assign`), so no such Gamma can be supplied today; hashing `8*Gamma` keeps the
+// dice unique if that ever changes.
+//
+// THE OPENING (ply 0) is thrown by the operator in the clear: `S = x*P_open` with `P_open`
+// hashed from both seats' join entropies, the DLEQ checked on chain, a die per seat from `8*S`.
+// The operator learns it as it throws -- it is the operator's throw -- but cannot choose it. It
+// can never be a double (see `bgDiceFromBytes`), so it needs no re-throw.
+
+/** The two dice of a ply. For the opening, `a` is seat 0's die and `b` seat 1's. */
+export struct BgDice {
+  a: Uint<8>,
+  b: Uint<8>,
+}
+
+/** A seat's forced entropy: `H(sk, tableId, index)`. Proven, never chosen. */
+export struct BgEntropyContext {
+  domain: Bytes<32>,
+  sk: Bytes<32>,
+  tableId: Bytes<32>,
+  turn: Uint<16>,
+}
+
+export pure circuit bgForcedEntropy(sk: Bytes<32>, tableId: Bytes<32>, turn: Uint<16>): Bytes<32> {
+  return persistentHash<BgEntropyContext>(
+           BgEntropyContext { domain: pad(32, "dust-dice:bg:v2:entropy"),
+                              sk: sk,
+                              tableId: tableId,
+                              turn: turn, }
+           );
+}
+
+/** The entropy a seat reveals at `join`, and the opening hashes. Index 0 -- no ply uses it. */
+export pure circuit bgJoinEntropy(sk: Bytes<32>, tableId: Bytes<32>): Bytes<32> {
+  return bgForcedEntropy(sk, tableId, 0);
+}
+
+/**
+ * The secret behind a seat's roll at ply `t`: index t+1, so it never collides with the join's.
+ * The move at ply t reveals it, after the roll it fed has been used.
+ */
+export pure circuit bgRollSecret(sk: Bytes<32>, tableId: Bytes<32>, t: Uint<16>): Bytes<32> {
+  return bgForcedEntropy(sk, tableId, (t + 1) as Uint<16>);
+}
+
+/**
+ * The VRF input point for a roll at ply `t`. Hashed in the bytes domain first, as vrf-core's
+ * `vrfInputPoint` is and for the same reason: `Bytes<32> as Field` fails at runtime for about
+ * half of all values, while `Field as Bytes<32>` is always defined.
+ */
+export pure circuit bgVrfInputPoint(tableId: Bytes<32>, t: Uint<16>, v: Bytes<32>): JubjubPoint {
+  return hashToCurve<Bytes<32>>(persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "dust-dice:bg:v2:vrf-input"),
+    tableId,
+    (t as Field) as Bytes<32>,
+    v,
+  ]));
+}
+
+/**
+ * The blinding for a roll at ply `t`, derived from the seat secret. Unpredictable to the
+ * operator because `sk` is in it, distinct per ply, and recomputable after a reload -- and,
+ * because the circuit derives it rather than taking it as a witness, not the player's to pick.
+ */
+export pure circuit bgBlindingFor(sk: Bytes<32>, tableId: Bytes<32>, t: Uint<16>): Field {
+  return transientHash<Vector<4, Bytes<32>>>([
+    pad(32, "dust-dice:bg:v2:vrf-blinding"),
+    tableId,
+    (t as Field) as Bytes<32>,
+    sk,
+  ]);
+}
+
+/** The opening's VRF input: both seats' join entropies, public once the table is full. */
+export pure circuit bgOpeningPoint(tableId: Bytes<32>, e0: Bytes<32>, e1: Bytes<32>): JubjubPoint {
+  return hashToCurve<Bytes<32>>(persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "dust-dice:bg:v2:opening"),
+    tableId,
+    e0,
+    e1,
+  ]));
+}
+
+/** `8*g`: three doublings, by the complete twisted-Edwards addition. See the header. */
+export pure circuit bgClearCofactor(g: JubjubPoint): JubjubPoint {
+  const g2 = ecAdd(g, g);
+  const g4 = ecAdd(g2, g2);
+  return ecAdd(g4, g4);
+}
+
+/** Everything that identifies one Backgammon roll. Fixed-width fields, hashed whole. */
+export struct BgRollContext {
+  domain: Bytes<32>,
+  tableId: Bytes<32>,
+  output: Bytes<32>,
+  other: Bytes<32>,
+  turn: Uint<16>,
+  stream: Uint<8>,
+}
+
+/**
+ * The 32 bytes behind one roll: the cleared VRF output, the opponent's latest revealed secret
+ * (zeros for the opening), the ply and the stream (1 for the opening, 0 for a ply).
+ */
+export pure circuit bgRollBytes(
+                      tableId: Bytes<32>,
+                      gamma: JubjubPoint,
+                      other: Bytes<32>,
+                      turn: Uint<16>,
+                      stream: Uint<8>,
+                      ): Vector<32, Uint<8>> {
+  const g8 = bgClearCofactor(gamma);
+  return persistentHash<BgRollContext>(
+           BgRollContext { domain: pad(32, "dust-dice:bg:v2:roll"),
+                           tableId: tableId,
+                           output: persistentHash<Vector<2, Field>>([jubjubPointX(g8),
+                                                                     jubjubPointY(g8)]),
+                           other: other,
+                           turn: turn,
+                           stream: stream, }
+           )
+         as Vector<32, Uint<8>>;
+}
+
+/**
+ * FIVE-face candidate for the opening's second die: accept b < 250, five buckets of 50.
+ * The same shape as dice-core's six-face `byteCandidate`.
+ */
+pure circuit fiveCandidate(acc: Pick, b: Uint<8>): Pick {
+  const v = (1 +
+             ((b >= 50) as Uint<8>) +
+             ((b >= 100) as Uint<8>) +
+             ((b >= 150) as Uint<8>) +
+             ((b >= 200) as Uint<8>))
+            as Uint<8>;
+  return acc.found ? acc : (b < 250 ? Pick { found: true, die: v } : acc);
+}
+
+/** 1..5 from 4 candidate bytes. Exhaustion probability (6/256)^4 = 3.0e-7 (falls back to 1). */
+pure circuit fiveFromBytes(cands: Vector<4, Uint<8>>): Uint<8> {
+  const p = fold((acc: Pick, b: Uint<8>) => fiveCandidate(acc, b), noPick(), cands);
+  return p.die;
+}
+
+/**
+ * Two dice from a roll's 32 bytes -- or, when `opening`, the two opening dice.
+ *
+ * The opening's second die is `e + (e >= a)` with `e` uniform on 1..5 -- uniform on the five
+ * faces that are NOT `a` -- so the pair is never a double and needs no re-throw. Every ordered
+ * pair of distinct faces has probability exactly 1/30.
+ */
+export pure circuit bgDiceFromBytes(v: Vector<32, Uint<8>>, opening: Boolean): BgDice {
+  const a = dieFromBytes([v[0], v[1], v[2], v[3]]);
+  const six = dieFromBytes([v[4], v[5], v[6], v[7]]);
+  const five = fiveFromBytes([v[4], v[5], v[6], v[7]]);
+  const other2 = (five + ((five >= a) as Uint<8>)) as Uint<8>;
+  return BgDice { a: a, b: opening ? other2 : six };
+}
+
+/** The dice of a roll, from its VRF output. What the move (and a replay) computes. */
+export pure circuit bgDice(
+                      tableId: Bytes<32>,
+                      gamma: JubjubPoint,
+                      other: Bytes<32>,
+                      turn: Uint<16>,
+                      opening: Boolean,
+                      ): BgDice {
+  return bgDiceFromBytes(bgRollBytes(tableId, gamma, other, turn, opening ? 1 : 0), opening);
+}
