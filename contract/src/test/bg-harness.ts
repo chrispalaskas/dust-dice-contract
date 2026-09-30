@@ -6,16 +6,14 @@
  *
  * Same conventions as simulator.ts's `TableSimulator`: block time is always explicit (the
  * runtime would default it to wall clock), and the acting party is swapped between calls, because
- * the witnesses belong to different people in production. `asPlayer` holds a seat secret, and
- * with it the seat's side of the VRF: its queries (posted by `join` and `move`) and the
- * unblinding of its answers. `asOperator` holds nothing -- the operator has no witness -- and the
- * operator's answers are computed from the ledger with the table key in `config`.
+ * the witnesses belong to different people in production. `asPlayer` holds a seat secret -- all a
+ * seat needs to reveal its share of the opening and to compute and play its own rolls.
+ * `asOperator` holds nothing: the operator has no part in the dice, only in starting, timing out
+ * and settling a table, all of which anyone may do.
  *
- * `join` and `resolveRoll` are the only circuits that DECLARE a time, so they take `now` and
- * optionally a different `blockTime`; everything else takes `blockTime` alone.
+ * `join`, `start`, `reveal` and `move` DECLARE a time, so they take `now` and optionally a
+ * different `blockTime`; everything else takes `blockTime` alone.
  */
-
-import type { JubjubPoint } from '@midnight-ntwrk/compact-runtime';
 
 import {
   Contract as BgContract,
@@ -25,31 +23,25 @@ import {
 } from '../managed/backgammon/contract/index.js';
 import * as Rules from '../../../api/src/backgammon.ts';
 import {
-  bgAnswer,
   bgMyRoll,
-  bgOpeningPointTs,
-  bgQueryFor,
-  bgReplayOpening,
-  bgReplayRoll,
-  bgResolvePoint,
+  bgOpeningDiceTs,
+  bgPlyDiceTs,
   bgRollSecretTs,
+  bgStarter,
   type BgDiceTs,
-  type BgJoinEntropies,
+  type BgOpeningShares,
 } from '../bg-mirror.ts';
-import { bgStartPick } from '../bg-slots.ts';
 import { entropyKeyCommitmentTs } from '../policy-mirror.ts';
 import {
   createTablePrivateState,
-  NO_GAMMA,
   tableWitnesses,
   type TablePrivateState,
 } from '../table-witnesses.ts';
-import { vrfPublicKeyOf, vrfSecretFromSeed, type DleqProof } from '../vrf.ts';
 import { BaseSimulator, DEFAULT_BLOCK_TIME, userAddress } from './simulator.ts';
 
 export type { BgLedger };
 
-export const STAGE_ROLL = 0n;
+export const STAGE_OPENING = 0n;
 export const STAGE_MOVE = 1n;
 export const NO_WINNER = 2n;
 
@@ -60,10 +52,6 @@ export type BgConfig = {
   tableId: Uint8Array;
   tier: bigint;
   rakeAddress: UserAddress;
-  /** The operator's 32 random bytes; the VRF key is derived from them, as in production. */
-  seed: Uint8Array;
-  vrfSecret: bigint;
-  vrfPublicKey: JubjubPoint;
   moveTimeoutSecs: bigint;
   tableTimeoutSecs: bigint;
   inviteHash: Uint8Array;
@@ -74,25 +62,16 @@ export function bytes32(fill: number): Uint8Array {
 }
 
 export function defaultBgConfig(overrides: Partial<BgConfig> = {}): BgConfig {
-  const tableId = overrides.tableId ?? bytes32(0x42);
-  const seed = overrides.seed ?? bytes32(0x5e);
-  const vrfSecret = overrides.vrfSecret ?? vrfSecretFromSeed(seed);
   return {
-    tableId,
+    tableId: bytes32(0x42),
     tier: 10_000n,
     rakeAddress: userAddress(0xaa),
     moveTimeoutSecs: 180n,
     tableTimeoutSecs: 600n,
     inviteHash: new Uint8Array(32),
     ...overrides,
-    seed,
-    vrfSecret,
-    vrfPublicKey: overrides.vrfPublicKey ?? vrfPublicKeyOf(vrfSecret),
   };
 }
-
-/** An operator answer, as `resolveRoll` takes it. */
-export type BgAnswer = { response: JubjubPoint; proof: DleqProof };
 
 export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
   bg: BgContract<TablePrivateState>;
@@ -118,7 +97,6 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
         config.tableId,
         config.tier,
         config.rakeAddress,
-        config.vrfPublicKey,
         config.moveTimeoutSecs,
         config.tableTimeoutSecs,
         config.inviteHash,
@@ -141,114 +119,60 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
     this.privateState = createTablePrivateState({ playerSecret: sk, inviteCode });
   }
 
-  /** The acting seat's query for its roll at ply `turn`; the identity when nobody is seated. */
-  queryFor(turn: number): JubjubPoint {
-    return this.sk ? bgQueryFor(this.sk, this.config.tableId, turn) : NO_GAMMA;
-  }
-
   /** Claim `slot` (the lowest free one when omitted, so tests stay deterministic). */
   join(
     payoutTo: UserAddress,
     now: number,
     blockTime = now,
     slot: number = freeSlots(this.getLedger())[0] ?? 0,
-    firstQuery = this.queryFor(1),
   ): Promise<bigint> {
     this.blockTime = blockTime;
     return this.run('join', (ctx) =>
-      this.bg.impureCircuits.join(ctx, BigInt(slot), payoutTo, BigInt(now), firstQuery),
+      this.bg.impureCircuits.join(ctx, BigInt(slot), payoutTo, BigInt(now)),
+    );
+  }
+
+  /** The start: seat the two earliest joiners. Anyone may send it. */
+  start(now: number, blockTime = now): Promise<[]> {
+    this.blockTime = blockTime;
+    return this.run('start', (ctx) => this.bg.impureCircuits.start(ctx, BigInt(now)));
+  }
+
+  /** The acting seat reveals its share of the opening. */
+  reveal(seat: number, now: number, blockTime = now): Promise<[]> {
+    this.blockTime = blockTime;
+    return this.run('reveal', (ctx) =>
+      this.bg.impureCircuits.reveal(ctx, BigInt(seat), BigInt(now)),
     );
   }
 
   /**
-   * The point the operator owes an answer to, read off the ledger as the daemon reads it: at a
-   * filling table the opening, from the two joiners `start` will seat; after it the mover's query.
+   * The roll for the ply the table owes, as the mover's browser computes it: the opening pair at
+   * ply 0 (from both shares), after it the acting seat's own roll.
    */
-  owedPoint(): JubjubPoint {
+  myRoll(): BgDiceTs {
     const l = this.getLedger();
-    if (Number(l.phase) === BG_PHASE.filling) {
-      const pick = bgStartPick(l);
-      if (!pick) throw new Error('owedPoint: fewer than two players have joined');
-      return bgOpeningPointTs(this.config.tableId, [
-        l.joinSlots.lookup(BigInt(pick[0])).entropy,
-        l.joinSlots.lookup(BigInt(pick[1])).entropy,
-      ]);
-    }
-    return bgResolvePoint({
-      tableId: this.config.tableId,
-      turn: l.turn,
-      join: joinOf(l),
-      query: l.query.lookup(l.toMove),
-    });
-  }
-
-  /** The honest answer to what the ledger asks, under `secret` (the table's key by default). */
-  answer(secret = this.config.vrfSecret): BgAnswer {
-    return bgAnswer(secret, this.owedPoint());
-  }
-
-  /** The start: seat the two earliest joiners and throw the opening. */
-  start(now: number, blockTime = now, answer?: BgAnswer): Promise<{ a: bigint; b: bigint }> {
-    this.blockTime = blockTime;
-    const { response, proof } = answer ?? this.answer();
-    return this.run('start', (ctx) =>
-      this.bg.impureCircuits.start(ctx, BigInt(now), response, proof.a1, proof.a2, proof.z),
-    );
-  }
-
-  resolveRoll(now: number, blockTime = now, answer?: BgAnswer): Promise<[]> {
-    this.blockTime = blockTime;
-    const { response, proof } = answer ?? this.answer();
-    return this.run('resolveRoll', (ctx) =>
-      this.bg.impureCircuits.resolveRoll(ctx, BigInt(now), response, proof.a1, proof.a2, proof.z),
-    );
-  }
-
-  /** Whatever the operator owes: the start at a filling table, else the mover's roll. */
-  async roll(now: number, blockTime = now): Promise<void> {
-    if (Number(this.getLedger().phase) === BG_PHASE.filling) await this.start(now, blockTime);
-    else await this.resolveRoll(now, blockTime);
-  }
-
-  /**
-   * The acting seat's roll for the ply it owes, as its browser computes it: the opening pair at
-   * ply 0 (public), its own unblinded VRF roll after.
-   */
-  myRoll(): { gamma: JubjubPoint; dice: BgDiceTs } {
-    const l = this.getLedger();
-    if (l.turn === 0n)
-      return { gamma: NO_GAMMA, dice: { a: Number(l.dice.a), b: Number(l.dice.b) } };
+    if (l.turn === 0n) return bgOpeningDiceTs(this.config.tableId, sharesOf(l));
     if (!this.sk) throw new Error('myRoll: no seat is acting');
     return bgMyRoll({
       sk: this.sk,
       tableId: this.config.tableId,
       turn: l.turn,
-      response: l.rollAnswer,
       lastSecret: l.lastSecret,
     });
   }
 
-  move(
-    ply: Rules.Ply,
-    blockTime = DEFAULT_BLOCK_TIME,
-    opts: { gamma?: JubjubPoint; nextQuery?: JubjubPoint } = {},
-  ): Promise<bigint> {
-    return this.moveEncoded(Rules.encodePly(ply), blockTime, opts);
+  move(ply: Rules.Ply, now: number, blockTime = now): Promise<bigint> {
+    return this.moveEncoded(Rules.encodePly(ply), now, blockTime);
   }
 
-  moveEncoded(
-    enc: Rules.EncodedPly,
-    blockTime = DEFAULT_BLOCK_TIME,
-    opts: { gamma?: JubjubPoint; nextQuery?: JubjubPoint } = {},
-  ): Promise<bigint> {
+  /** Ply 0 goes to `openingMove`, every later ply to `move` -- as a client picks. */
+  moveEncoded(enc: Rules.EncodedPly, now: number, blockTime = now): Promise<bigint> {
     this.blockTime = blockTime;
-    const turn = Number(this.getLedger().turn);
-    const gamma = opts.gamma ?? (this.sk ? this.myRoll().gamma : NO_GAMMA);
-    const nextQuery = opts.nextQuery ?? this.queryFor(turn + 2);
-    this.privateState = { ...this.privateState, vrfGamma: gamma };
     const moves = enc.moves.map((m) => ({ point: BigInt(m.point), die: BigInt(m.die) }));
-    return this.run('move', (ctx) =>
-      this.bg.impureCircuits.move(ctx, moves, BigInt(enc.count), nextQuery),
+    const circuit = this.getLedger().turn === 0n ? 'openingMove' : 'move';
+    return this.run(circuit, (ctx) =>
+      this.bg.impureCircuits[circuit](ctx, moves, BigInt(enc.count), BigInt(now)),
     );
   }
 
@@ -259,12 +183,10 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
     );
   }
 
-  settle(secret: bigint, blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
+  settle(blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
     this.blockTime = blockTime;
     const pot = this.getLedger().pot;
-    return this.run('settle', (ctx) =>
-      this.bg.impureCircuits.settle(ctx, secret, pot / 100n, pot % 100n),
-    );
+    return this.run('settle', (ctx) => this.bg.impureCircuits.settle(ctx, pot / 100n, pot % 100n));
   }
 
   abortTable(blockTime = DEFAULT_BLOCK_TIME): Promise<bigint> {
@@ -284,14 +206,14 @@ export function boardOf(ledger: BgLedger): Rules.Board {
   };
 }
 
-/** The ledger's `dice`: the opening pair until ply 0 is played, then the last ply's roll. */
+/** The ledger's `dice`: the last ply's roll; zeros before ply 0. */
 export function diceOf(ledger: BgLedger): [number, number] {
   return [Number(ledger.dice.a), Number(ledger.dice.b)];
 }
 
-/** The two seats' join entropies, which the opening hashes. */
-export function joinOf(ledger: BgLedger): BgJoinEntropies {
-  return [ledger.joinEntropy.lookup(0n), ledger.joinEntropy.lookup(1n)];
+/** Both seats' opening shares, zeros where a seat has not revealed. */
+export function sharesOf(ledger: BgLedger): BgOpeningShares {
+  return [ledger.openingShare.lookup(0n), ledger.openingShare.lookup(1n)];
 }
 
 /** How many slots a filling table has (the contract's `slotCount()`). */
@@ -304,6 +226,17 @@ export function freeSlots(ledger: BgLedger): number[] {
     if (ledger.joinSlots.lookup(BigInt(i)).addr.bytes.every((b) => b === 0)) out.push(i);
   }
   return out;
+}
+
+/** The seat a secret holds once the table has started, or -1. */
+export function seatOfKey(ledger: BgLedger, tableId: Uint8Array, sk: Uint8Array): number {
+  const mine = Buffer.from(entropyKeyCommitmentTs(tableId, sk)).toString('hex');
+  for (const s of [0, 1]) {
+    if (Buffer.from(ledger.seatIdentity.lookup(BigInt(s)).keyCommit).toString('hex') === mine) {
+      return s;
+    }
+  }
+  return -1;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -330,7 +263,7 @@ export function rng(seed: number): () => number {
   };
 }
 
-/** Seat both players at `t`: two joins; the operator's `start` then seats them. */
+/** Two joins at `t`; `start` then seats them (the earlier one, `players[0]`, as seat 0). */
 export async function seatBoth(sim: BackgammonSimulator, players: [Seat, Seat], t: number) {
   sim.asPlayer(players[0].sk);
   await sim.join(players[0].addr, t);
@@ -338,20 +271,30 @@ export async function seatBoth(sim: BackgammonSimulator, players: [Seat, Seat], 
   await sim.join(players[1].addr, t + 1);
 }
 
+/** Start the table and have both seats reveal their shares: ply 0 is then owed. */
+export async function openTable(sim: BackgammonSimulator, players: [Seat, Seat], t: number) {
+  sim.asOperator();
+  await sim.start(t);
+  for (const s of [0, 1]) {
+    sim.asPlayer(players[s]!.sk);
+    await sim.reveal(s, t + 1 + s);
+  }
+}
+
 export type PlayedGame = {
   plies: number;
   winner: number;
-  /** Every roll: what the mover saw, and what a replay from the key recomputes. */
+  /** Every roll: what the mover saw, and what a replay from the public log recomputes. */
   rolls: { turn: number; mover: number; chain: [number, number]; mirror: [number, number] }[];
   /** The clock after the last move. */
   t: number;
 };
 
 /**
- * Play to the end: the operator answers, the mover unblinds its roll and picks a random legal
- * ply from the rules engine, and after every call the chain's board and dice are checked
- * against the engine's and against a replay from the table key. Returns once a seat has borne
- * off its fifteenth checker.
+ * Play to the end from an opened table: the mover computes its roll and picks a random legal ply
+ * from the rules engine, and after every call the chain's board and dice are checked against the
+ * engine's and against a replay from what the moves revealed. Returns once a seat has borne off
+ * its fifteenth checker.
  */
 export async function playOut(
   sim: BackgammonSimulator,
@@ -362,62 +305,54 @@ export async function playOut(
 ): Promise<PlayedGame> {
   let t = start;
   const rolls: PlayedGame['rolls'] = [];
-  const { tableId, vrfSecret } = sim.config;
+  const { tableId } = sim.config;
   for (let guard = 0; guard < 4000; guard++) {
-    const turn = Number(sim.getLedger().turn);
-    sim.asOperator();
-    t += 5;
-    await sim.roll(t);
-    const rolled = sim.getLedger();
-    const mover = Number(rolled.toMove);
+    const before = sim.getLedger();
+    const turn = Number(before.turn);
+    const opening = turn === 0 ? bgOpeningDiceTs(tableId, sharesOf(before)) : null;
+    const mover = opening ? bgStarter(opening) : Number(before.toMove);
 
-    sim.asPlayer(players[mover].sk);
-    const seen = sim.myRoll().dice;
+    sim.asPlayer(players[mover]!.sk);
+    const seen = sim.myRoll();
     const chain: [number, number] = [seen.a, seen.b];
-    const replay =
-      turn === 0
-        ? bgReplayOpening(vrfSecret, tableId, joinOf(rolled))
-        : bgReplayRoll({
-            secret: vrfSecret,
-            tableId,
-            turn,
-            rollSecret: bgRollSecretTs(players[mover].sk, tableId, turn),
-            lastSecret: rolled.lastSecret,
-          });
-    rolls.push({ turn, mover, chain, mirror: [replay.a, replay.b] });
-    check(`roll ${turn} matches the replay`, chain[0] === replay.a && chain[1] === replay.b);
     if (turn === 0) check('the opening is never a double', chain[0] !== chain[1]);
 
-    const { mine, opp } = Rules.sidesFor(boardOf(rolled), mover);
+    const { mine, opp } = Rules.sidesFor(boardOf(before), mover);
     const options = Rules.legalPlies(mine, opp, chain);
-    const ply = options[Math.floor(random() * options.length)];
+    const ply = options[Math.floor(random() * options.length)]!;
     const after = Rules.applyPly(mine, opp, chain, ply);
 
     t += 5;
     await sim.move(ply, t);
     const moved = sim.getLedger();
+    // The replay: from nothing but the public log -- the secret this move revealed and the one
+    // before it (or, at the opening, the two shares).
+    const replay =
+      turn === 0 ? opening! : bgPlyDiceTs(tableId, moved.lastSecret, before.lastSecret, turn);
+    rolls.push({ turn, mover, chain, mirror: [replay.a, replay.b] });
+    check(`roll ${turn} matches the replay`, chain[0] === replay.a && chain[1] === replay.b);
+    check(
+      `ply ${turn}: the chain played the roll the mover saw`,
+      diceOf(moved)[0] === chain[0] && diceOf(moved)[1] === chain[1],
+    );
     const want = Rules.boardFrom(mover, after.mine, after.opp);
     check(
       `ply ${turn}: the chain's board is the rules engine's`,
       JSON.stringify(boardOf(moved)) === JSON.stringify(want),
     );
     check(
-      `ply ${turn}: the move disclosed the roll it played`,
-      diceOf(moved)[0] === chain[0] && diceOf(moved)[1] === chain[1],
-    );
-    check(
-      `ply ${turn}: the move revealed the roll's forced secret`,
+      `ply ${turn}: the move revealed the ply's forced secret`,
       Buffer.from(moved.lastSecret).equals(
-        Buffer.from(bgRollSecretTs(players[mover].sk, tableId, turn)),
+        Buffer.from(bgRollSecretTs(players[mover]!.sk, tableId, turn)),
       ),
-    );
-    check(
-      `ply ${turn}: the mover's next query is for ply ${turn + 2}`,
-      moved.query.lookup(BigInt(mover)).turn === BigInt(turn + 2),
     );
     if (after.won) {
       return { plies: turn + 1, winner: mover, rolls, t };
     }
+    check(
+      `ply ${turn}: the other seat is to move`,
+      Number(moved.toMove) === 1 - mover && moved.stage === STAGE_MOVE,
+    );
   }
   throw new Error('playOut: no winner after 4000 plies');
 }

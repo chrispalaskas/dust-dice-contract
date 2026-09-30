@@ -6,10 +6,10 @@
  *
  * Three kinds of test. DIFFERENTIAL: the TypeScript mirrors (src/bg-mirror.ts, and the rules
  * engine api/src/backgammon.ts) against the contract's own `pureCircuits`, on random inputs --
- * the dice ladder, the VRF round trip, and every accept/refuse decision the board circuit makes.
- * GAMES: whole games played by random legal plies, with the chain's board and dice checked
- * against the engine and against a replay from the table key after every call. CASES: each
- * illegal move, each forged roll, and every exit from every state, one at a time.
+ * the dice ladder, the two-player roll hashes, and every accept/refuse decision the board circuit
+ * makes. GAMES: whole games played by random legal plies, with the chain's board and dice checked
+ * against the engine and against a replay from the public log after every call. CASES: each
+ * illegal move, each out-of-turn reveal or move, and every exit from every state, one at a time.
  *
  * The ledger's WASM wrappers are freed only by the garbage collector, and a file that plays
  * many games crawls without a collection between tests (the dust-dice-dleq finding) -- hence
@@ -24,14 +24,12 @@ import * as vm from 'node:vm';
 import * as Rules from '../../../api/src/backgammon.ts';
 import { pureCircuits as bgPure } from '../managed/backgammon/contract/index.js';
 import {
-  bgAnswer,
-  bgAnswerHolds,
   bgDiceFromBytesTs,
-  bgDiceOf,
-  bgGammaFor,
-  bgJoinEntropyTs,
-  bgQueryFor,
-  bgReplayRoll,
+  bgHasShare,
+  bgMyRoll,
+  bgOpeningDiceTs,
+  bgOpeningSecretTs,
+  bgPlyDiceTs,
   bgRollSecretTs,
   bgStarter,
 } from '../bg-mirror.ts';
@@ -45,25 +43,25 @@ import {
   bgStartPick,
 } from '../bg-slots.ts';
 import { entropyKeyCommitmentTs, inviteCommitmentTs } from '../policy-mirror.ts';
-import { vrfPublicKeyOf, vrfSecretFromSeed } from '../vrf.ts';
 import {
   BG_PHASE,
   BackgammonSimulator,
   DEFAULT_BLOCK_TIME,
   NO_WINNER,
   STAGE_MOVE,
-  STAGE_ROLL,
+  STAGE_OPENING,
   boardOf,
   bytes32,
   defaultBgConfig,
-  freeSlots,
-  SLOT_COUNT,
   diceOf,
-  joinOf,
+  freeSlots,
+  openTable,
   playOut,
   rng,
   seatBoth,
   seats,
+  sharesOf,
+  SLOT_COUNT,
   userAddress,
 } from './bg-harness.ts';
 
@@ -72,6 +70,8 @@ const gc = vm.runInNewContext('gc') as () => void;
 afterEach(() => gc());
 
 const T0 = DEFAULT_BLOCK_TIME;
+/** A move's clock: the declared time plus the 120 s slack plus the 180 s move timeout. */
+const clock = (now: number) => BigInt(now + 120 + 180);
 
 async function rejects(p: Promise<unknown>, pattern: RegExp): Promise<void> {
   await assert.rejects(p, (e: unknown) => {
@@ -89,35 +89,33 @@ function randomBytes(r: () => number): Uint8Array {
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString('hex');
 
-/** A started game at the opening roll, and the two players. */
+/** Both players joined, the table started: both owe their share of the opening. */
 async function startedGame(config = defaultBgConfig()) {
   const sim = await BackgammonSimulator.create(config);
   const players = seats();
   await seatBoth(sim, players, T0);
+  sim.asOperator();
+  await sim.start(T0 + 5);
   return { sim, players };
 }
 
-/** A game rolled and waiting on the mover, with the mover's identity. */
-async function rolledGame(config = defaultBgConfig()) {
-  const { sim, players } = await startedGame(config);
-  sim.asOperator();
-  await sim.start(T0 + 10);
-  const mover = Number(sim.getLedger().toMove);
-  return { sim, players, mover };
+/** Both shares in: ply 0 is owed by the starter, with the opening dice. */
+async function openedGame(config = defaultBgConfig()) {
+  const sim = await BackgammonSimulator.create(config);
+  const players = seats();
+  await seatBoth(sim, players, T0);
+  await openTable(sim, players, T0 + 5);
+  const opening = bgOpeningDiceTs(config.tableId, sharesOf(sim.getLedger()));
+  const mover = bgStarter(opening);
+  return { sim, players, mover, opening: [opening.a, opening.b] as [number, number] };
 }
 
-/**
- * Past the opening: ply 0 played, ply 1 answered and waiting on its mover -- the first roll that
- * is the mover's own blind VRF roll rather than the public opening throw.
- */
+/** Past the opening: ply 0 played, ply 1 owed by the other seat, with its own roll. */
 async function laterGame(config = defaultBgConfig()) {
-  const { sim, players, mover: starter } = await rolledGame(config);
-  sim.asPlayer(players[starter].sk);
-  const opening = diceOf(sim.getLedger());
-  const ply = Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), opening)[0];
+  const { sim, players, mover: starter, opening } = await openedGame(config);
+  sim.asPlayer(players[starter]!.sk);
+  const ply = Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), opening)[0]!;
   await sim.move(ply, T0 + 20);
-  sim.asOperator();
-  await sim.resolveRoll(T0 + 30);
   const mover = Number(sim.getLedger().toMove);
   assert.equal(mover, 1 - starter);
   return { sim, players, mover, opening };
@@ -156,55 +154,31 @@ describe('the dice', () => {
     assert.ok(chi < 58.3, `opening chi-square ${chi.toFixed(1)}`);
   });
 
-  it('round-trips the blind VRF: the blinding cancels, and the answer proves its key', () => {
-    const r = rng(8);
-    for (let i = 0; i < 12; i++) {
-      const [sk, tid, other] = [randomBytes(r), randomBytes(r), randomBytes(r)];
-      const secret = vrfSecretFromSeed(randomBytes(r));
-      const pk = vrfPublicKeyOf(secret);
-      const turn = 1 + Math.floor(r() * 400);
-      const query = bgQueryFor(sk, tid, turn);
-      const { response, proof } = bgAnswer(secret, query);
-      assert.ok(bgAnswerHolds(pk, query, response, proof), 'the DLEQ holds under the key');
-      assert.ok(
-        !bgAnswerHolds(vrfPublicKeyOf(secret + 1n), query, response, proof),
-        'and not under another key',
-      );
-      const seen = bgDiceOf(tid, bgGammaFor(sk, tid, turn, response), other, turn);
-      const replayed = bgReplayRoll({
-        secret,
-        tableId: tid,
-        turn,
-        rollSecret: bgRollSecretTs(sk, tid, turn),
-        lastSecret: other,
-      });
-      assert.deepEqual(seen, replayed, `roll ${i}: what the mover sees is what a replay computes`);
+  it('needs a secret from each player: change either and the roll changes', () => {
+    const r = rng(12);
+    const tid = bytes32(0x42);
+    let same = 0;
+    for (let i = 0; i < 200; i++) {
+      const mine = randomBytes(r);
+      const other = randomBytes(r);
+      const base = bgPlyDiceTs(tid, mine, other, 3);
+      const m2 = bgPlyDiceTs(tid, randomBytes(r), other, 3);
+      const o2 = bgPlyDiceTs(tid, mine, randomBytes(r), 3);
+      if (m2.a === base.a && m2.b === base.b) same += 1;
+      if (o2.a === base.a && o2.b === base.b) same += 1;
     }
+    // 36 outcomes: a changed input keeps the same pair about 1 time in 36 (~11 of 400).
+    assert.ok(same < 30, `${same} of 400 changed inputs kept the roll`);
   });
 
-  it('does not let a small-order point change a roll', () => {
-    // (0, -1) is Jubjub's point of order 2 in twisted Edwards form. `S == rho*Gamma` cannot tell
-    // Gamma from Gamma + T2 when rho is even, so a Gamma shifted by T2 must either be refused
-    // outright or roll the same dice -- which hashing `8*Gamma` guarantees. The JS runtime does
-    // the former (its `ecAdd` will not take a point outside the prime-order subgroup); the
-    // clearing is there so the property never rests on that.
-    const P = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001n;
-    const t2 = { x: 0n, y: P - 1n };
-    const r = rng(10);
-    for (let i = 0; i < 4; i++) {
-      const tid = randomBytes(r);
-      const gamma = bgPure.vrfGeneratorMul(BigInt(1 + i) * 7919n);
-      let shifted: typeof gamma;
-      try {
-        shifted = bgPure.vrfPointAdd(gamma, t2);
-      } catch {
-        continue; // refused: nothing to roll with
-      }
-      assert.deepEqual(
-        bgPure.bgDice(tid, shifted, tid, 5n, false),
-        bgPure.bgDice(tid, gamma, tid, 5n, false),
-      );
-    }
+  it('forces every revealed secret from the seat key, at distinct indices', () => {
+    const tid = bytes32(0x42);
+    const sk = bytes32(0x11);
+    const opening = hex(bgOpeningSecretTs(sk, tid));
+    const plies = new Set<string>([opening]);
+    for (let t = 0; t < 20; t++) plies.add(hex(bgRollSecretTs(sk, tid, t)));
+    assert.equal(plies.size, 21, 'the opening share and each ply secret are all distinct');
+    assert.notEqual(hex(bgRollSecretTs(sk, bytes32(0x43), 0)), hex(bgRollSecretTs(sk, tid, 0)));
   });
 });
 
@@ -345,10 +319,10 @@ describe('the board circuit and the rules engine', () => {
 // =============================================================================================
 
 describe('whole games', () => {
-  it('play to a settlement, the chain agreeing with the engine and the mirror throughout', async () => {
+  it('play to a settlement, the chain agreeing with the engine and the replay throughout', async () => {
     for (const seed of [1, 2, 3]) {
-      const config = defaultBgConfig({ tableId: bytes32(0x40 + seed), seed: bytes32(0x60 + seed) });
-      const { sim, players } = await startedGame(config);
+      const config = defaultBgConfig({ tableId: bytes32(0x40 + seed) });
+      const { sim, players } = await openedGame(config);
       const failures: string[] = [];
       const game = await playOut(sim, players, rng(seed), T0 + 10, (msg, ok) => {
         if (!ok) failures.push(msg);
@@ -356,7 +330,7 @@ describe('whole games', () => {
       assert.deepEqual(failures, [], `game ${seed}`);
 
       // The opening decided who went first, by the higher die.
-      const first = game.rolls[0];
+      const first = game.rolls[0]!;
       assert.equal(first.mover, bgStarter({ a: first.chain[0], b: first.chain[1] }));
 
       const decided = sim.getLedger();
@@ -366,11 +340,10 @@ describe('whole games', () => {
       assert.equal(boardOf(decided)[game.winner === 0 ? 's0' : 's1'][Rules.OFF], Rules.CHECKERS);
 
       sim.asOperator();
-      assert.equal(await sim.settle(config.vrfSecret, game.t + 5), BigInt(game.winner));
+      assert.equal(await sim.settle(game.t + 5), BigInt(game.winner));
       const settled = sim.getLedger();
       assert.equal(settled.phase, BG_PHASE.settled);
       assert.equal(settled.pot, 0n);
-      assert.equal(settled.revealedSecret, config.vrfSecret);
       gc();
     }
   });
@@ -381,7 +354,7 @@ describe('whole games', () => {
 // =============================================================================================
 
 describe('joining', () => {
-  it('claims a slot and counts nothing: the table fills without starting', async () => {
+  it('claims a slot, commits only to its key, and counts nothing', async () => {
     const sim = await BackgammonSimulator.create(defaultBgConfig());
     const [p0, p1] = seats();
     sim.asPlayer(p0.sk);
@@ -398,14 +371,9 @@ describe('joining', () => {
       hex(l.joinSlots.lookup(3n).keyCommit),
       hex(entropyKeyCommitmentTs(sim.config.tableId, p0.sk)),
     );
-    // The join entropy is revealed at join, forced from the seat key, and so is the slot's
-    // blinded query for ply 1.
-    assert.equal(
-      hex(l.joinSlots.lookup(6n).entropy),
-      hex(bgJoinEntropyTs(p1.sk, sim.config.tableId)),
-    );
-    assert.deepEqual(l.joinSlots.lookup(6n).query, bgQueryFor(p1.sk, sim.config.tableId, 1));
     assert.equal(l.joinSlots.lookup(6n).joinedAt, BigInt(T0 + 50));
+    // Nothing of the dice yet: the opening's shares come after the start.
+    assert.ok(!bgHasShare(l.openingShare.lookup(0n)) && !bgHasShare(l.openingShare.lookup(1n)));
     assert.deepEqual(freeSlots(l), [0, 1, 2, 4, 5, 7]);
   });
 
@@ -429,7 +397,7 @@ describe('joining', () => {
     assert.deepEqual(freeSlots(sim.getLedger()), [2, 3, 4, 5, 6, 7]);
   });
 
-  it("starts with the operator's opening roll: the two earliest joiners take the seats", async () => {
+  it('starts with the two earliest joiners in the seats, refunding the rest; anyone may start it', async () => {
     const sim = await BackgammonSimulator.create(defaultBgConfig());
     const [pA, pB] = seats();
     const pC = { sk: bytes32(0x33), addr: userAddress(0x03) };
@@ -441,25 +409,22 @@ describe('joining', () => {
     sim.asPlayer(pC.sk);
     await sim.join(pC.addr, T0 + 3, T0 + 5, 4);
     assert.deepEqual(bgStartPick(sim.getLedger()), [2, 4]);
-    sim.asOperator();
+    // A stranger starts it: the start takes no secret and decides nothing a caller could steer.
+    sim.asPlayer(bytes32(0x99));
     await sim.start(T0 + 20);
     const l = sim.getLedger();
     assert.equal(l.phase, BG_PHASE.playing);
-    assert.equal(l.stage, STAGE_MOVE, 'the opening is thrown in the same call');
+    assert.equal(l.stage, STAGE_OPENING, 'both seats now owe their share of the opening');
     assert.equal(l.seatCount, 2n);
     // The pot is the two seated stakes; the third (pA, the latest) was refunded by this call.
     assert.equal(l.pot, 20_000n);
     assert.deepEqual(l.seatIdentity.lookup(0n).addr, pB.addr);
     assert.deepEqual(l.seatIdentity.lookup(1n).addr, pC.addr);
-    // Their join entropies and ply-1 queries moved from the slots into the seats.
-    assert.equal(hex(l.joinEntropy.lookup(0n)), hex(bgJoinEntropyTs(pB.sk, sim.config.tableId)));
-    assert.deepEqual(l.query.lookup(1n), {
-      turn: 1n,
-      blinded: bgQueryFor(pC.sk, sim.config.tableId, 1),
-    });
-    // Once started, nobody else can sit down.
+    assert.equal(l.deadline, clock(T0 + 20));
+    // Once started, nobody else can sit down, and it cannot be started twice.
     sim.asPlayer(bytes32(0x44));
     await rejects(sim.join(userAddress(0x04), T0 + 21), /not filling/);
+    await rejects(sim.start(T0 + 21), /not filling/);
   });
 
   it('breaks a tie on the declared time by the lower slot', async () => {
@@ -480,9 +445,7 @@ describe('joining', () => {
     sim.asPlayer(p0.sk);
     await sim.join(p0.addr, T0);
     sim.asOperator();
-    // Any answer: the circuit refuses before it looks at one.
-    const any = bgAnswer(sim.config.vrfSecret, bgPure.vrfGeneratorMul(7n));
-    await rejects(sim.start(T0 + 10, T0 + 10, any), /start: fewer than two/);
+    await rejects(sim.start(T0 + 10), /fewer than two/);
   });
 
   it('agrees with the TypeScript reading of the slots', async () => {
@@ -537,17 +500,10 @@ describe('the constructor', () => {
       BackgammonSimulator.create(defaultBgConfig({ moveTimeoutSecs: 119n })),
       /at least two minutes/,
     );
-    // Three minutes is fine: the deadline is stamped a slack ahead, so it cannot be shaved.
     await BackgammonSimulator.create(defaultBgConfig({ moveTimeoutSecs: 180n }));
     await rejects(
       BackgammonSimulator.create(defaultBgConfig({ tableTimeoutSecs: 240n })),
       /table timeout/,
-    );
-    await rejects(
-      BackgammonSimulator.create(
-        defaultBgConfig({ moveTimeoutSecs: 300n, tableTimeoutSecs: 540n }),
-      ),
-      /exceed the move timeout/,
     );
     await rejects(BackgammonSimulator.create(defaultBgConfig({ tier: 99n })), /at least 100/);
   });
@@ -559,71 +515,100 @@ describe('the constructor', () => {
   });
 });
 
-describe('rolling and moving', () => {
-  it("only the table's key can throw the opening, and only once", async () => {
-    const { sim } = await startedGame();
-    sim.asOperator();
-    // A valid DLEQ, but under another key: anyone could make one, and the chain refuses it.
-    await rejects(
-      sim.start(T0 + 10, T0 + 10, sim.answer(sim.config.vrfSecret + 1n)),
-      /not this table's VRF/,
-    );
-    // The right key's answer with a response it did not produce.
-    const honest = sim.answer();
-    await rejects(
-      sim.start(T0 + 10, T0 + 10, {
-        response: bgPure.vrfGeneratorMul(12345n),
-        proof: honest.proof,
-      }),
-      /not this table's VRF/,
-    );
-    await sim.start(T0 + 10);
+describe('the opening', () => {
+  it("takes one share from each seat, each forced from the seat's key, in any order", async () => {
+    const { sim, players } = await startedGame();
+    // Seat 1 first: the order does not matter, and neither reveal reads the other's.
+    sim.asPlayer(players[1].sk);
+    await sim.reveal(1, T0 + 10);
+    sim.asPlayer(players[0].sk);
+    await sim.reveal(0, T0 + 12);
     const l = sim.getLedger();
-    assert.equal(l.stage, STAGE_MOVE);
-    // Stamped a roll-slack ahead of the declared time: at least the move timeout of real time.
-    assert.equal(l.deadline, BigInt(T0 + 10 + 60 + 180));
-    await rejects(sim.resolveRoll(T0 + 11), /no roll is owed/);
-    await rejects(sim.start(T0 + 11), /not filling/);
+    for (const s of [0, 1]) {
+      assert.equal(
+        hex(l.openingShare.lookup(BigInt(s))),
+        hex(bgOpeningSecretTs(players[s]!.sk, sim.config.tableId)),
+      );
+    }
+    // The later reveal's clock stands: the starter's ply 0 runs from the second share.
+    assert.equal(l.deadline, clock(T0 + 12));
+    assert.equal(l.stage, STAGE_OPENING);
   });
 
-  it("only the table's key can answer a later roll", async () => {
-    const { sim, players, mover } = await rolledGame();
-    sim.asPlayer(players[mover].sk);
-    const opening = diceOf(sim.getLedger());
-    await sim.move(Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), opening)[0], T0 + 20);
-    sim.asOperator();
-    await rejects(
-      sim.resolveRoll(T0 + 30, T0 + 30, sim.answer(sim.config.vrfSecret + 1n)),
-      /not this table's VRF/,
+  it('refuses a share from the wrong key, a second share, and a share once the opening is played', async () => {
+    const { sim, players } = await startedGame();
+    sim.asPlayer(players[1].sk);
+    await rejects(sim.reveal(0, T0 + 10), /wrong entropy secret/);
+    sim.asPlayer(players[0].sk);
+    await sim.reveal(0, T0 + 10);
+    await rejects(sim.reveal(0, T0 + 11), /revealed its share already/);
+    sim.asPlayer(players[1].sk);
+    await sim.reveal(1, T0 + 12);
+    const opening = bgOpeningDiceTs(sim.config.tableId, sharesOf(sim.getLedger()));
+    const starter = bgStarter(opening);
+    sim.asPlayer(players[starter]!.sk);
+    await sim.move(
+      Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), [opening.a, opening.b])[0]!,
+      T0 + 20,
     );
-    await sim.resolveRoll(T0 + 30);
-    assert.equal(sim.getLedger().stage, STAGE_MOVE);
+    await rejects(sim.reveal(starter, T0 + 21), /opening has been played/);
   });
 
-  it("pins the operator's declared time within the roll's 60 s slack", async () => {
-    const { sim } = await startedGame();
-    sim.asOperator();
-    await rejects(sim.start(T0 + 10, T0 + 70), /the roll's slack/);
-    await sim.start(T0 + 11, T0 + 70);
-    // However far behind the operator declared, the player's clock runs from the real block.
-    assert.ok(sim.getLedger().deadline >= BigInt(T0 + 70 + 180));
-  });
-
-  it('refuses a move by the wrong seat, and a move before the roll', async () => {
-    const { sim, players, mover } = await rolledGame();
-    const dice = diceOf(sim.getLedger());
-    const ply = Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), dice)[0];
-    sim.asPlayer(players[1 - mover].sk);
+  it('will not play ply 0 until both shares are in, and lets only the higher die play it', async () => {
+    const { sim, players } = await startedGame();
+    sim.asPlayer(players[0].sk);
+    await sim.reveal(0, T0 + 10);
+    const anyPly = Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), [3, 1])[0]!;
+    await rejects(sim.move(anyPly, T0 + 11), /both shares are needed/);
+    sim.asPlayer(players[1].sk);
+    await sim.reveal(1, T0 + 12);
+    const opening = bgOpeningDiceTs(sim.config.tableId, sharesOf(sim.getLedger()));
+    const starter = bgStarter(opening);
+    const ply = Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), [
+      opening.a,
+      opening.b,
+    ])[0]!;
+    sim.asPlayer(players[1 - starter]!.sk);
     await rejects(sim.move(ply, T0 + 20), /wrong entropy secret/);
-    sim.asPlayer(players[mover].sk);
+    sim.asPlayer(players[starter]!.sk);
     await sim.move(ply, T0 + 20);
-    await rejects(sim.move(ply, T0 + 21), /not been rolled/);
+    const l = sim.getLedger();
+    assert.deepEqual(diceOf(l), [opening.a, opening.b], 'ply 0 played the opening pair');
+    assert.equal(Number(l.toMove), 1 - starter);
+    assert.equal(l.stage, STAGE_MOVE);
+  });
+
+  it('pins the declared time on the start, a reveal and a move', async () => {
+    const { sim, players } = await startedGame();
+    sim.asPlayer(players[0].sk);
+    await rejects(sim.reveal(0, T0 + 10, T0 + 200), /further behind/);
+    await rejects(sim.reveal(0, T0 + 10, T0 + 5), /ahead of block time/);
+  });
+});
+
+describe('moving', () => {
+  it('refuses a move by the wrong seat, and a second move by the same seat', async () => {
+    const { sim, players, mover } = await laterGame();
+    const l = sim.getLedger();
+    const dice = bgMyRoll({
+      sk: players[mover]!.sk,
+      tableId: sim.config.tableId,
+      turn: l.turn,
+      lastSecret: l.lastSecret,
+    });
+    const { mine, opp } = Rules.sidesFor(boardOf(l), mover);
+    const ply = Rules.legalPlies(mine, opp, [dice.a, dice.b])[0]!;
+    sim.asPlayer(players[1 - mover]!.sk);
+    await rejects(sim.move(ply, T0 + 30), /wrong entropy secret/);
+    sim.asPlayer(players[mover]!.sk);
+    await sim.move(ply, T0 + 30);
+    await rejects(sim.move(ply, T0 + 31), /wrong entropy secret/);
   });
 
   it('refuses each kind of illegal ply', async () => {
-    const { sim, players, mover } = await rolledGame();
-    const [a, b] = diceOf(sim.getLedger());
-    sim.asPlayer(players[mover].sk);
+    const { sim, players, mover, opening } = await openedGame();
+    const [a, b] = opening;
+    sim.asPlayer(players[mover]!.sk);
     const t = T0 + 20;
     // A die that was not rolled.
     const notRolled = [1, 2, 3, 4, 5, 6].find((d) => d !== a && d !== b)!;
@@ -659,95 +644,58 @@ describe('rolling and moving', () => {
     );
   });
 
-  it("keeps a later ply's roll off the ledger until its move, which discloses exactly it", async () => {
+  it("keeps a ply's roll off the ledger until its move, which discloses exactly it and its secret", async () => {
     const { sim, players, mover, opening } = await laterGame();
     const l = sim.getLedger();
-    // Answered, but the ledger still shows the last PLAYED roll: the opening.
-    assert.equal(l.stage, STAGE_MOVE);
+    // The ledger still shows the last PLAYED roll: the opening. Only the mover can compute this one.
     assert.deepEqual(diceOf(l), opening);
-    sim.asPlayer(players[mover].sk);
-    const { dice } = sim.myRoll();
-    const replay = bgReplayRoll({
-      secret: sim.config.vrfSecret,
+    const dice = bgMyRoll({
+      sk: players[mover]!.sk,
       tableId: sim.config.tableId,
-      turn: 1,
-      rollSecret: bgRollSecretTs(players[mover].sk, sim.config.tableId, 1),
+      turn: l.turn,
       lastSecret: l.lastSecret,
     });
-    assert.deepEqual(dice, replay);
     const { mine, opp } = Rules.sidesFor(boardOf(l), mover);
-    const ply = Rules.legalPlies(mine, opp, [dice.a, dice.b])[0];
-    await sim.move(ply, T0 + 40);
-    assert.deepEqual(diceOf(sim.getLedger()), [dice.a, dice.b]);
+    sim.asPlayer(players[mover]!.sk);
+    await sim.move(Rules.legalPlies(mine, opp, [dice.a, dice.b])[0]!, T0 + 40);
+    const after = sim.getLedger();
+    assert.deepEqual(diceOf(after), [dice.a, dice.b]);
+    assert.equal(
+      hex(after.lastSecret),
+      hex(bgRollSecretTs(players[mover]!.sk, sim.config.tableId, 1)),
+    );
+    // Anyone replays it from the public log: this move's secret and the one before it.
+    const replay = bgPlyDiceTs(sim.config.tableId, after.lastSecret, l.lastSecret, 1);
+    assert.deepEqual([replay.a, replay.b], [dice.a, dice.b]);
+    assert.equal(after.deadline, clock(T0 + 40), "the move starts the other seat's clock");
   });
 
-  it('refuses a Gamma that does not unblind the answer, and a roll played with other dice', async () => {
+  it('refuses a ply played with dice the mover did not roll', async () => {
     const { sim, players, mover } = await laterGame();
-    sim.asPlayer(players[mover].sk);
     const l = sim.getLedger();
-    const { dice } = sim.myRoll();
+    const dice = bgMyRoll({
+      sk: players[mover]!.sk,
+      tableId: sim.config.tableId,
+      turn: l.turn,
+      lastSecret: l.lastSecret,
+    });
     const { mine, opp } = Rules.sidesFor(boardOf(l), mover);
-    const ply = Rules.legalPlies(mine, opp, [dice.a, dice.b])[0];
-    // Any other point: the player cannot choose its own Gamma, so cannot choose its dice.
-    await rejects(
-      sim.move(ply, T0 + 40, { gamma: bgPure.vrfGeneratorMul(777n) }),
-      /does not unblind/,
+    // The legal plies of every OTHER roll whose plies the real roll does not also allow.
+    const real = new Set(
+      Rules.legalPlies(mine, opp, [dice.a, dice.b]).map((p) => JSON.stringify(p)),
     );
-    // The opponent's secret cannot reveal this seat's roll either.
-    sim.asPlayer(players[1 - mover].sk);
-    await rejects(sim.move(ply, T0 + 40), /wrong entropy secret/);
-    sim.asPlayer(players[mover].sk);
-    await sim.move(ply, T0 + 40);
-  });
-
-  it("refuses to reveal a query that is not the seat's own input point blinded", async () => {
-    const sim = await BackgammonSimulator.create(defaultBgConfig());
-    const players = seats();
-    // Both seats post a point of their choosing for ply 1, not `rho*P`.
-    const chosen = bgPure.vrfGeneratorMul(4242n);
-    for (const [i, p] of players.entries()) {
-      sim.asPlayer(p.sk);
-      await sim.join(p.addr, T0 + i, T0 + i, undefined, chosen);
+    let tried = 0;
+    sim.asPlayer(players[mover]!.sk);
+    for (let x = 1; x <= 6 && tried < 3; x++) {
+      for (let y = x; y <= 6 && tried < 3; y++) {
+        if ((x === dice.a && y === dice.b) || (x === dice.b && y === dice.a)) continue;
+        const ply = Rules.legalPlies(mine, opp, [x, y]).find((p) => !real.has(JSON.stringify(p)));
+        if (!ply || ply.length === 0) continue;
+        tried += 1;
+        await rejects(sim.move(ply, T0 + 40), /not rolled|unused|do not have|holds|unplayed/);
+      }
     }
-    sim.asOperator();
-    await sim.start(T0 + 10);
-    const starter = Number(sim.getLedger().toMove);
-    sim.asPlayer(players[starter].sk);
-    const opening = diceOf(sim.getLedger());
-    await sim.move(Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), opening)[0], T0 + 20);
-    // The operator answers whatever was asked -- it cannot tell -- and the chain lets it.
-    sim.asOperator();
-    await sim.resolveRoll(T0 + 30);
-    const mover = 1 - starter;
-    sim.asPlayer(players[mover].sk);
-    const l = sim.getLedger();
-    // The answer unblinds under the seat's own rho, but it is not the seat's own roll.
-    const gamma = bgGammaFor(players[mover].sk, sim.config.tableId, 1, l.rollAnswer);
-    const { mine, opp } = Rules.sidesFor(boardOf(l), mover);
-    await rejects(
-      sim.move(Rules.legalPlies(mine, opp, [1, 2])[0], T0 + 40, { gamma }),
-      /not this seat's input point blinded/,
-    );
-  });
-
-  it('answers the opening from both join entropies, publicly', async () => {
-    const { sim } = await rolledGame();
-    const l = sim.getLedger();
-    const dice = diceOf(l);
-    assert.notEqual(dice[0], dice[1]);
-    assert.equal(Number(l.toMove), bgStarter({ a: dice[0], b: dice[1] }));
-    assert.ok(joinOf(l).every((e) => e.some((b) => b !== 0)));
-  });
-
-  it('refuses a move a whole move timeout past the deadline', async () => {
-    const { sim, players, mover } = await rolledGame();
-    const dice = diceOf(sim.getLedger());
-    const ply = Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), dice)[0];
-    sim.asPlayer(players[mover].sk);
-    const deadline = Number(sim.getLedger().deadline);
-    const move = Number(sim.config.moveTimeoutSecs);
-    await rejects(sim.move(ply, deadline + move), /too late/);
-    await sim.move(ply, deadline + move - 1);
+    assert.ok(tried > 0);
   });
 
   it('refuses entering onto a closed board and accepts the forced pass', async () => {
@@ -776,7 +724,7 @@ describe('rolling and moving', () => {
 
 describe('timeouts, resignation and leaving', () => {
   it('eliminates the mover past its deadline, and the opponent wins', async () => {
-    const { sim, mover } = await rolledGame();
+    const { sim, mover } = await laterGame();
     const deadline = Number(sim.getLedger().deadline);
     sim.asOperator();
     await rejects(sim.eliminate(mover, false, deadline), /not past its deadline/);
@@ -787,21 +735,34 @@ describe('timeouts, resignation and leaving', () => {
     assert.equal(Number(l.winner), 1 - mover);
   });
 
-  it('cannot eliminate a player while the operator owes the roll', async () => {
-    // Played to ply 1's roll: the opening ply is in, and the operator owes the next roll.
-    const { sim, players, mover } = await rolledGame();
-    const dice = diceOf(sim.getLedger());
-    sim.asPlayer(players[mover].sk);
-    await sim.move(Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), dice)[0]!, T0 + 20);
-    assert.equal(sim.getLedger().stage, STAGE_ROLL);
+  it('at the opening, eliminates the seat whose share is missing -- only once the other is in', async () => {
+    const { sim, players } = await startedGame();
     const deadline = Number(sim.getLedger().deadline);
     sim.asOperator();
+    // Neither in: nobody's fault alone.
     await rejects(sim.eliminate(0, false, deadline + 1), /not past its deadline/);
     await rejects(sim.eliminate(1, false, deadline + 1), /not past its deadline/);
+    sim.asPlayer(players[1].sk);
+    await sim.reveal(1, T0 + 10);
+    const later = Number(sim.getLedger().deadline);
+    sim.asOperator();
+    await rejects(sim.eliminate(1, false, later + 1), /not past its deadline/);
+    await rejects(sim.eliminate(0, false, later), /not past its deadline/);
+    await sim.eliminate(0, false, later + 1);
+    assert.equal(Number(sim.getLedger().winner), 1);
+  });
+
+  it('at the opening, eliminates the starter who does not play ply 0', async () => {
+    const { sim, mover } = await openedGame();
+    const deadline = Number(sim.getLedger().deadline);
+    sim.asOperator();
+    await rejects(sim.eliminate(1 - mover, false, deadline + 1), /not past its deadline/);
+    await sim.eliminate(mover, false, deadline + 1);
+    assert.equal(Number(sim.getLedger().winner), 1 - mover);
   });
 
   it('lets a seat resign at any time during play, proving its key', async () => {
-    const { sim, players } = await rolledGame();
+    const { sim, players } = await openedGame();
     sim.asPlayer(players[1].sk);
     await rejects(sim.eliminate(0, true, T0 + 15), /wrong entropy secret/);
     await sim.eliminate(1, true, T0 + 15);
@@ -809,7 +770,7 @@ describe('timeouts, resignation and leaving', () => {
     assert.equal(l.phase, BG_PHASE.decided);
     assert.equal(l.winner, 0n);
     sim.asOperator();
-    await sim.settle(sim.config.vrfSecret, T0 + 16);
+    await sim.settle(T0 + 16);
     assert.equal(sim.getLedger().phase, BG_PHASE.settled);
   });
 
@@ -852,8 +813,9 @@ describe('aborting', () => {
     assert.equal(sim.getLedger().phase, BG_PHASE.aborted);
   });
 
-  it('refunds every joiner of a table the operator never starts, a table timeout after the last join', async () => {
-    const { sim } = await startedGame(); // joins at T0 and T0 + 1
+  it('refunds every joiner of a table nobody starts, a table timeout after the last join', async () => {
+    const sim = await BackgammonSimulator.create(defaultBgConfig());
+    await seatBoth(sim, seats(), T0); // joins at T0 and T0 + 1
     await rejects(sim.abortTable(T0 + 1 + 600), /not stalled/);
     assert.equal(await sim.abortTable(T0 + 1 + 601), 20_000n);
     const l = sim.getLedger();
@@ -861,51 +823,46 @@ describe('aborting', () => {
     assert.equal(l.pot, 0n);
   });
 
-  it('refunds both seats when the operator stalls a roll past the grace', async () => {
-    const { sim, players, mover } = await rolledGame();
-    const dice = diceOf(sim.getLedger());
-    sim.asPlayer(players[mover].sk);
-    await sim.move(Rules.legalPlies(Rules.initialSide(), Rules.initialSide(), dice)[0]!, T0 + 20);
+  it('refunds both seats when neither reveals its share, past the grace', async () => {
+    const { sim } = await startedGame();
     const deadline = Number(sim.getLedger().deadline);
     await rejects(sim.abortTable(deadline + 600), /not stalled/);
     assert.equal(await sim.abortTable(deadline + 601), 20_000n);
-    const l = sim.getLedger();
-    assert.equal(l.phase, BG_PHASE.aborted);
-    assert.equal(l.pot, 0n);
+    assert.equal(sim.getLedger().phase, BG_PHASE.aborted);
   });
 
-  it('never refunds a player who stalls its own move', async () => {
-    const { sim } = await rolledGame();
-    const deadline = Number(sim.getLedger().deadline);
-    await rejects(sim.abortTable(deadline + 100_000), /not stalled/);
+  it('never refunds a table once one share is in, or once play has begun', async () => {
+    const { sim, players } = await startedGame();
+    sim.asPlayer(players[0].sk);
+    await sim.reveal(0, T0 + 10);
+    await rejects(sim.abortTable(T0 + 100_000), /not stalled/);
+    const later = await laterGame();
+    await rejects(later.sim.abortTable(T0 + 100_000), /not stalled/);
   });
 });
 
 describe('settling', () => {
-  it('needs a decided game and the VRF key, until the grace waives it', async () => {
-    const { sim, players, mover } = await rolledGame();
+  it('needs a decided game, and pays the winner at its join-time address', async () => {
+    const { sim, players, mover } = await openedGame();
     sim.asOperator();
-    await rejects(sim.settle(sim.config.vrfSecret, T0 + 20), /not decided/);
-    sim.asPlayer(players[mover].sk);
+    await rejects(sim.settle(T0 + 20), /not decided/);
+    sim.asPlayer(players[mover]!.sk);
     await sim.eliminate(mover, true, T0 + 20);
-    const deadline = Number(sim.getLedger().deadline);
-    await rejects(sim.settle(sim.config.vrfSecret + 1n, deadline + 600), /does not open/);
-    assert.equal(await sim.settle(sim.config.vrfSecret + 1n, deadline + 601), BigInt(1 - mover));
+    sim.asOperator();
+    assert.equal(await sim.settle(T0 + 21), BigInt(1 - mover));
     const l = sim.getLedger();
     assert.equal(l.phase, BG_PHASE.settled);
-    assert.equal(l.revealedSecret, 0n, 'an unverified settle reveals nothing');
+    assert.equal(l.pot, 0n);
   });
 
   it('refuses a rake split that is not the 1%', async () => {
-    const { sim, players, mover } = await rolledGame();
-    sim.asPlayer(players[mover].sk);
+    const { sim, players, mover } = await openedGame();
+    sim.asPlayer(players[mover]!.sk);
     await sim.eliminate(mover, true, T0 + 20);
     sim.asOperator();
     sim.blockTime = T0 + 21;
     await rejects(
-      sim.run('settle', (ctx) =>
-        sim.bg.impureCircuits.settle(ctx, sim.config.vrfSecret, 199n, 100n),
-      ),
+      sim.run('settle', (ctx) => sim.bg.impureCircuits.settle(ctx, 199n, 0n)),
       /rake split/,
     );
   });

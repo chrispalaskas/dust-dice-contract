@@ -61,9 +61,9 @@ export type TableCircuitId =
 
 export type LobbyCircuitId = 'openTableAt' | 'tableFilled';
 
-/** The Backgammon table's six exported circuits. */
+/** The Backgammon table's eight exported circuits. */
 export type BackgammonCircuitId =
-  'join' | 'resolveRoll' | 'move' | 'eliminate' | 'settle' | 'abortTable';
+  'join' | 'start' | 'reveal' | 'openingMove' | 'move' | 'eliminate' | 'settle' | 'abortTable';
 
 export const CompiledTableContract = CompiledContract.make<Table.Contract<TablePrivateState>>(
   'Table',
@@ -140,14 +140,15 @@ export async function readBackgammonLedger(
 }
 
 /**
- * Which game a deployed contract is, from its own entry points: `move` is Backgammon's alone,
- * `playerMove` Yacht's. Undefined for anything else (a Lobby, or not a Dust Dice contract).
+ * Which game a deployed contract is, from its own entry points: `move` and `openingMove` are
+ * Backgammon's alone, `playerMove` Yacht's. Undefined for anything else (a Lobby, or not a Dust
+ * Dice contract).
  */
 export async function gameOf(address: string): Promise<'yacht' | 'backgammon' | undefined> {
   const ops = (await readContractState(address))
     .operations()
     .map((o) => (typeof o === 'string' ? o : new TextDecoder().decode(o)));
-  if (ops.includes('move') && ops.includes('resolveRoll')) return 'backgammon';
+  if (ops.includes('move') && ops.includes('openingMove')) return 'backgammon';
   if (ops.includes('playerMove')) return 'yacht';
   return undefined;
 }

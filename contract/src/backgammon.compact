@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The Backgammon table: two seats, one flat pot, Yacht's dust dice -- the ledger-9 build, whose
-// rolls come from the blind VRF (backgammon-dice.compact) instead of a committed seed.
+// every roll hashes a secret from EACH player and nothing of the operator's (backgammon-dice).
 //
 // One deployment per game, like the Yacht table (table.compact), and advertised the same way --
 // by a second instance of the unchanged Lobby. The winner takes the pot less a 1% rake. No
@@ -25,72 +25,59 @@
 // half -- a die left unplayed must be unplayable on the final board -- which closes "just pass".
 //
 // -------------------------------------------------------------------------------------------
-// 2. THE TURN IS TWO TRANSACTIONS
+// 2. A PLY IS ONE TRANSACTION, AND THE OPERATOR IS NOT IN IT
 // -------------------------------------------------------------------------------------------
 //
-//     filling  two or more have joined    ->  start(now, S, dleq)         (seats them, throws the opening)
-//     stage 0  the operator owes a roll   ->  resolveRoll(now, S, dleq)   (the only mid-game time stamp)
-//     stage 1  the player owes a move     ->  move(ply, nextQuery)
+//     filling  two or more have joined     ->  start(now)              anyone: seats the two earliest
+//     stage 0  both seats owe the opening  ->  reveal(seat, now)       each seat's share, any order
+//              then the higher opening die ->  openingMove(ply, now)   ply 0, with the opening dice
+//     stage 1  the player to move          ->  move(ply, now)          ply 1 on
 //
-// There is no "ask" step as in Yacht, because the queries are PIPELINED: `move` at ply t posts
-// the mover's blinded query for its next roll, at ply t+2, and `join` posts each seat's query
-// for ply 1 (only the seat that does not start uses it). So when the operator owes a roll, the
-// query it answers is already on chain. See backgammon-dice.compact.
+// Nobody answers a roll. A ply's dice hash the mover's own secret for that ply and the secret the
+// previous move revealed (backgammon-dice.compact), so the mover computes its roll the moment the
+// opponent's move lands, and its move reveals the secret that proves it. The dice of ply t >= 1
+// are PRIVATE to the mover until that move: nobody else holds its secret. The opening is public
+// once both shares are revealed.
 //
-// The dice of ply t >= 1 are PRIVATE until the move at t lands: only the mover can unblind the
-// operator's answer. The opponent sees the roll with the ply that plays it. The opening throw
-// (ply 0) is public from the moment the operator makes it.
+// A pass (`count == 0`) is a move like any other and reveals its secret too: the other seat's
+// next roll hashes it. A shut-out player therefore still sends its pass -- the website sends a
+// forced one by itself -- because skipping it would leave the next roll hashing only the mover's
+// own secret (reverted 2026-09-29, db2e94d).
 //
 // -------------------------------------------------------------------------------------------
 // 3. TIME
 // -------------------------------------------------------------------------------------------
 //
-// Declared-and-sandwiched, as table.compact section 5: `join` and `resolveRoll` declare `now`,
-// pinned within a slack of block time. Everything else compares block time against the stored
-// `deadline` with a kernel predicate:
+// Declared-and-sandwiched, as table.compact section 5: `join`, `start`, `reveal`, `openingMove`
+// and `move` declare `now`, pinned within `timeSlackSecs()` of block time. Every clock a call
+// starts is stamped a slack AHEAD -- `deadline = now + timeSlackSecs() + moveTimeoutSecs` -- so
+// the seat it is for has AT LEAST `moveTimeoutSecs` from the block the call landed in, whatever time the
+// caller declared (security-review C1: a deadline of `now + moveTimeoutSecs` would let the caller
+// start the other seat's clock in the past). Everything else compares block time against the
+// stored `deadline` with a kernel predicate:
 //
-//     eliminate (timeout)    stage 1, blockTimeGt(deadline)                  -> opponent wins
-//     move                   refused once blockTimeGte(deadline + moveTimeoutSecs)
-//     abortTable (operator)  stage 0, blockTimeGt(deadline + tableTimeoutSecs) -> both refunded
+//     eliminate (timeout)    the seat that owes -- the one to move, or a share not yet revealed
+//                            while the other's is -- past `deadline`          -> the other wins
+//     abortTable (opening)   neither share revealed past deadline + tableTimeoutSecs -> refunds
 //     abortTable (filling)   a table timeout after the latest join            -> slots refunded
-//     settle waiver          blockTimeGt(deadline + tableTimeoutSecs)         -> pays, unverified
 //
-// `move` declares no time, so a very late move could otherwise land just before the operator's
-// abort clock ran out and leave it no time to roll. Refusing a move once a whole extra move
-// timeout has passed guarantees the operator at least `tableTimeoutSecs - moveTimeoutSecs`, and
-// the constructor requires that to exceed the timeout floor. A player that late has been
-// eliminable for a full move timeout already.
-//
-// `abortTable` on the operator's stall requires stage 0 -- the roll is the OPERATOR'S -- so a
-// player losing a game cannot stall into a refund: its own silence is answered by `eliminate`.
-//
-// THE MOVE CLOCK IS STAMPED A SLACK AHEAD, so it is a guaranteed minimum. The operator's roll
-// declares `now`, which the chain accepts up to `rollSlackSecs()` behind real block time -- so a
-// deadline of `now + moveTimeoutSecs` would let a hostile operator start the player's clock in
-// the past and shave up to that slack off it (security-review C1, the Yacht table's reason for a
-// 240 s floor on every timeout). Stamping `now + rollSlackSecs() + moveTimeoutSecs` instead means
-// the player has AT LEAST `moveTimeoutSecs` from the block its dice landed in, whatever the
-// operator declared; an honest operator's declared time trails by a few blocks, so in practice
-// it is a little more. That is what lets the move clock be three minutes rather than four.
-//
-// The roll's slack is 60 s, not the 120 s `join` keeps: only the operator declares it, from its
-// own tip read to inclusion, with no wallet prompt in between (the reason for join's 120 s).
+// Both reveals stamp `deadline` BLINDLY (they read nothing the other writes, so they can land in
+// one block): the later one's stamp stands, and the starter's clock runs from the second share.
 //
 // -------------------------------------------------------------------------------------------
-// 4. THE RANDOMNESS RESIDUAL, STATED
+// 4. THE RANDOMNESS, AND WHAT IS LEFT
 // -------------------------------------------------------------------------------------------
 //
-// The operator cannot choose or change a roll: its VRF key is sealed before either player
-// exists, every answer carries a DLEQ the chain checks against it, and every input is forced.
-// It never sees a ply's roll before the mover plays it. It can stall, and a stall ends in a full
-// refund with no rake.
+// Every roll takes a secret from each player, forced from the key it committed at join, and
+// nothing from the operator (backgammon-dice.compact). So no one -- player, operator, or any two
+// of them together -- can choose a roll, and no one but the mover can compute one before the move
+// that plays it. Trying keys at join buys nothing: every roll also needs the other player's
+// secret, which is not known then, and a join reveals only its key's commitment.
 //
-// If the operator colludes with one player anyway, the pair still cannot see the honest
-// player's roll before it is played (it needs that player's secret), nor the colluder's own next
-// roll before the honest move in between (that roll hashes the secret the honest move reveals).
-// What remains is the opening: the operator knows it as it throws it, and the second joiner of
-// such a pair can grind its key at join to pick it. The board is deliberately NOT in any roll:
-// it would let a player choose among legal moves to steer the next one.
+// What is left is the order of revealing, and it only ever hurts the one who uses it. The later
+// of the two opening shares sees the opening first; a mover sees its roll before it moves. Either
+// can decline to act, and declining loses the game on the clock (`eliminate`). Neither can change
+// anything it reveals.
 //
 // -------------------------------------------------------------------------------------------
 // 6. JOINS DO NOT CONFLICT
@@ -106,11 +93,9 @@
 // both would land and one player's identity would silently overwrite the other's.
 //
 // Nothing shared is counted while the table fills -- no seat counter, no pot, no set of keys --
-// because counting is a read-modify-write. The operator's `start` reads every slot, seats the
-// two EARLIEST joiners (by declared join time, slot breaking ties) as seats 0 and 1, moves their
-// join entropies and ply-1 queries into the seats, refunds anyone else who joined in the same
-// moment, sets the pot, and throws the opening -- one transaction, the one the operator sent
-// anyway.
+// because counting is a read-modify-write. `start` -- anyone may send it; the operator does --
+// reads every slot, seats the two EARLIEST joiners (by declared join time, slot breaking ties) as
+// seats 0 and 1, refunds anyone else who joined in the same moment and sets the pot.
 //
 // Consequences, stated: the same secret may sit in two slots (seated twice, it plays itself for
 // its own stake -- the old one-seat-per-key set was the growing structure that made concurrent
@@ -123,13 +108,9 @@
 // 5. k, AND THE DEPLOY
 // -------------------------------------------------------------------------------------------
 //
-// Seven exported circuits. `move` carries the VRF reveal (a hash-to-curve and two scalar
-// multiplications) and sits at k=16 like Yacht's `playerMove` on this line; `start` is k=16 too
-// (eight slots read, up to six refunds, the opening's hash-to-curve and DLEQ) and runs once a
-// game. `resolveRoll` is only the DLEQ against a query already on chain and sits at k=12, like
-// Yacht's `resolveRoll` on this line -- the lower edge of the node's proof-size admission floor
-// (table.compact section 3), which k=12 has always cleared. The rest are 13 and 14. Measured
-// 2026-09-29 with cli/tools/circuit-k.mjs.
+// Eight exported circuits: join, start, reveal, openingMove, move, eliminate, settle, abortTable.
+// With no VRF a move proves no curve arithmetic; `move` is k=15 because the opening's hash lives
+// in `openingMove`, used once a game. Measured values: cli/tools/circuit-k.mjs.
 
 pragma language_version >= 0.26;
 
@@ -138,8 +119,6 @@ import CompactStandardLibrary;
 include "dice-core";
 
 include "policy-core";
-
-include "vrf-core";
 
 include "backgammon-dice";
 
@@ -159,15 +138,7 @@ pure circuit timeoutSlackFactor(): Uint<64> {
   return 2;
 }
 
-/**
- * Slack on the operator's declared `now` in `resolveRoll`. See section 3: the move deadline is
- * stamped this far ahead, so it can never be shaved.
- */
-pure circuit rollSlackSecs(): Uint<64> {
-  return 60;
-}
-
-/** The shortest move clock a table may seal: time to prove, approve and land a move. */
+/** The shortest move clock a table may seal: time to prove and land a move. */
 pure circuit minMoveSecs(): Uint<64> {
   return 120;
 }
@@ -196,12 +167,12 @@ export pure circuit noWinner(): Uint<8> {
   return 2;
 }
 
-/** The operator owes the roll. */
-export pure circuit stageRoll(): Uint<8> {
+/** Both seats owe their share of the opening; then the starter owes ply 0. */
+export pure circuit stageOpening(): Uint<8> {
   return 0;
 }
 
-/** The player to move owes its move. */
+/** The player to move owes its move (ply 1 on). */
 export pure circuit stageMove(): Uint<8> {
   return 1;
 }
@@ -220,7 +191,7 @@ export struct Board {
   s1: Vector<26, Uint<8>>,
 }
 
-/** Written once per seat, at `join`. Pre-inserted as zeros so every lookup is total. */
+/** Written once per seat, by the start. Pre-inserted as zeros so every lookup is total. */
 export struct SeatIdentity {
   addr: UserAddress,
   keyCommit: Bytes<32>,
@@ -238,13 +209,10 @@ export sealed ledger tier: Uint<64>;
 
 export sealed ledger rakeAddress: UserAddress;
 
-/** `x*G` for the table's VRF key `x`, sealed before any player existed. */
-export sealed ledger vrfPublicKey: JubjubPoint;
-
-/** How long the player to move has, from the roll, before it can be eliminated. */
+/** How long the seat that owes has, from the call that made it owe, before it can be eliminated. */
 export sealed ledger moveTimeoutSecs: Uint<64>;
 
-/** The fill clock, and the operator's grace past a deadline. See section 3. */
+/** The fill clock, and the grace before a table nobody opened is refunded. See section 3. */
 export sealed ledger tableTimeoutSecs: Uint<64>;
 
 /** `inviteCommitment(code)` on a private table; zeros on a public one. */
@@ -255,18 +223,18 @@ export ledger phase: BgPhase;
 /** 0 while filling (nothing is counted then -- section 6), 2 from the start. */
 export ledger seatCount: Uint<8>;
 
-/** The seat whose ply it is. Set by the opening roll; meaningless before. */
+/** The seat whose ply it is, from ply 1. At the opening it is the higher die's, read from the shares. */
 export ledger toMove: Uint<8>;
 
-/** `stageRoll()` or `stageMove()`. */
+/** `stageOpening()` or `stageMove()`. */
 export ledger stage: Uint<8>;
 
 /** Plies played so far. 0 until the opening ply has been played. */
 export ledger turn: Uint<16>;
 
 /**
- * The dice of the last ply PLAYED -- written by its move, which is where they become public --
- * or, from the opening throw until the opening ply, the opening pair. Zeros before the throw.
+ * The dice of the last ply PLAYED -- written by its move, which is where they become public.
+ * Zeros before ply 0 (the opening pair follows from the two shares; see `bgOpeningDice`).
  */
 export ledger dice: BgDice;
 
@@ -283,46 +251,25 @@ export ledger pot: Uint<64>;
 /** The winning seat once decided; `noWinner()` before. */
 export ledger winner: Uint<8>;
 
-/** The VRF key once `settle` showed it opens `vrfPublicKey`; 0 on an unverified settle. */
-export ledger revealedSecret: Field;
-
 /** How the table ended, as one hash. Zeros until `settle` or `abortTable`. */
 export ledger finalDigest: Bytes<32>;
 
 export ledger seatIdentity: Map<Uint<8>, SeatIdentity>;
 
-/** Each seat's join entropy, which the opening throw hashes. */
-export ledger joinEntropy: Map<Uint<8>, Bytes<32>>;
+/** Each seat's share of the opening, revealed after the start; zeros until then. */
+export ledger openingShare: Map<Uint<8>, Bytes<32>>;
 
-/** A seat's blinded VRF query for its roll at ply `turn`. Checked only when it is used. */
-export struct BgQuery {
-  turn: Uint<16>,
-  blinded: JubjubPoint,
-}
-
-/** Each seat's query for its next roll: ply 1 from `join`, then ply t+2 from its move at t. */
-export ledger query: Map<Uint<8>, BgQuery>;
-
-/** The operator's answer `S = x*B` to the query of the player to move. See backgammon-dice. */
-export ledger rollAnswer: JubjubPoint;
-
-/** The roll secret the last move revealed; it goes into the next roll. Zeros before ply 0. */
+/** The roll secret the last move revealed; the next roll hashes it. Zeros before ply 0. */
 export ledger lastSecret: Bytes<32>;
 
-/** The filling table's slots (section 6): who joined each, its e(1), and its declared time. */
-/**
- * One slot of a filling table (section 6): who joined it, the join entropy it revealed (which the
- * opening hashes), its blinded query for ply 1, and when it declared it joined.
- */
+/** One slot of a filling table (section 6): who joined it, and when it declared it joined. */
 export struct BgSlot {
   addr: UserAddress,
   keyCommit: Bytes<32>,
-  entropy: Bytes<32>,
-  query: JubjubPoint,
   joinedAt: Uint<64>,
 }
 
-/** The filling table's slots. ONE map of records, not four maps: see the constructor. */
+/** The filling table's slots. ONE map of records, not a map per field: see the constructor. */
 export ledger joinSlots: Map<Uint<8>, BgSlot>;
 
 /** Sink for the transaction padding. See table.compact section 3. */
@@ -336,17 +283,11 @@ pure circuit paddingConstant(): Bytes<4096> {
 // Witnesses -- a subset of the Yacht table's (src/table-witnesses.ts serves both)
 // ===========================================================================================
 
-/** The seated player's secret `sk`. `join` commits to it; `move` proves it. */
+/** The seated player's secret `sk`. `join` commits to it; `reveal` and `move` prove it. */
 witness playerEntropySecret(): Bytes<32>;
 
 /** A private table's invite code. Zeros otherwise. */
 witness inviteCode(): Bytes<32>;
-
-/**
- * The unblinded VRF output of the mover's roll, `Gamma = rho^-1 * S = x*P`. Checked by
- * `S == rho*Gamma` with `rho` derived in the circuit. See backgammon-dice.compact.
- */
-witness vrfGamma(): JubjubPoint;
 
 // ===========================================================================================
 // Helpers
@@ -361,7 +302,6 @@ export struct BgFinalEvent {
   turn: Uint<16>,
   paid: Uint<64>,
   rake: Uint<64>,
-  verifiable: Boolean,
   board: Board,
 }
 
@@ -372,18 +312,16 @@ pure circuit finalDigestOf(
                plies: Uint<16>,
                paid: Uint<64>,
                rake: Uint<64>,
-               verifiable: Boolean,
                b: Board,
                ): Bytes<32> {
   return persistentHash<BgFinalEvent>(
-           BgFinalEvent { domain: pad(32, "dust-dice:bg:v1:final"),
+           BgFinalEvent { domain: pad(32, "dust-dice:bg:v3:final"),
                           tableId: id,
                           ending: ending,
                           winner: win,
                           turn: plies,
                           paid: paid,
                           rake: rake,
-                          verifiable: verifiable,
                           board: b, }
            );
 }
@@ -402,24 +340,6 @@ circuit padTransaction(): [] {
   padStore = paddingConstant();
 }
 
-/**
- * BALLAST: make `resolveRoll` heavy enough that ledger 9 classes it wholly FALLIBLE.
- *
- * Load-bearing, as table.compact's `resolveBallast` is for Yacht's resolve. The one-transaction
- * ply merges the player's `move` (heavy, wholly fallible) with the operator's `resolveRoll` for the
- * next ply, and ledger 9 refuses a merged transaction in which a call with a GUARANTEED
- * transcript follows one with a FALLIBLE one (`CausalityConstraintViolation`, bugs-found #35).
- * Left alone, the roll -- a DLEQ proven off chain and a handful of cells -- is light enough to be
- * classed guaranteed. The weight is reads of slot 0's join time, which nothing writes once the
- * table has started (only joins and leaves, while filling), so it binds to nothing a ply races.
- * cli/src/bg/ply.ts checks the classification on every roll it builds.
- */
-circuit resolveBallast(): [] {
-  for (const _i of 0..10) {
-    assert(joinSlots.member(0), "resolveRoll: slot 0 is always present");
-  }
-}
-
 /** Pin a declared (already disclosed) `now` to block time. See table.compact's `pinTime`. */
 circuit pinTime(now: Uint<64>): [] {
   assert(blockTimeGte(now), "declared time is ahead of block time");
@@ -428,12 +348,9 @@ circuit pinTime(now: Uint<64>): [] {
          );
 }
 
-/** `pinTime` with the operator's tighter roll slack. */
-circuit pinRollTime(now: Uint<64>): [] {
-  assert(blockTimeGte(now), "declared time is ahead of block time");
-  assert(blockTimeLt((now + rollSlackSecs()) as Uint<64>),
-         "declared time is further behind block time than the roll's slack"
-         );
+/** The deadline a call starts for the seat it hands the game to: a slack ahead (section 3). */
+circuit clockFrom(now: Uint<64>): Uint<64> {
+  return (now + timeSlackSecs() + moveTimeoutSecs) as Uint<64>;
 }
 
 /** Every stake received is still in the pot: nothing leaves before the end. */
@@ -452,6 +369,17 @@ circuit proveSeat(s: Uint<8>): Bytes<32> {
   return sk;
 }
 
+/** Has seat `s` revealed its share of the opening? A forced share is zeros only by accident. */
+circuit hasShare(s: Uint<8>): Boolean {
+  return openingShare.lookup(s) != default<Bytes<32>>;
+}
+
+/** The seat the opening makes move first: the higher of the two opening dice. */
+circuit openingStarter(): Uint<8> {
+  const od = bgOpeningDice(tableId, openingShare.lookup(0), openingShare.lookup(1));
+  return od.a > od.b ? 0 : 1;
+}
+
 /** One slot, as the start and the filling abort read it. */
 export struct SlotInfo {
   slot: Uint<8>,
@@ -462,11 +390,7 @@ export struct SlotInfo {
 
 /** A free slot: the zero address marks it free (a join refuses a zero payout address). */
 pure circuit emptySlot(): BgSlot {
-  return BgSlot { addr: default<UserAddress>,
-                  keyCommit: default<Bytes<32>>,
-                  entropy: default<Bytes<32>>,
-                  query: default<JubjubPoint>,
-                  joinedAt: 0, };
+  return BgSlot { addr: default<UserAddress>, keyCommit: default<Bytes<32>>, joinedAt: 0 };
 }
 
 /** A slot's holder, as a seat identity. */
@@ -535,7 +459,6 @@ circuit refundSlots(slots: Vector<8, SlotInfo>, keepA: Uint<8>, keepB: Uint<8>, 
 constructor(id: Bytes<32>,
             stake: Uint<64>,
             rakeTo: UserAddress,
-            vrfPk: JubjubPoint,
             moveTimeout: Uint<64>,
             tableTimeout: Uint<64>,
             invite: Bytes<32>,
@@ -545,16 +468,10 @@ constructor(id: Bytes<32>,
   const floor = (timeSlackSecs() * timeoutSlackFactor()) as Uint<64>;
   assert(moveTimeout >= minMoveSecs(), "move timeout must be at least two minutes");
   assert(tableTimeout > floor, "table timeout must exceed the declared-time floor");
-  // Section 3: after the latest move `move` accepts, the operator still has
-  // `tableTimeout - moveTimeout` to roll before it can be aborted; that must beat the floor too.
-  assert(tableTimeout > (moveTimeout + floor) as Uint<64>,
-         "table timeout must exceed the move timeout by the declared-time floor"
-         );
 
   tableId = disclose(id);
   tier = disclose(stake);
   rakeAddress = disclose(rakeTo);
-  vrfPublicKey = disclose(vrfPk);
   moveTimeoutSecs = disclose(moveTimeout);
   tableTimeoutSecs = disclose(tableTimeout);
   inviteHash = disclose(invite);
@@ -562,7 +479,7 @@ constructor(id: Bytes<32>,
   phase = BgPhase.filling;
   seatCount = 0;
   toMove = 0;
-  stage = stageRoll();
+  stage = stageOpening();
   turn = 0;
   dice = BgDice { a: 0, b: 0 };
   board = Board { s0: bgInitialSide(), s1: bgInitialSide() };
@@ -571,29 +488,24 @@ constructor(id: Bytes<32>,
   deadline = 0;
   pot = 0;
   winner = noWinner();
-  revealedSecret = 0 as Field;
   finalDigest = default<Bytes<32>>;
-  rollAnswer = default<JubjubPoint>;
   lastSecret = default<Bytes<32>>;
 
-  // Both slots pre-inserted, so every lookup at a fixed index is total (table.compact section 7).
+  // Both seats pre-inserted, so every lookup at a fixed index is total (table.compact section 7).
   for (const s of 0..2) {
     seatIdentity.insert(
       s as Uint<8>,
       SeatIdentity { addr: default<UserAddress>, keyCommit: default<Bytes<32>> }
       );
-    joinEntropy.insert(s as Uint<8>, default<Bytes<32>>);
-    query.insert(s as Uint<8>, BgQuery { turn: 0, blinded: default<JubjubPoint> });
+    openingShare.insert(s as Uint<8>, default<Bytes<32>>);
   }
   // Every slot pre-inserted: a join then overwrites one cell of a fixed size, so its cost does
   // not depend on how many others joined first (the gas trap of docs/order-independent-join.md).
   //
-  // ONE MAP OF RECORDS, NOT FOUR MAPS. On this ledger a slot also carries its ply-1 query, and
-  // with identity, entropy, query and join time in four maps of eight the deploy was refused
-  // ("Transaction would exhaust the block limits", devnet 2026-09-29: 32,345 bytes written
-  // against the Yacht table's 28,920, which lands). One record per slot is 25,569 -- each map
-  // entry carries its own overhead -- and the start and the filling abort read eight cells
-  // instead of sixteen.
+  // ONE MAP OF RECORDS, NOT A MAP PER FIELD: each map entry carries its own overhead, and with a
+  // slot's fields in four maps of eight the deploy was refused ("Transaction would exhaust the
+  // block limits", devnet 2026-09-29: 32,345 bytes written against the Yacht table's 28,920,
+  // which lands). It also lets the start and the filling abort read eight cells, not sixteen.
   for (const s of 0..8) {
     joinSlots.insert(s as Uint<8>, emptySlot());
   }
@@ -604,19 +516,14 @@ constructor(id: Bytes<32>,
 // ===========================================================================================
 
 /**
- * Claim `slot`, stake `tier`, register the seat key, reveal its join entropy (which the opening
- * hashes) and post its blinded query for a roll at ply 1 (only the seat that does not start
- * uses it).
+ * Claim `slot`, stake `tier` and commit to the seat key. Nothing else is revealed: the opening's
+ * share comes after the start (backgammon-dice.compact), so no joiner can tune its key to it.
  *
  * Reads `phase`, constants and this slot, and nothing else (section 6), so joins to different
- * slots land together. The game starts with the operator's opening roll, not with a join: a join
- * cannot know it is the second without reading what the other joins wrote.
+ * slots land together. The game starts with `start`, not with a join: a join cannot know it is
+ * the second without reading what the other joins wrote.
  */
-export circuit join(slot: Uint<8>,
-                    payoutTo: UserAddress,
-                    now: Uint<64>,
-                    firstQuery: JubjubPoint,
-                    ): Uint<8> {
+export circuit join(slot: Uint<8>, payoutTo: UserAddress, now: Uint<64>): Uint<8> {
   assert(phase == BgPhase.filling, "join: table is not filling");
 
   const s = disclose(slot);
@@ -638,11 +545,7 @@ export circuit join(slot: Uint<8>,
          "join: this table is private -- the invite code does not match"
          );
 
-  joinSlots.insert(s, BgSlot { addr: who,
-                           keyCommit: commit,
-                           entropy: disclose(bgJoinEntropy(sk, tableId)),
-                           query: disclose(firstQuery),
-                           joinedAt: t, });
+  joinSlots.insert(s, BgSlot { addr: who, keyCommit: commit, joinedAt: t });
   receiveUnshielded(nativeToken(), tier as Uint<128>);
 
   padTransaction();
@@ -650,158 +553,82 @@ export circuit join(slot: Uint<8>,
 }
 
 // ===========================================================================================
-// start -- the operator seats the players and throws the opening
+// start -- seat the players
 // ===========================================================================================
 
 /**
  * The START (section 6): seat the two earliest joiners, refund anyone else who joined in the same
- * moment, set the pot, and throw the opening -- one transaction.
- *
- * The opening's point is public, `bgOpeningPoint` of the two seated joiners' join entropies, so
- * the dice follow from the operator's `S` here: the seat with the higher die moves first and
- * plays both numbers. The DLEQ against the sealed `vrfPublicKey` is the authority, as at every
- * roll.
- *
- * A circuit of its own, not a branch of `resolveRoll`: reading eight slots and refunding up to six
- * of them put `resolveRoll` at k=16 (measured 2026-09-29), and every ply's roll would have paid
- * for a start that happens once. Here it is paid once.
+ * moment, set the pot, and start both seats' clocks for their opening shares. Anyone may send
+ * it -- it takes no secret and decides nothing a caller could steer.
  */
-export circuit start(now: Uint<64>,
-                     response: JubjubPoint,
-                     dleqA1: JubjubPoint,
-                     dleqA2: JubjubPoint,
-                     dleqZ: Field,
-                     ): BgDice {
+export circuit start(now: Uint<64>): [] {
   assert(phase == BgPhase.filling, "start: table is not filling");
 
   const t = disclose(now);
-  pinRollTime(t);
+  pinTime(t);
 
   const slots = allSlots();
   const p = fold(pickTwo, noPick2(), slots);
   assert(p.count >= 2, "start: fewer than two players have joined");
-  const sa = joinSlots.lookup(p.a);
-  const sb = joinSlots.lookup(p.b);
-  const ea = sa.entropy;
-  const eb = sb.entropy;
-  seatIdentity.insert(0, SeatIdentity { addr: sa.addr, keyCommit: sa.keyCommit });
-  seatIdentity.insert(1, SeatIdentity { addr: sb.addr, keyCommit: sb.keyCommit });
-  joinEntropy.insert(0, ea);
-  joinEntropy.insert(1, eb);
-  query.insert(0, BgQuery { turn: 1, blinded: sa.query });
-  query.insert(1, BgQuery { turn: 1, blinded: sb.query });
+  seatIdentity.insert(0, slotSeat(p.a));
+  seatIdentity.insert(1, slotSeat(p.b));
   refundSlots(slots, p.a, p.b, true);
   pot = (tier * 2) as Uint<64>;
   seatCount = 2;
   phase = BgPhase.playing;
-
-  const s = disclose(response);
-  assert(disclose(vrfDleqHolds(vrfPublicKey, bgOpeningPoint(tableId, ea, eb), s, dleqA1, dleqA2,
-                               dleqZ)),
-         "start: the answer is not this table's VRF applied to the opening"
-         );
-  const thrown = bgDice(tableId, s, default<Bytes<32>>, 0, true);
-  toMove = thrown.a > thrown.b ? 0 : 1;
-  dice = thrown;
-  rollAnswer = s;
-  stage = stageMove();
-  // A slack ahead of the declared time: at least `moveTimeoutSecs` of real time (section 3).
-  deadline = (t + rollSlackSecs() + moveTimeoutSecs) as Uint<64>;
+  stage = stageOpening();
+  deadline = clockFrom(t);
 
   padTransaction();
-  return thrown;
 }
 
 // ===========================================================================================
-// resolveRoll -- the operator
+// reveal -- a seat's share of the opening
 // ===========================================================================================
 
 /**
- * Answer the mover's blinded query for the ply about to be played (ply 1 on; the opening is
- * `start`'s).
+ * Reveal seat `seat`'s share of the opening, forced from its key (backgammon-dice.compact).
  *
- * The DLEQ against the sealed `vrfPublicKey` is the authority -- exactly one `S` has a valid
- * proof for a given point, so the operator can neither choose the answer nor aim it. The point
- * is blind, and the dice appear only in the mover's `move`.
+ * Reads the phase, the stage, this seat's identity and this seat's own share cell -- nothing the
+ * other seat's reveal writes -- so both reveals can land in one block. `deadline` is written
+ * blind: the later reveal's stamp stands, and the starter's clock runs from the second share.
  */
-export circuit resolveRoll(now: Uint<64>,
-                           response: JubjubPoint,
-                           dleqA1: JubjubPoint,
-                           dleqA2: JubjubPoint,
-                           dleqZ: Field,
-                           ): [] {
-  assert(phase == BgPhase.playing, "resolveRoll: table is not playing");
-  assert(stage == stageRoll(), "resolveRoll: no roll is owed");
+export circuit reveal(seat: Uint<8>, now: Uint<64>): [] {
+  assert(phase == BgPhase.playing, "reveal: table is not playing");
+  assert(stage == stageOpening(), "reveal: the opening has been played");
 
+  const s = disclose(seat);
   const t = disclose(now);
-  pinRollTime(t);
+  assert(s < 2, "reveal: no such seat");
+  pinTime(t);
 
-  const q = query.lookup(toMove);
-  assert(q.turn == turn, "resolveRoll: the player to move has no query for this ply");
-  const s = disclose(response);
-  assert(disclose(vrfDleqHolds(vrfPublicKey, q.blinded, s, dleqA1, dleqA2, dleqZ)),
-         "resolveRoll: the answer is not this table's VRF applied to the query"
-         );
+  const sk = proveSeat(s);
+  assert(!hasShare(s), "reveal: this seat has revealed its share already");
+  openingShare.insert(s, disclose(bgOpeningSecret(sk, tableId)));
+  deadline = clockFrom(t);
 
-  rollAnswer = s;
-  stage = stageMove();
-  // A slack ahead of the declared time: at least `moveTimeoutSecs` of real time (section 3).
-  deadline = (t + rollSlackSecs() + moveTimeoutSecs) as Uint<64>;
-
-  // Before the padding's checkpoint, as Yacht's. See `resolveBallast`.
-  resolveBallast();
   padTransaction();
 }
 
 // ===========================================================================================
-// move -- the player to move
+// openingMove and move -- the player to move
 // ===========================================================================================
 
 /**
- * Reveal the roll and play it: up to four sub-moves, in order, each checked against the board as
- * it stands when that checker moves. `count == 0` is a pass (no legal move -- see section 1).
- *
- * At ply 0 the dice are the opening throw, already public. After it they are the mover's VRF
- * roll, unblinded here -- the only place anyone but the mover can learn them. The move reveals
- * the roll's secret (the next roll hashes it) and posts the mover's query for its roll at ply
- * t+2. Bearing off the fifteenth checker decides the game for the mover.
+ * Play a ply with dice `d` for `mover`: up to four sub-moves, in order, each checked against the
+ * board as it stands when that checker moves; `count == 0` is a pass (no legal move -- see
+ * section 1). Records the ply, discloses its dice and the ply's secret `v` (the other seat's next
+ * roll hashes it), and hands the game on -- or, when the mover bore off its fifteenth checker,
+ * decides it.
  */
-export circuit move(ply: Vector<4, SubMove>, count: Uint<8>, nextQuery: JubjubPoint): Uint<16> {
-  assert(phase == BgPhase.playing, "move: table is not playing");
-  assert(stage == stageMove(), "move: the dice have not been rolled");
-  assert(blockTimeLt((deadline + moveTimeoutSecs) as Uint<64>),
-         "move: too late -- a whole move timeout has passed since the deadline"
-         );
-
-  const mover = toMove;
-  const sk = proveSeat(mover);
-  const n = turn;
-  const opening = n == 0;
-
-  // ---- the roll (backgammon-dice.compact) ----------------------------------------------------
-  //
-  //   1. The query the operator answered is this seat's, for this ply.
-  //   2. `P` is rebuilt from this seat's forced secret for this ply -- not a point of its choice.
-  //   3. `B == rho*P`, with `rho` derived here, ties the answered query to that `P`.
-  //   4. `S == rho*Gamma` unblinds it without an inverse. It pins Gamma up to a small-order
-  //      point, which the dice never see: they hash `8*Gamma`.
-  const v = bgRollSecret(sk, tableId, n);
-  const rho = bgBlindingFor(sk, tableId, n) as JubjubScalar;
-  const q = query.lookup(mover);
-  assert(opening || q.turn == n, "move: this seat has no query on chain for this ply");
-  assert(disclose(opening || ecMul(bgVrfInputPoint(tableId, n, v), rho) == q.blinded),
-         "move: the query on chain is not this seat's input point blinded"
-         );
-  const gamma = vrfGamma();
-  assert(disclose(opening || ecMul(gamma, rho) == rollAnswer),
-         "move: gamma does not unblind the operator's answer"
-         );
-  const rolled = bgDice(tableId, gamma, lastSecret, n, false);
-  // The one disclosure of the roll: the dice are public from this move on, `gamma` never.
-  const d = disclose(opening ? dice : rolled);
-
-  const p = disclose(ply);
-  const c = disclose(count);
+circuit playPly(mover: Uint<8>,
+                d: BgDice,
+                p: Vector<4, SubMove>,
+                c: Uint<8>,
+                v: Bytes<32>,
+                n: Uint<16>,
+                t: Uint<64>,
+                ): Uint<16> {
   const bd = board;
   const first = mover == 0;
   const out = applyPlyStrict(first ? bd.s0 : bd.s1, first ? bd.s1 : bd.s0, d.a, d.b, p, c);
@@ -810,17 +637,64 @@ export circuit move(ply: Vector<4, SubMove>, count: Uint<8>, nextQuery: JubjubPo
   lastPly = Ply { moves: p, count: c };
   dice = d;
   lastSecret = disclose(v);
-  query.insert(mover, BgQuery { turn: (n + 2) as Uint<16>, blinded: disclose(nextQuery) });
   const next = (n + 1) as Uint<16>;
   turn = next;
+  stage = stageMove();
 
   if (out.won) {
     phase = BgPhase.decided;
     winner = mover;
   } else {
     toMove = (1 - mover) as Uint<8>;
-    stage = stageRoll();
+    deadline = clockFrom(t);
   }
+  return next;
+}
+
+/**
+ * Ply 0: played by the higher opening die's seat, with the opening pair -- both read from the two
+ * shares. A circuit of its own so that `move`, which every other ply proves, does not also pay
+ * for the opening's hash: that put `move` at k=16 rather than 15 (measured 2026-09-29).
+ */
+export circuit openingMove(ply: Vector<4, SubMove>, count: Uint<8>, now: Uint<64>): Uint<16> {
+  assert(phase == BgPhase.playing, "openingMove: table is not playing");
+  assert(turn == 0, "openingMove: the opening has been played");
+  assert(hasShare(0) && hasShare(1),
+         "openingMove: the opening is not thrown yet -- both shares are needed"
+         );
+
+  const t = disclose(now);
+  pinTime(t);
+
+  const od = bgOpeningDice(tableId, openingShare.lookup(0), openingShare.lookup(1));
+  const mover = (od.a > od.b ? 0 : 1) as Uint<8>;
+  const sk = proveSeat(mover);
+  const v = bgRollSecret(sk, tableId, 0);
+  // The opening pair is public already (both shares are on the ledger); this discloses no more.
+  const next = playPly(mover, disclose(od), disclose(ply), disclose(count), v, 0, t);
+
+  padTransaction();
+  return next;
+}
+
+/**
+ * Ply 1 on. The dice hash the mover's secret for this ply, revealed here, and the secret the
+ * previous move revealed (backgammon-dice.compact).
+ */
+export circuit move(ply: Vector<4, SubMove>, count: Uint<8>, now: Uint<64>): Uint<16> {
+  assert(phase == BgPhase.playing, "move: table is not playing");
+  const n = turn;
+  assert(n > 0, "move: ply 0 is the opening's -- openingMove plays it");
+
+  const t = disclose(now);
+  pinTime(t);
+
+  const mover = toMove;
+  const sk = proveSeat(mover);
+  const v = bgRollSecret(sk, tableId, n);
+  // The one disclosure of the roll: the dice are public from this move on.
+  const d = disclose(bgPlyDice(tableId, v, lastSecret, n));
+  const next = playPly(mover, d, disclose(ply), disclose(count), v, n, t);
 
   padTransaction();
   return next;
@@ -833,10 +707,11 @@ export circuit move(ply: Vector<4, SubMove>, count: Uint<8>, nextQuery: JubjubPo
 /**
  * Three things, by state:
  *
- *   * playing, not voluntary: the seat to move owes its move past the deadline -> the opponent
- *     wins. Permissionless.
+ *   * playing, not voluntary: the seat that owes, past the deadline -> the opponent wins.
+ *     Permissionless. The seat that owes is the one to move -- or, at the opening, a seat whose
+ *     share is missing while the other's is in, or the starter once both are in.
  *   * playing, voluntary: the seat resigns (proves its secret) -> the opponent wins.
- *   * filling, voluntary: the only seat leaves and is refunded in full; the table is empty again.
+ *   * filling, voluntary: the seat leaves its slot and is refunded in full.
  */
 export circuit eliminate(seat: Uint<8>, voluntary: Boolean): Uint<8> {
   const s = disclose(seat);
@@ -854,7 +729,16 @@ export circuit eliminate(seat: Uint<8>, voluntary: Boolean): Uint<8> {
          "eliminate: wrong entropy secret for this seat"
          );
 
-  const timedOut = playing && !vol && stage == stageMove() && s == toMove && blockTimeGt(deadline);
+  // Who owes right now. At the opening: a missing share while the other's is in, or -- both in --
+  // the starter's ply 0. Neither share in is nobody's fault alone: `abortTable` refunds it.
+  const other = (1 - (s < 2 ? s : 0)) as Uint<8>;
+  const opening = stage == stageOpening();
+  const mine = playing && opening && hasShare(s < 2 ? s : 0);
+  const theirs = playing && opening && hasShare(other);
+  const owes = opening
+                 ? ((!mine && theirs) || (mine && theirs && openingStarter() == s))
+                 : s == toMove;
+  const timedOut = playing && !vol && owes && blockTimeGt(deadline);
   assert((filling && vol) || (playing && vol) || timedOut,
          "eliminate: this seat is not past its deadline, and is not leaving of its own accord"
          );
@@ -864,7 +748,7 @@ export circuit eliminate(seat: Uint<8>, voluntary: Boolean): Uint<8> {
     sendUnshielded(nativeToken(), tier as Uint<128>, right<ContractAddress, UserAddress>(who.addr));
     joinSlots.insert(s, emptySlot());
   } else {
-    winner = (1 - s) as Uint<8>;
+    winner = other;
     phase = BgPhase.decided;
   }
 
@@ -877,23 +761,12 @@ export circuit eliminate(seat: Uint<8>, voluntary: Boolean): Uint<8> {
 // ===========================================================================================
 
 /**
- * Pay the winner the pot less the 1% rake, and reveal the VRF key.
- *
- * Every roll was already proven as it was made (the DLEQ at each resolve, the unblinding in each
- * move). The key is what lets anyone REPLAY them: with `x` and the roll secrets the moves
- * revealed, each `Gamma = x*P` and so each roll can be recomputed from the public log alone.
- *
- * Past `deadline + tableTimeoutSecs` the key is waived: the winner is paid regardless and
- * `revealedSecret` stays 0, the table's "paid but not replayable" marker. A withheld key can
- * therefore delay a payout, never cancel it.
+ * Pay the winner the pot less the 1% rake. Permissionless: every input is on the ledger, and
+ * nothing is left to reveal -- every roll was proven by the move that played it, and replays from
+ * the secrets the moves revealed.
  */
-export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
+export circuit settle(q: Uint<64>, r: Uint<64>): Uint<8> {
   assert(phase == BgPhase.decided, "settle: the game is not decided");
-
-  const x = disclose(vrfSecret);
-  const opens = ecMulGenerator(x as JubjubScalar) == vrfPublicKey;
-  const graceExpired = blockTimeGt((deadline + tableTimeoutSecs) as Uint<64>);
-  assert(opens || graceExpired, "settle: the secret does not open the table's VRF key");
 
   assertCustody();
 
@@ -911,9 +784,8 @@ export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
     );
 
   pot = 0;
-  revealedSecret = opens ? x : 0 as Field;
   finalDigest =
-    finalDigestOf(tableId, BgPhase.settled as Uint<8>, w, turn, split[0], split[1], opens, board);
+    finalDigestOf(tableId, BgPhase.settled as Uint<8>, w, turn, split[0], split[1], board);
   phase = BgPhase.settled;
 
   padTransaction();
@@ -927,23 +799,24 @@ export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
 /**
  * Permissionless. Refunds every stake in full, no rake, in two situations:
  *
- *   * filling with one seat, past the fill clock;
- *   * playing, the OPERATOR owes the roll, and the table grace has passed on top of the
- *     deadline. Requiring stage 0 is load-bearing: see section 3.
+ *   * filling, and nobody new has joined for a table timeout (a lone player waiting, or a full
+ *     table nobody started);
+ *   * the opening, NEITHER seat has revealed its share, and a table timeout has passed on top of
+ *     the deadline. One share in and the other missing is the missing seat's fault: `eliminate`.
  */
 export circuit abortTable(): Uint<64> {
   const filling = phase == BgPhase.filling;
   const slots = allSlots();
   const p = fold(pickTwo, noPick2(), slots);
-  // Filling: nobody new has joined for a whole table timeout -- a lone player waiting, or a full
-  // table the operator never started (section 6).
   const fillingStalled =
           filling && p.count > 0 && blockTimeGt((p.latest + tableTimeoutSecs) as Uint<64>);
-  const operatorStalled =
+  const openingStalled =
           phase == BgPhase.playing &&
-          stage == stageRoll() &&
+          stage == stageOpening() &&
+          !hasShare(0) &&
+          !hasShare(1) &&
           blockTimeGt((deadline + tableTimeoutSecs) as Uint<64>);
-  assert(fillingStalled || operatorStalled,
+  assert(fillingStalled || openingStalled,
          "abortTable: the table is not stalled past its deadline"
          );
 
@@ -968,8 +841,7 @@ export circuit abortTable(): Uint<64> {
 
   const refunded = filling ? (tier * (p.count as Uint<64>)) as Uint<64> : pot;
   pot = 0;
-  finalDigest =
-    finalDigestOf(tableId, BgPhase.aborted as Uint<8>, noWinner(), turn, 0, 0, false, board);
+  finalDigest = finalDigestOf(tableId, BgPhase.aborted as Uint<8>, noWinner(), turn, 0, 0, board);
   phase = BgPhase.aborted;
 
   padTransaction();

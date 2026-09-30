@@ -5,11 +5,13 @@
  * The chain-only verifier for a Backgammon table. Given only the table's address, it reads every
  * transaction and the state each one left, and checks:
  *
- *   1. the VRF key `settle` revealed opens the public key sealed at deploy;
- *   2. every roll replays from that key and the secrets the moves revealed (bg-mirror.ts):
- *      the opening and who it made move first, then each ply's roll against the dice its move
- *      disclosed. The chain already checked each one as it was made (the DLEQ at every resolve,
- *      the unblinding in every move); the replay is the check that needs no proof system;
+ *   1. the start seated the two earliest joiners;
+ *   2. every roll replays from the secrets the two players revealed (bg-mirror.ts): the opening
+ *      from both seats' shares, and who it made move first, then each ply's roll from the secret
+ *      its move revealed and the one the move before it revealed, against the dice the move
+ *      played. No key, no operator: every input is on the ledger. (That each secret is the one
+ *      FORCED from its seat's key is proven in zero knowledge as it is revealed, and is by
+ *      construction not checkable from public data.)
  *   3. every ply re-applies to the board before it and gives the board after it
  *      (api/src/backgammon.ts, the circuit's twin);
  *   4. every ply obeyed the two rules the chain does NOT enforce -- play as many dice as you can,
@@ -19,19 +21,17 @@
  *   7. the settlement paid the winner pot - 1% at its join-time address and the rake to the
  *      sealed rake address, out of the contract's own balance (zero user inputs).
  *
- * Exit codes follow verify.ts: 0 verified, 1 a check failed (or force-settled, unreplayable),
- * 2 verified with findings (a player broke a rule the chain does not enforce), 3 not settled.
+ * Exit codes follow verify.ts: 0 verified, 1 a check failed, 2 verified with findings (a player broke a rule the chain does not enforce), 3 not settled.
  */
 
 import { Backgammon as Rules } from '@dust-dice/api';
 import {
   bgHeldSlots,
-  bgReplayOpening,
-  bgReplayRoll,
+  bgOpeningDiceTs,
+  bgPlyDiceTs,
   bgStartPick,
   bgStarter,
   nativeBalanceOf,
-  vrfPublicKeyOf,
 } from '@dust-dice/contract';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 
@@ -48,7 +48,7 @@ import {
 
 const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 
-const STAGE_ROLL = 0n;
+const STAGE_OPENING = 0n;
 const STAGE_MOVE = 1n;
 /** Slots someone holds. While filling nothing else counts the players -- the contract's §6. */
 const occupied = (led: BackgammonLedger): number => bgHeldSlots(led).length;
@@ -107,11 +107,9 @@ async function readSteps(address: string): Promise<Step[]> {
 /** Could this transaction's calls have taken the table from `p` to `s`? */
 function produces(eps: readonly string[], p: BackgammonLedger, s: BackgammonLedger): boolean {
   const P = Backgammon.BgPhase;
-  if (eps.includes('move')) return s.turn === p.turn + 1n;
+  if (eps.includes('move') || eps.includes('openingMove')) return s.turn === p.turn + 1n;
   if (eps.includes('start')) return p.phase === P.filling && s.phase === P.playing;
-  if (eps.includes('resolveRoll')) {
-    return p.stage === STAGE_ROLL && s.stage === STAGE_MOVE && s.turn === p.turn;
-  }
+  if (eps.includes('reveal')) return shareCount(s) === shareCount(p) + 1;
   if (eps.includes('join')) return occupied(s) === occupied(p) + 1;
   if (eps.includes('eliminate')) {
     return (
@@ -169,9 +167,15 @@ function stateKey(l: BackgammonLedger): string {
     occupied(l),
     l.winner,
     l.deadline,
+    shareCount(l),
     l.board.s0.join(','),
     l.board.s1.join(','),
   ].join('|');
+}
+
+/** How many of the two opening shares are in. */
+function shareCount(l: BackgammonLedger): number {
+  return [0n, 1n].filter((s) => l.openingShare.lookup(s).some((b) => b !== 0)).length;
 }
 
 function boardOf(led: BackgammonLedger): Rules.Board {
@@ -211,40 +215,18 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
   console.log(`  tableId        ${hex(tableId)}`);
   console.log(`  tier           ${final.tier}`);
   console.log(
-    `  VRF public key (${final.vrfPublicKey.x.toString(16).slice(0, 16)}…, ` +
-      `${final.vrfPublicKey.y.toString(16).slice(0, 16)}…)`,
-  );
-  console.log(
     `  move timeout   ${final.moveTimeoutSecs} s   table timeout ${final.tableTimeoutSecs} s`,
   );
   console.log(`  phase          ${Backgammon.BgPhase[final.phase]}`);
 
   if (final.phase !== Backgammon.BgPhase.settled) {
     console.log(
-      `\nNOT REPLAYABLE YET: this table is ${Backgammon.BgPhase[final.phase]}. Only a settled ` +
-        'table reveals the VRF key,\nand without it no roll can be recomputed offline. Every ' +
-        'roll was still proven on chain as it was made;\nnothing here says the game was dishonest.',
+      `\nNOT FINISHED YET: this table is ${Backgammon.BgPhase[final.phase]}. Every roll so far was ` +
+        'proven on chain as it was played;\nrun this again once the table has settled for the full ' +
+        'replay and the payout.',
     );
     return 3;
   }
-
-  console.log('\n── the revealed VRF key ──');
-  const secret = final.revealedSecret;
-  if (secret === 0n) {
-    console.log(
-      '\n  This table was FORCE-SETTLED: the key was not revealed before the grace ran out, so\n' +
-        '  `settle` paid the winner the chain had already decided and left `revealedSecret` at\n' +
-        '  zero. Every roll and every ply was still checked on chain as it was made, but the\n' +
-        '  rolls cannot be replayed offline.',
-    );
-    c.summary();
-    return 1;
-  }
-  const pk = vrfPublicKeyOf(secret);
-  c.ok(
-    'the key opens the VRF public key sealed at deploy',
-    pk.x === final.vrfPublicKey.x && pk.y === final.vrfPublicKey.y,
-  );
 
   const steps = await readSteps(address);
   console.log(`\n── ${steps.length} transactions ──`);
@@ -279,19 +261,6 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
         case 'join':
           break;
 
-        case 'resolveRoll': {
-          if (!prev) {
-            c.ok(`tx ${i}: a roll has a state before it`, false);
-            break;
-          }
-          // The roll is for the ply the table is now at: in a one-transaction ply that is the ply
-          // AFTER the move it rides with.
-          const turn = Number(led.turn);
-          // The answer is blind: its dice appear with the move that plays them.
-          c.ok(`roll ${turn}: the player now owes the move`, led.stage === STAGE_MOVE);
-          break;
-        }
-
         case 'start': {
           if (!prev || prev.phase !== Backgammon.BgPhase.filling) {
             c.ok(`tx ${i}: the start has a filling table before it`, false);
@@ -313,49 +282,54 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
                   hex(led.seatIdentity.lookup(BigInt(seat)).keyCommit),
               ),
           );
-          // The opening is thrown in the clear: its dice are on the ledger from this call.
-          const join = [led.joinEntropy.lookup(0n), led.joinEntropy.lookup(1n)] as const;
-          const expected = bgReplayOpening(secret, tableId, join);
           c.ok(
-            'the opening replays from the key and both join entropies',
-            Number(led.dice.a) === expected.a && Number(led.dice.b) === expected.b,
-            `chain ${led.dice.a}-${led.dice.b}, replay ${expected.a}-${expected.b}`,
+            'the start leaves both seats owing their share of the opening',
+            led.stage === STAGE_OPENING,
           );
-          c.ok(
-            'the opening: the higher die moves first',
-            Number(led.toMove) === bgStarter(expected),
-            `seat 0 threw ${expected.a}, seat 1 threw ${expected.b}; seat ${led.toMove} moved first`,
-          );
-          c.ok('the opening: the player now owes the move', led.stage === STAGE_MOVE);
           break;
         }
 
+        case 'reveal': {
+          if (!prev) break;
+          // Which seat revealed: the share that is new in this state.
+          const seat = [0n, 1n].find(
+            (x) => hex(prev!.openingShare.lookup(x)) !== hex(led.openingShare.lookup(x)),
+          );
+          c.ok(
+            `tx ${i}: a reveal added exactly one seat's share of the opening`,
+            seat !== undefined,
+          );
+          break;
+        }
+
+        case 'openingMove':
         case 'move': {
           if (!prev) {
             c.ok(`tx ${i}: a move has a state before it`, false);
             break;
           }
           const turn = Number(prev.turn);
-          const mover = Number(prev.toMove);
-          // The move discloses the roll it played (at ply 0, the opening already on the ledger).
+          // The move discloses the roll it played. Ply 0 plays the opening, from both shares, and is
+          // the higher die's to play; after it each roll replays from the secret this move revealed
+          // and the one the move before it did.
+          const opening =
+            turn === 0
+              ? bgOpeningDiceTs(tableId, [led.openingShare.lookup(0n), led.openingShare.lookup(1n)])
+              : null;
+          const mover = opening ? bgStarter(opening) : Number(prev.toMove);
           const dice: [number, number] = [Number(led.dice.a), Number(led.dice.b)];
-          if (turn > 0) {
-            const expected = bgReplayRoll({
-              secret,
-              tableId,
-              turn,
-              rollSecret: led.lastSecret,
-              lastSecret: prev.lastSecret,
-            });
+          const expected = opening ?? bgPlyDiceTs(tableId, led.lastSecret, prev.lastSecret, turn);
+          if (opening) {
             c.ok(
-              `roll ${turn}: replays from the key and the secret its move revealed`,
-              dice[0] === expected.a && dice[1] === expected.b,
-              `chain ${dice[0]}-${dice[1]}, replay ${expected.a}-${expected.b}`,
+              "the opening replays from both seats' shares, and the higher die moved first",
+              dice[0] === opening.a && dice[1] === opening.b && Number(led.toMove) !== mover,
+              `chain ${dice[0]}-${dice[1]}, replay ${opening.a}-${opening.b}; seat ${mover} moved first`,
             );
           } else {
             c.ok(
-              'ply 0 played the opening throw',
-              dice[0] === Number(prev.dice.a) && dice[1] === Number(prev.dice.b),
+              `roll ${turn}: replays from the secrets both players revealed`,
+              dice[0] === expected.a && dice[1] === expected.b,
+              `chain ${dice[0]}-${dice[1]}, replay ${expected.a}-${expected.b}`,
             );
           }
           const ply = plyOf(led);
@@ -390,12 +364,9 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
               Rules.hasWon(Rules.sidesFor(board, mover).mine) && Number(led.winner) === mover,
             );
           } else {
-            // The other seat is to roll -- or, in a one-transaction ply, has been rolled for.
-            const rolledToo = s.entryPoints.includes('resolveRoll');
             c.ok(
-              `ply ${turn}: the other seat is to ${rolledToo ? 'move, rolled for in the same transaction' : 'roll'}`,
-              Number(led.toMove) === 1 - mover &&
-                led.stage === (rolledToo ? STAGE_MOVE : STAGE_ROLL),
+              `ply ${turn}: the other seat is to move`,
+              Number(led.toMove) === 1 - mover && led.stage === STAGE_MOVE,
             );
           }
           break;
@@ -408,10 +379,12 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
             break;
           }
           const loser = 1 - Number(led.winner);
-          const timedOut = prev.stage === STAGE_MOVE && Number(prev.toMove) === loser;
-          decidedBy = timedOut
-            ? `seat ${loser} was eliminated (timed out or resigned while to move)`
-            : `seat ${loser} resigned`;
+          decidedBy =
+            prev.stage === STAGE_OPENING
+              ? `seat ${loser} was eliminated at the opening (a share or ply 0 not sent in time, or a resignation)`
+              : Number(prev.toMove) === loser
+                ? `seat ${loser} was eliminated (timed out or resigned while to move)`
+                : `seat ${loser} resigned`;
           c.ok(
             'eliminate decided the game for the other seat',
             led.phase === Backgammon.BgPhase.decided,

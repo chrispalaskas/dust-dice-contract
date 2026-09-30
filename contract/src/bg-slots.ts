@@ -62,8 +62,7 @@ export function bgRandomFreeSlot(l: SlotLedger, random: () => number = Math.rand
 /**
  * The two slots `start` seats, in seat order -- the two EARLIEST joiners by declared time, the
  * slot breaking a tie, exactly the contract's `pickTwo` -- or null with fewer than two held.
- * The operator needs it before it can answer the opening: the opening's VRF point hashes the
- * two seated joiners' join entropies (backgammon.compact `start`).
+ * Clients read it to know, before the start lands, which two joiners it will seat.
  */
 export function bgStartPick(l: SlotLedger): [number, number] | null {
   const order = bgHeldSlots(l)
