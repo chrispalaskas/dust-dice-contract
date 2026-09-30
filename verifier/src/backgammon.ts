@@ -173,6 +173,21 @@ function stateKey(l: BackgammonLedger): string {
   ].join('|');
 }
 
+/**
+ * Whether step `i` is a join whose block gained a slot for every join in it (see the loop): the
+ * block's state before it is the after-state of the last step of the block before.
+ */
+function everyJoinSeated(steps: readonly Step[], i: number): boolean {
+  const s = steps[i]!;
+  if (!s.entryPoints.includes('join')) return false;
+  const first = steps.findIndex((x) => x.blockHeight === s.blockHeight);
+  const before = first > 0 ? occupied(steps[first - 1]!.led) : 0;
+  const joins = steps.filter(
+    (x) => x.blockHeight === s.blockHeight && x.entryPoints.includes('join'),
+  ).length;
+  return occupied(s.led) - before >= joins;
+}
+
 /** How many of the two opening shares are in. */
 function shareCount(l: BackgammonLedger): number {
   return [0n, 1n].filter((s) => l.openingShare.lookup(s).some((b) => b !== 0)).length;
@@ -245,7 +260,13 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
     // in the same block (a roll that lost to a resignation), it fails its fallible half and
     // leaves the table as it was. The fee is spent; the game is not touched. Seen live on the
     // devnet 2026-09-25; the Yacht verifier learned the same lesson (bugs-found #34).
-    if (prev && stateKey(prev) === stateKey(led)) {
+    //
+    // The indexer keeps ONE state per block, so two transactions of one block read the same
+    // after-state whatever each did. Joins are the case that tells them apart: they never
+    // conflict, and each that took effect holds one more slot -- so as many slots gained over
+    // the block as it has joins means every one of them took a seat (both joins of a game
+    // landing together is the normal case since slot joins, 2026-09-29).
+    if (prev && stateKey(prev) === stateKey(led) && !everyJoinSeated(steps, i)) {
       console.log(
         `  tx ${i} (${what}): landed without effect -- a racing call changed the table first`,
       );
