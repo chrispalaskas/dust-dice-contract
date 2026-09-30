@@ -131,27 +131,6 @@
 // (table.compact section 3), which k=12 has always cleared. The rest are 13 and 14. Measured
 // 2026-09-29 with cli/tools/circuit-k.mjs.
 
-// -------------------------------------------------------------------------------------------
-// 7. A CLOSED-OUT PLAYER PASSES WITHOUT A TRANSACTION
-// -------------------------------------------------------------------------------------------
-//
-// A player with a checker on the bar whose six entry points are all held (two or more of the
-// opponent's on each) cannot move whatever it rolls. Its ply is a pass, and asking it to prove
-// and send one -- with the operator first answering a roll that cannot matter -- cost it a
-// transaction and the game half a minute per such turn. So `move` records the pass itself when
-// the ply it applies leaves the other seat shut out: `turn` advances by two, the same seat is to
-// move again, and the operator owes that seat its next roll.
-//
-// Only this case, because only this one is decidable without the dice: a general "no legal move"
-// test needs the roll, which is sealed until its move, and a search the circuit cannot afford.
-//
-// The skipped seat's blind query was never answered, so it is carried forward to that seat's next
-// ply unchanged (`BgQuery.formedAt` keeps the index it was formed for). One thing does change: the
-// mover's next roll hashes the secret ITS OWN move just revealed, not an opponent's. Without the
-// table's key nobody can use that; with it -- the operator colluding with the mover -- the pair
-// could foresee that roll while choosing the move that shuts the other seat out. It is the same
-// class as the opening's residual (section 4): the operator must not play at its own tables.
-
 pragma language_version >= 0.26;
 
 import CompactStandardLibrary;
@@ -315,16 +294,9 @@ export ledger seatIdentity: Map<Uint<8>, SeatIdentity>;
 /** Each seat's join entropy, which the opening throw hashes. */
 export ledger joinEntropy: Map<Uint<8>, Bytes<32>>;
 
-/**
- * A seat's blinded VRF query for its roll at ply `turn`. Checked only when it is used.
- *
- * `formedAt` is the ply index the query was FORMED for -- its roll secret, VRF point and blinding
- * are those of that index -- and equals `turn` except after an automatic pass (section 7), which
- * carries a closed-out seat's unanswered query forward two plies without re-forming it.
- */
+/** A seat's blinded VRF query for its roll at ply `turn`. Checked only when it is used. */
 export struct BgQuery {
   turn: Uint<16>,
-  formedAt: Uint<16>,
   blinded: JubjubPoint,
 }
 
@@ -611,7 +583,7 @@ constructor(id: Bytes<32>,
       SeatIdentity { addr: default<UserAddress>, keyCommit: default<Bytes<32>> }
       );
     joinEntropy.insert(s as Uint<8>, default<Bytes<32>>);
-    query.insert(s as Uint<8>, BgQuery { turn: 0, formedAt: 0, blinded: default<JubjubPoint> });
+    query.insert(s as Uint<8>, BgQuery { turn: 0, blinded: default<JubjubPoint> });
   }
   // Every slot pre-inserted: a join then overwrites one cell of a fixed size, so its cost does
   // not depend on how many others joined first (the gas trap of docs/order-independent-join.md).
@@ -716,8 +688,8 @@ export circuit start(now: Uint<64>,
   seatIdentity.insert(1, SeatIdentity { addr: sb.addr, keyCommit: sb.keyCommit });
   joinEntropy.insert(0, ea);
   joinEntropy.insert(1, eb);
-  query.insert(0, BgQuery { turn: 1, formedAt: 1, blinded: sa.query });
-  query.insert(1, BgQuery { turn: 1, formedAt: 1, blinded: sb.query });
+  query.insert(0, BgQuery { turn: 1, blinded: sa.query });
+  query.insert(1, BgQuery { turn: 1, blinded: sb.query });
   refundSlots(slots, p.a, p.b, true);
   pot = (tier * 2) as Uint<64>;
   seatCount = 2;
@@ -813,15 +785,11 @@ export circuit move(ply: Vector<4, SubMove>, count: Uint<8>, nextQuery: JubjubPo
   //   3. `B == rho*P`, with `rho` derived here, ties the answered query to that `P`.
   //   4. `S == rho*Gamma` unblinds it without an inverse. It pins Gamma up to a small-order
   //      point, which the dice never see: they hash `8*Gamma`.
-  //
-  // The point and blinding are those of the index the query was FORMED for, which is this ply
-  // unless an automatic pass carried the query forward (section 7). The dice still hash `n`.
+  const v = bgRollSecret(sk, tableId, n);
+  const rho = bgBlindingFor(sk, tableId, n) as JubjubScalar;
   const q = query.lookup(mover);
-  const k = opening ? n : q.formedAt;
-  const v = bgRollSecret(sk, tableId, k);
-  const rho = bgBlindingFor(sk, tableId, k) as JubjubScalar;
   assert(opening || q.turn == n, "move: this seat has no query on chain for this ply");
-  assert(disclose(opening || ecMul(bgVrfInputPoint(tableId, k, v), rho) == q.blinded),
+  assert(disclose(opening || ecMul(bgVrfInputPoint(tableId, n, v), rho) == q.blinded),
          "move: the query on chain is not this seat's input point blinded"
          );
   const gamma = vrfGamma();
@@ -842,48 +810,20 @@ export circuit move(ply: Vector<4, SubMove>, count: Uint<8>, nextQuery: JubjubPo
   lastPly = Ply { moves: p, count: c };
   dice = d;
   lastSecret = disclose(v);
-  const two = (n + 2) as Uint<16>;
-  query.insert(mover, BgQuery { turn: two, formedAt: two, blinded: disclose(nextQuery) });
-
-  // THE AUTOMATIC PASS (section 7): the seat to move next cannot enter from the bar whatever it
-  // rolls -- every point it could land on holds two or more of the mover's -- so its ply is a
-  // pass, recorded here instead of costing it a transaction. The mover rolls again.
-  const other = (1 - mover) as Uint<8>;
-  const closedOut = !out.won && closedOutBy(out.mine, out.opp);
-  if (closedOut) {
-    const qo = query.lookup(other);
-    query.insert(other, BgQuery { turn: (qo.turn + 2) as Uint<16>,
-                                  formedAt: qo.formedAt,
-                                  blinded: qo.blinded });
-  }
-  const next = (n + (closedOut ? 2 : 1)) as Uint<16>;
+  query.insert(mover, BgQuery { turn: (n + 2) as Uint<16>, blinded: disclose(nextQuery) });
+  const next = (n + 1) as Uint<16>;
   turn = next;
 
   if (out.won) {
     phase = BgPhase.decided;
     winner = mover;
   } else {
-    toMove = closedOut ? mover : other;
+    toMove = (1 - mover) as Uint<8>;
     stage = stageRoll();
   }
 
   padTransaction();
   return next;
-}
-
-/**
- * Is the OTHER seat shut out of the game for its next ply: a checker on its bar, and every one
- * of the six points it could enter on (the mover's 1..6, its 24..19) held by two or more of the
- * mover's checkers? Then no roll lets it move, and its ply can only be a pass.
- */
-export pure circuit closedOutBy(mine: Vector<26, Uint<8>>, opp: Vector<26, Uint<8>>): Boolean {
-  return opp[25] > 0 &&
-         mine[1] >= 2 &&
-         mine[2] >= 2 &&
-         mine[3] >= 2 &&
-         mine[4] >= 2 &&
-         mine[5] >= 2 &&
-         mine[6] >= 2;
 }
 
 // ===========================================================================================

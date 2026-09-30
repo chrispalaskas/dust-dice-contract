@@ -26,7 +26,6 @@ import { pureCircuits as bgPure } from '../managed/backgammon/contract/index.js'
 import {
   bgAnswer,
   bgAnswerHolds,
-  bgClosesOut,
   bgDiceFromBytesTs,
   bgDiceOf,
   bgGammaFor,
@@ -127,34 +126,6 @@ async function laterGame(config = defaultBgConfig()) {
 // =============================================================================================
 // Differential: the mirrors against the circuits
 // =============================================================================================
-
-describe('the closed-out rule', () => {
-  it('matches its TypeScript twin on random boards and at the edges', () => {
-    const r = rng(11);
-    const side = (): number[] => Array.from({ length: 26 }, () => Math.floor(r() * 4));
-    const cases: [number[], number[]][] = [];
-    for (let i = 0; i < 300; i++) {
-      const mine = side();
-      // Bias toward the interesting case: most home points made, a checker on the bar.
-      if (i % 2 === 0) for (let p = 1; p <= 6; p++) mine[p] = 2 + (r() < 0.2 ? -1 : 0);
-      const opp = side();
-      if (i % 3 === 0) opp[25] = 1;
-      cases.push([mine, opp]);
-    }
-    for (const [mine, opp] of cases) {
-      const c = bgPure.closedOutBy(mine.map(BigInt), opp.map(BigInt));
-      assert.equal(c, bgClosesOut(mine, opp), JSON.stringify([mine, opp]));
-    }
-    // Six made points and a checker on the bar: shut out. Five made, or nobody on the bar: not.
-    const closed = [0, 2, 2, 2, 2, 2, 2, ...Array(19).fill(0)];
-    const onBar = [...Array(25).fill(0), 1];
-    assert.equal(bgPure.closedOutBy(closed.map(BigInt), onBar.map(BigInt)), true);
-    const five = [...closed];
-    five[4] = 1;
-    assert.equal(bgPure.closedOutBy(five.map(BigInt), onBar.map(BigInt)), false);
-    assert.equal(bgPure.closedOutBy(closed.map(BigInt), Array(26).fill(0n)), false);
-  });
-});
 
 describe('the dice', () => {
   it("expands a roll's bytes exactly as the circuit does", () => {
@@ -403,57 +374,6 @@ describe('whole games', () => {
       gc();
     }
   });
-
-  it('passes for a closed-out seat without a transaction, and the game plays on to the end', async () => {
-    // A player that closes its board and hits whenever it can shuts the other seat out often
-    // enough to find one in a few games: then the contract records the pass itself (section 7),
-    // the mover rolls again, and the skipped seat's unanswered query is used at its next ply --
-    // every roll of which `playOut` replays from the key, carried queries included.
-    const closer = (
-      options: Rules.Ply[],
-      mine: Rules.Side,
-      opp: Rules.Side,
-      d: [number, number],
-    ) => {
-      let best = options[0]!;
-      let bestScore = -Infinity;
-      for (const ply of options) {
-        const after = Rules.applyPly(mine, opp, d, ply);
-        let made = 0;
-        for (let p = 1; p <= 6; p++) if (after.mine[p]! >= 2) made += 1;
-        const score =
-          (bgClosesOut(after.mine, after.opp) ? 1000 : 0) + 20 * after.opp[25]! + 5 * made;
-        if (score > bestScore) {
-          bestScore = score;
-          best = ply;
-        }
-      }
-      return best;
-    };
-    let passes = 0;
-    for (let seed = 1; seed <= 8 && passes === 0; seed++) {
-      const config = defaultBgConfig({ tableId: bytes32(0x70 + seed), seed: bytes32(0x90 + seed) });
-      const { sim, players } = await startedGame(config);
-      const failures: string[] = [];
-      const game = await playOut(
-        sim,
-        players,
-        rng(seed),
-        T0 + 10,
-        (msg, ok) => {
-          if (!ok) failures.push(msg);
-        },
-        closer,
-      );
-      assert.deepEqual(failures, [], `game ${seed}`);
-      passes += game.autoPasses;
-      sim.asOperator();
-      await sim.settle(config.vrfSecret, game.t + 5);
-      assert.equal(sim.getLedger().phase, BG_PHASE.settled);
-      gc();
-    }
-    assert.ok(passes > 0, 'no game shut a seat out -- widen the search');
-  });
 });
 
 // =============================================================================================
@@ -535,7 +455,6 @@ describe('joining', () => {
     assert.equal(hex(l.joinEntropy.lookup(0n)), hex(bgJoinEntropyTs(pB.sk, sim.config.tableId)));
     assert.deepEqual(l.query.lookup(1n), {
       turn: 1n,
-      formedAt: 1n,
       blinded: bgQueryFor(pC.sk, sim.config.tableId, 1),
     });
     // Once started, nobody else can sit down.

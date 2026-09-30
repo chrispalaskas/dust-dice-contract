@@ -25,7 +25,6 @@
 
 import { Backgammon as Rules } from '@dust-dice/api';
 import {
-  bgClosesOut,
   bgHeldSlots,
   bgReplayOpening,
   bgReplayRoll,
@@ -108,9 +107,7 @@ async function readSteps(address: string): Promise<Step[]> {
 /** Could this transaction's calls have taken the table from `p` to `s`? */
 function produces(eps: readonly string[], p: BackgammonLedger, s: BackgammonLedger): boolean {
   const P = Backgammon.BgPhase;
-  // A move advances one ply -- or two when it shut the other seat out and the contract passed
-  // for it (backgammon.compact section 7).
-  if (eps.includes('move')) return s.turn === p.turn + 1n || s.turn === p.turn + 2n;
+  if (eps.includes('move')) return s.turn === p.turn + 1n;
   if (eps.includes('start')) return p.phase === P.filling && s.phase === P.playing;
   if (eps.includes('resolveRoll')) {
     return p.stage === STAGE_ROLL && s.stage === STAGE_MOVE && s.turn === p.turn;
@@ -288,7 +285,7 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
             break;
           }
           // The roll is for the ply the table is now at: in a one-transaction ply that is the ply
-          // AFTER the move it rides with (two after, when the move shut the other seat out).
+          // AFTER the move it rides with.
           const turn = Number(led.turn);
           // The answer is blind: its dice appear with the move that plays them.
           c.ok(`roll ${turn}: the player now owes the move`, led.stage === STAGE_MOVE);
@@ -343,13 +340,10 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
           // The move discloses the roll it played (at ply 0, the opening already on the ledger).
           const dice: [number, number] = [Number(led.dice.a), Number(led.dice.b)];
           if (turn > 0) {
-            // The index the mover's query was formed for: this ply, or an earlier one an
-            // automatic pass carried forward.
             const expected = bgReplayRoll({
               secret,
               tableId,
               turn,
-              formedAt: prev.query.lookup(BigInt(mover)).formedAt,
               rollSecret: led.lastSecret,
               lastSecret: prev.lastSecret,
             });
@@ -388,18 +382,7 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
               `ply ${turn}, seat ${mover}, ${dice[0]}-${dice[1]} ${showPly(ply)}: ${broke}`,
             );
           }
-          // Shut out by this ply, the other seat's ply is a pass the contract records itself.
-          const after = Rules.sidesFor(board, mover);
-          const shut =
-            led.phase !== Backgammon.BgPhase.decided && bgClosesOut(after.mine, after.opp);
-          c.ok(
-            `ply ${turn}: the turn counter advanced${shut ? ' past the shut-out seat\u2019s pass' : ''}`,
-            Number(led.turn) === turn + (shut ? 2 : 1),
-          );
-          if (shut)
-            console.log(
-              `  ply ${turn + 1}: seat ${1 - mover} was shut out -- passed by the contract`,
-            );
+          c.ok(`ply ${turn}: the turn counter advanced`, Number(led.turn) === turn + 1);
           if (led.phase === Backgammon.BgPhase.decided) {
             decidedBy = `seat ${mover} bore off its fifteenth checker at ply ${turn}`;
             c.ok(
@@ -407,13 +390,12 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
               Rules.hasWon(Rules.sidesFor(board, mover).mine) && Number(led.winner) === mover,
             );
           } else {
-            // The other seat is to roll -- or, in a one-transaction ply, has been rolled for; after
-            // an automatic pass, the mover again.
+            // The other seat is to roll -- or, in a one-transaction ply, has been rolled for.
             const rolledToo = s.entryPoints.includes('resolveRoll');
-            const next = shut ? mover : 1 - mover;
             c.ok(
-              `ply ${turn}: ${shut ? 'the mover' : 'the other seat'} is to ${rolledToo ? 'move, rolled for in the same transaction' : 'roll'}`,
-              Number(led.toMove) === next && led.stage === (rolledToo ? STAGE_MOVE : STAGE_ROLL),
+              `ply ${turn}: the other seat is to ${rolledToo ? 'move, rolled for in the same transaction' : 'roll'}`,
+              Number(led.toMove) === 1 - mover &&
+                led.stage === (rolledToo ? STAGE_MOVE : STAGE_ROLL),
             );
           }
           break;

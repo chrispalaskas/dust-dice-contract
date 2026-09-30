@@ -114,9 +114,6 @@ reads only `phase`, constants and that slot:
 - On ledger 9 a slot also holds the joiner's blinded query for ply 1, and the slots are ONE map
   of records (`joinSlots`) rather than one map per field: four maps of eight put the deploy over
   the node's block limit.
-- **A closed-out player passes without a transaction** (contract section 7): when a move leaves
-  the other seat with a checker on the bar and all six entry points held, `move` records its
-  pass, the same seat rolls again, and the skipped seat's unanswered query carries forward.
 - A filling table's clock is its latest join: `abortTable` refunds every slot once nobody has
   joined for a table timeout. `eliminate(slot, true)` leaves and frees the slot.
 

@@ -30,7 +30,6 @@ import {
   bgOpeningPointTs,
   bgQueryFor,
   bgReplayOpening,
-  bgClosesOut,
   bgReplayRoll,
   bgResolvePoint,
   bgRollSecretTs,
@@ -224,7 +223,6 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
       sk: this.sk,
       tableId: this.config.tableId,
       turn: l.turn,
-      formedAt: l.query.lookup(l.toMove).formedAt,
       response: l.rollAnswer,
       lastSecret: l.lastSecret,
     });
@@ -342,8 +340,6 @@ export async function seatBoth(sim: BackgammonSimulator, players: [Seat, Seat], 
 
 export type PlayedGame = {
   plies: number;
-  /** Plies the contract passed for a closed-out seat (backgammon.compact section 7). */
-  autoPasses: number;
   winner: number;
   /** Every roll: what the mover saw, and what a replay from the key recomputes. */
   rolls: { turn: number; mover: number; chain: [number, number]; mirror: [number, number] }[];
@@ -363,16 +359,8 @@ export async function playOut(
   random: () => number,
   start: number,
   check: (msg: string, ok: boolean) => void,
-  /** Pick the ply from the legal ones; a random one by default. */
-  choose?: (
-    options: Rules.Ply[],
-    mine: Rules.Side,
-    opp: Rules.Side,
-    dice: [number, number],
-  ) => Rules.Ply,
 ): Promise<PlayedGame> {
   let t = start;
-  let autoPasses = 0;
   const rolls: PlayedGame['rolls'] = [];
   const { tableId, vrfSecret } = sim.config;
   for (let guard = 0; guard < 4000; guard++) {
@@ -386,8 +374,6 @@ export async function playOut(
     sim.asPlayer(players[mover].sk);
     const seen = sim.myRoll().dice;
     const chain: [number, number] = [seen.a, seen.b];
-    // The index the mover's query was formed for: this ply, unless an automatic pass carried it.
-    const formed = turn === 0 ? 0 : Number(rolled.query.lookup(BigInt(mover)).formedAt);
     const replay =
       turn === 0
         ? bgReplayOpening(vrfSecret, tableId, joinOf(rolled))
@@ -395,8 +381,7 @@ export async function playOut(
             secret: vrfSecret,
             tableId,
             turn,
-            formedAt: formed,
-            rollSecret: bgRollSecretTs(players[mover].sk, tableId, formed),
+            rollSecret: bgRollSecretTs(players[mover].sk, tableId, turn),
             lastSecret: rolled.lastSecret,
           });
     rolls.push({ turn, mover, chain, mirror: [replay.a, replay.b] });
@@ -405,11 +390,8 @@ export async function playOut(
 
     const { mine, opp } = Rules.sidesFor(boardOf(rolled), mover);
     const options = Rules.legalPlies(mine, opp, chain);
-    const ply = choose
-      ? choose(options, mine, opp, chain)
-      : options[Math.floor(random() * options.length)]!;
+    const ply = options[Math.floor(random() * options.length)];
     const after = Rules.applyPly(mine, opp, chain, ply);
-    const otherQuery = rolled.query.lookup(BigInt(1 - mover));
 
     t += 5;
     await sim.move(ply, t);
@@ -426,7 +408,7 @@ export async function playOut(
     check(
       `ply ${turn}: the move revealed the roll's forced secret`,
       Buffer.from(moved.lastSecret).equals(
-        Buffer.from(bgRollSecretTs(players[mover].sk, tableId, formed)),
+        Buffer.from(bgRollSecretTs(players[mover].sk, tableId, turn)),
       ),
     );
     check(
@@ -434,23 +416,8 @@ export async function playOut(
       moved.query.lookup(BigInt(mover)).turn === BigInt(turn + 2),
     );
     if (after.won) {
-      return { plies: Number(moved.turn), autoPasses, winner: mover, rolls, t };
+      return { plies: turn + 1, winner: mover, rolls, t };
     }
-    // Shut out: the contract passes for the other seat and the mover rolls again, the skipped
-    // seat's unanswered query carried two plies on, unchanged.
-    const shut = bgClosesOut(after.mine, after.opp);
-    if (shut) autoPasses += 1;
-    check(
-      `ply ${turn}: ${shut ? 'an automatic pass, the mover again' : 'the other seat to roll'}`,
-      moved.turn === BigInt(turn + (shut ? 2 : 1)) &&
-        Number(moved.toMove) === (shut ? mover : 1 - mover),
-    );
-    const carried = moved.query.lookup(BigInt(1 - mover));
-    check(
-      `ply ${turn}: the other seat's query is ${shut ? 'carried forward' : 'untouched'}`,
-      carried.turn === otherQuery.turn + (shut ? 2n : 0n) &&
-        carried.formedAt === otherQuery.formedAt,
-    );
   }
   throw new Error('playOut: no winner after 4000 plies');
 }
