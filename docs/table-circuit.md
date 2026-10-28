@@ -60,6 +60,13 @@ Verifier keys are 2,119 bytes for every circuit. `--skip-zk` compiles the whole 
 **0.72 s** and emits byte-identical ZKIR, so the instruction counts above are safe to quote from
 the dev loop; only key generation needs the full compile.
 
+**Practice tables (`house`, 2026-10-28; compactc 0.31.1, ZKIR from `--skip-zk`, k from
+`Zkir.getK()`) moved no circuit's k.** Against the 0.4.7 build: `settle` 1,638 → 2,142
+instructions (k 14 — the six `seatIdentity` reads that find the house's stakes, made only at a
+practice table), `eliminate` 1,736 → 1,846 (14), `abortTable` 6,836 → 6,938 (still 15, the
+ceiling), and the rest within ±2 — the new sealed field re-buckets the ledger, so every circuit's
+ledger addresses, and with them every verifier key, change.
+
 **k is not monotonic in instruction count and never was.** `abortTable` is the largest circuit
 here at 2,172 instructions and sits at k=14, while `resolveRoll2` at 924 needs k=15. The domain
 is set by the _gates_, and for the resolve circuits that means the roll hash and its rejection

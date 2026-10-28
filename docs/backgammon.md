@@ -1,7 +1,8 @@
 # Backgammon
 
 The second Dust Dice game. Two seats, one flat pot, Yacht's dust dice. The winner takes the
-pot less a 1% rake. There is no doubling cube and there are no gammons: a win is a win.
+pot less a 1% rake — except at a practice table, which pays no winner ([below](#practice-tables)).
+There is no doubling cube and there are no gammons: a win is a win.
 
 | File                                    | What it holds                                                                                         |
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
@@ -109,6 +110,29 @@ Operator defaults: 180 s to move, 900 s table timeout (the fill clock and the op
 A player cannot stall its way into a refund. When the player owes the move, the only exit is
 `eliminate`.
 
+## Practice tables
+
+The constructor's last argument, `house: UserAddress` (sealed as `house`), makes a practice
+table when it is not all zero: the site's bot deploys it and sits as `house`, and a person plays
+it. The person's stake is a fee for the DUST the house spends on their game, and the bot must
+never gain or lose NIGHT. Argument order: `(id, stake, rakeTo, seedCommit, moveTimeout,
+tableTimeout, invite, house)`; all zero is an ordinary table, unchanged.
+
+Every send of a stake goes through `payeeOf` (`backgammon.compact` section 7): a stake recorded
+at `house` goes back to it, exactly `tier`; any other goes to the rake address, whole. So:
+
+| Exit                                              | house seat / slot | person | rake address        |
+| ------------------------------------------------- | ----------------- | ------ | ------------------- |
+| `settle`, whoever won (play, timeout, resign)     | `tier`            | 0      | the person's `tier` |
+| `eliminate(slot, true)` while filling (leave)     | `tier`            | 0      | the leaver's `tier` |
+| the start's refund of a third joiner              | `tier`            | 0      | a person's `tier`   |
+| `abortTable` (never filled, never started, stall) | `tier`            | 0      | every other `tier`  |
+
+`q` and `r` are still required by `settle`, so the encoding is the same at every table. The
+closing certificate records `paid = 0` and `rake` = what the rake address took. A person who
+records `house` as their payout address is paid as the house, and a practice table the house
+never sat at sends every stake to the rake.
+
 ## Randomness residual
 
 The operator cannot choose or change a roll:
@@ -144,6 +168,12 @@ compactc 0.31.1 (ledger 8):
 | `abortTable`    |  13 |        1,130 |
 
 The maximality check costs `move` about 490 instructions and no k.
+
+Practice tables (`house`, 2026-10-28) cost no k anywhere, measured from `--skip-zk` ZKIR with
+`Zkir.getK()`: `settle` 968 → 1,106 instructions (k 14), `abortTable` 3,316 → 3,434 (14),
+`eliminate` 865 → 927 (13), `resolveRoll` 3,414 → 3,525 (still 15, the ceiling), `join` and
+`move` unchanged. The new sealed field changes every circuit's ledger addresses, so both
+contracts' verifier keys, and the build fingerprint, change with it.
 
 Adding Backgammon changed none of Yacht's artifacts. The Table and Lobby verifier keys are
 byte-identical to the deployed build, and the fingerprint is still `f815b5d063f9adc3`.

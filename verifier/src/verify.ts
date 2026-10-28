@@ -72,8 +72,10 @@ import {
   type Scorecard,
 } from '@dust-dice/api';
 import {
+  eliminationRefundTs,
   emptyRoundResult,
   firstRollTs,
+  forfeitsTs,
   genesisDigestTs,
   startDigestTs,
   mixEntropyTs,
@@ -266,6 +268,11 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   console.log(
     `  mode           ${final.fastMode ? 'FAST (turn ordering operator-attested)' : 'on-chain (ordering chain-proven)'}`,
   );
+  // A PRACTICE table (table.compact section 10) pays no winner: the house gets back exactly its
+  // own stakes and every other stake goes to the rake address. The payout checks below follow it.
+  const house = final.house.bytes;
+  const practice = !house.every((b) => b === 0);
+  if (practice) console.log(`  practice       house ${hex(house)} (no winner is paid)`);
 
   // A table that never settled is NOT a failed verification: an aborted or still-playing table
   // has not revealed its seed, so there is nothing to replay yet. Saying "FAILED" here would
@@ -749,7 +756,8 @@ async function verify(address: string, verbose: boolean): Promise<number> {
           console.log(
             led.phase === Table.Phase.filling
               ? `  (a player left the filling table in block ${g.blockHeight}: its stake went ` +
-                  'straight back and its slot was freed)'
+                  `straight back${practice ? ' -- to the rake unless it was the house' : ''} ` +
+                  'and its slot was freed)'
               : `  (an eliminate in block ${g.blockHeight} marked no new seat -- it landed on ` +
                   'chain without effect, or the replay had already accounted for it)',
           );
@@ -773,13 +781,23 @@ async function verify(address: string, verbose: boolean): Promise<number> {
         const resignPenalty = (final.tier * BigInt(round)) / 13n;
         const delta = led.seatRedeemable.lookup(BigInt(seat));
         const penalty = delta === final.tier - resignPenalty ? resignPenalty : timeoutPenalty;
-        const how =
-          penalty === resignPenalty && resignPenalty !== timeoutPenalty ? 'resigned' : 'timed out';
-        const refund = final.tier - penalty;
+        // At a practice table the schedule does not apply (table.compact section 10): the house
+        // keeps its whole stake and anyone else keeps nothing, however the seat left -- so the
+        // money cannot say how, and is not asked to.
+        const addr = final.seatIdentity.lookup(BigInt(seat)).addr.bytes;
+        const how = practice
+          ? forfeitsTs(addr, house)
+            ? 'forfeited the fee'
+            : 'the house, kept whole'
+          : penalty === resignPenalty && resignPenalty !== timeoutPenalty
+            ? 'resigned'
+            : 'timed out';
+        const refund = eliminationRefundTs(final.tier, penalty, addr, house);
         c.ok(
-          `seat ${seat}: eliminated at round ${round} keeps tier - penalty`,
+          `seat ${seat}: eliminated at round ${round} keeps ` +
+            (practice ? 'its stake if the house, else nothing' : 'tier - penalty'),
           delta === refund,
-          `expected +${refund} (penalty ${penalty}, ${how})`,
+          `expected +${refund} (${practice ? '' : `penalty ${penalty}, `}${how})`,
         );
         // The pot delta needs the state before this one call, so it is only checked where that
         // state is readable — one transaction in the block. Where it is not, nothing is lost:
@@ -796,7 +814,10 @@ async function verify(address: string, verbose: boolean): Promise<number> {
           `seat ${seat}: carries the never-finished sentinel`,
           led.seatProgress.lookup(BigInt(seat)).finishedAtRound === 65535n,
         );
-        console.log(`  (seat ${seat} ${how} at round ${round}: penalty ${penalty})`);
+        console.log(
+          `  (seat ${seat} ${how} at round ${round}: ` +
+            `${practice ? `keeps ${refund}` : `penalty ${penalty}`})`,
+        );
         break;
       }
 
@@ -967,16 +988,40 @@ async function verify(address: string, verbose: boolean): Promise<number> {
       created === potBefore,
       `created ${created}, pot ${potBefore}`,
     );
-    c.ok(
-      'the winner was paid pot - q, at the address recorded at join',
-      sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, winnerAddr)) === potBefore - q,
-      `expected ${potBefore - q}`,
-    );
-    c.ok(
-      'the rake was paid q, at the address sealed at construction',
-      sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, rakeAddr)) === q,
-      `expected ${q}`,
-    );
+    if (practice) {
+      // No winner is paid. Every house seat still in the game takes its `tier` back; the rest of
+      // the pot -- every other stake, and the people's stakes eliminated seats left in it -- is
+      // the rake's. (A house seat eliminated earlier holds its `tier` as a redeem, below.)
+      let houseSeats = 0n;
+      for (let s = 0; s < seatCount; s++) {
+        const id = final.seatIdentity.lookup(BigInt(s)).addr.bytes;
+        if (!final.seatProgress.lookup(BigInt(s)).eliminated && !forfeitsTs(id, house))
+          houseSeats += 1n;
+      }
+      const homeStakes = final.tier * houseSeats;
+      c.ok(
+        'practice: the house got back exactly its stakes still in the game',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, house)) === homeStakes,
+        `expected ${homeStakes}`,
+      );
+      c.ok(
+        'practice: the rake took the rest of the pot, whole -- no winner was paid',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, rakeAddr)) ===
+          potBefore - homeStakes,
+        `expected ${potBefore - homeStakes}`,
+      );
+    } else {
+      c.ok(
+        'the winner was paid pot - q, at the address recorded at join',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, winnerAddr)) === potBefore - q,
+        `expected ${potBefore - q}`,
+      );
+      c.ok(
+        'the rake was paid q, at the address sealed at construction',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, rakeAddr)) === q,
+        `expected ${q}`,
+      );
+    }
     c.ok('the pot is empty afterwards', final.pot === 0n, `pot field ${final.pot}`);
   }
 

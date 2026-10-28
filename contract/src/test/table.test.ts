@@ -2737,3 +2737,324 @@ describe('token custody, as far as the simulator can see it', () => {
     assert.deepEqual(g.ledger().rakeAddress.bytes, g.config.rakeAddress.bytes);
   });
 });
+
+// =========================================================================================
+describe('practice tables (section 10): the house never wins or loses, the fee is kept', () => {
+  // =======================================================================================
+  //
+  // THE INVARIANT, over a table's whole life and every path money leaves by: the house gets back
+  // exactly `tier` per stake recorded at its address, the rake address takes every other stake
+  // whole (no 1% split), nobody else is paid anything, and the contract ends holding nothing.
+  // Each test keeps a BOOK of every send the table made -- settle, redeem, the start, the
+  // aborts, the leaves -- and checks it against that at the end. The driver checks the custody
+  // invariant after every move, as it does at an ordinary table.
+  //
+  // The house is one of the driver's own players: `makePlayers` gives player i the address
+  // `0x80 + i`, so `house: makePlayers(2)[k].addr` seats the house in seat k.
+
+  type Book = Map<string, bigint>;
+  const tier = 1_300_000n; // so every penalty the schedule WOULD charge is non-zero
+
+  const hexOf = (a: { bytes: Uint8Array }): string => Buffer.from(a.bytes).toString('hex');
+
+  /** A practice table with the house in seat `houseSeat`, everyone seated. */
+  async function practiceTable(houseSeat: number, seats = 2): Promise<GameDriver> {
+    return seated(
+      { seats, tier, house: makePlayers(seats)[houseSeat]!.addr },
+      { strategy: 'bestScore', holds: alwaysStopEarly },
+    );
+  }
+
+  /** Add what the last circuit sent to the book. */
+  function take(g: GameDriver, book: Book): void {
+    for (const [addr, v] of g.paidOut()) book.set(addr, (book.get(addr) ?? 0n) + v);
+  }
+
+  function assertPracticeBook(
+    g: GameDriver,
+    book: Book,
+    houseStakes: number,
+    otherStakes: number,
+  ): void {
+    const h = hexOf(g.config.house!);
+    const r = hexOf(g.config.rakeAddress);
+    const t = g.config.tier;
+    assert.equal(book.get(h) ?? 0n, t * BigInt(houseStakes), 'the house gets exactly its stakes');
+    assert.equal(book.get(r) ?? 0n, t * BigInt(otherStakes), 'the rake takes every other stake');
+    for (const [addr, v] of book) {
+      if (addr !== h && addr !== r) assert.fail(`${addr.slice(0, 8)}… was paid ${v}`);
+    }
+    g.assertFullyDrained();
+  }
+
+  /** Settle as the operator, booking what it paid. */
+  async function settle(g: GameDriver, book: Book): Promise<number> {
+    const [q, r] = g.rakeSplit();
+    g.sim.asOperator();
+    const winner = Number(await g.sim.settle(g.config.seed, q, r, g.tick()));
+    take(g, book);
+    return winner;
+  }
+
+  /** Redeem a seat, booking what it paid. */
+  async function redeem(g: GameDriver, book: Book, seat: number): Promise<bigint> {
+    const paid = await g.sim.redeem(seat, g.tick());
+    take(g, book);
+    return paid;
+  }
+
+  it('seals the house, and an ordinary table seals zeros', async () => {
+    const g = await practiceTable(1);
+    assert.deepEqual(g.ledger().house.bytes, makePlayers(2)[1]!.addr.bytes);
+    const plain = await seated({ seats: 2 });
+    assert.deepEqual(plain.ledger().house.bytes, new Uint8Array(32));
+  });
+
+  it('pays no winner: a whole game returns the house its stake and the fee to the rake, whoever won', async () => {
+    const winners: number[] = [];
+    for (const houseSeat of [0, 1]) {
+      // The same game twice -- `house` is in no hash -- with the house in the other seat.
+      const g = await practiceTable(houseSeat);
+      const book: Book = new Map();
+      await g.playToEnd();
+      const winner = await settle(g, book);
+      assert.equal(winner, g.expectedWinner(), 'the result is decided as at any table');
+      winners.push(winner);
+      const led = g.ledger();
+      assert.equal(led.winnerSeatIndex, BigInt(winner));
+      assert.deepEqual(
+        led.finalDigest,
+        finalDigestTs(
+          led.roundDigest,
+          g.config.tableId,
+          PHASE.settled,
+          winner,
+          2,
+          0n,
+          tier,
+          0n,
+          true,
+        ),
+        'the certificate: no winner paid, the rake took the person’s stake',
+      );
+      assertPracticeBook(g, book, 1, 1);
+      await assert.rejects(() => g.sim.redeem(0), /nothing to redeem/);
+      await assert.rejects(() => g.sim.redeem(1), /nothing to redeem/);
+    }
+    assert.equal(winners[0], winners[1], 'one game, so the house won it once and lost it once');
+  });
+
+  it('the person times out: nothing comes back to them, and the house wins its stake back', async () => {
+    const g = await practiceTable(0);
+    const book: Book = new Map();
+    await g.playRound(0);
+    await g.playTurn(0, 1); // the house plays round 1; the person goes silent
+    assert.equal(await g.eliminate(1, 1), 0n, 'the schedule would refund 11/13; practice, nothing');
+    assert.equal(g.ledger().pot, tier * 2n, 'their whole stake stays in the pot, for the rake');
+    assert.equal(await settle(g, book), 0);
+    assertPracticeBook(g, book, 1, 1);
+  });
+
+  it('the house times out: it still gets exactly its stake back, and the person still nothing', async () => {
+    const g = await practiceTable(0);
+    const book: Book = new Map();
+    await g.playRound(0);
+    await g.playRound(1);
+    await g.playTurn(1, 2); // the person plays round 2; the HOUSE goes silent
+    assert.equal(await g.eliminate(0, 2), tier, 'no penalty: the schedule would keep 3/13');
+    const led = g.ledger();
+    assert.equal(led.seatRedeemable.lookup(0n), tier);
+    assert.deepEqual(
+      led.seatReceipt.lookup(0n),
+      eliminateDigestTs(bytes32(0), g.config.tableId, 0, 2, tier, 0n, tier),
+      'the receipt records what was charged: nothing',
+    );
+    // The walkover pays no winner. The house is out, so the pot is the person's stake alone and
+    // all of it goes to the rake -- one send, none of zero to the house.
+    assert.equal(await settle(g, book), 1);
+    assert.deepEqual([...g.paidOut().keys()], [hexOf(g.config.rakeAddress)]);
+    assert.equal(await redeem(g, book, 0), tier);
+    await assert.rejects(() => g.sim.redeem(1), /nothing to redeem/);
+    assertPracticeBook(g, book, 1, 1);
+  });
+
+  it('a resignation is charged no schedule: the person forfeits all, the house nothing', async () => {
+    for (const quitter of ['person', 'house'] as const) {
+      const g = await practiceTable(quitter === 'house' ? 0 : 1);
+      const book: Book = new Map();
+      await g.playRound(0);
+      await g.playRound(1);
+      // Round 2: the schedule would charge a resigner 2/13 (and the identity still holds it).
+      const q = (tier * 2n) / 13n;
+      g.sim.asPlayer(g.players[0]!.sk);
+      const back = await g.sim.resign(0, q, tier * 2n - q * 13n, g.tick());
+      assert.equal(back, quitter === 'house' ? tier : 0n);
+      assert.equal(await settle(g, book), 1);
+      if (quitter === 'house') assert.equal(await redeem(g, book, 0), tier);
+      else await assert.rejects(() => g.sim.redeem(0), /nothing to redeem/);
+      assertPracticeBook(g, book, 1, 1);
+    }
+  });
+
+  it('everyone out: the waiver keeps the house whole and pays the rake the fee, not 1%', async () => {
+    const g = await practiceTable(1);
+    const book: Book = new Map();
+    for (let r = 0; r < 3; r++) await g.playRound(r);
+    await g.eliminate(0, 3);
+    await g.eliminate(1, 3);
+    assert.equal(g.ledger().phase, PHASE.abandoned);
+    const [q, rem] = g.abortRake();
+    assert.equal(await g.sim.abortTable(q, rem, g.tick()), tier, 'a house seat redeems its tier');
+    take(g, book);
+    const led = g.ledger();
+    assert.equal(led.phase, PHASE.aborted);
+    assert.equal(led.seatRedeemable.lookup(0n), 0n, 'the person: nothing');
+    assert.equal(led.seatRedeemable.lookup(1n), tier, 'the house: its whole stake');
+    assert.deepEqual(
+      led.finalDigest,
+      finalDigestTs(
+        led.roundDigest,
+        g.config.tableId,
+        PHASE.aborted,
+        NO_WINNER,
+        2,
+        0n,
+        tier,
+        tier,
+        false,
+      ),
+    );
+    assert.equal(await redeem(g, book, 1), tier);
+    await assert.rejects(() => g.sim.redeem(0), /nothing to redeem/);
+    assertPracticeBook(g, book, 1, 1);
+  });
+
+  it('the operator stalls: the house is refunded, and the fee still is not', async () => {
+    const g = await practiceTable(1);
+    const book: Book = new Map();
+    await g.playTurn(1, 0, alwaysStopEarly);
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.openTurn(0, g.entropyFor(0, 0), g.tick()); // the operator never rolls it
+    const grace = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs);
+    const [q, rem] = g.abortRake();
+    assert.equal(await g.sim.abortTable(q, rem, grace + 1), tier);
+    take(g, book);
+    assert.equal(await redeem(g, book, 1), tier);
+    await assert.rejects(() => g.sim.redeem(0), /nothing to redeem/);
+    assertPracticeBook(g, book, 1, 1);
+  });
+
+  it('a table that never fills: the house’s slot comes back, everyone else’s goes to the rake', async () => {
+    const players = makePlayers(3);
+    const g = await GameDriver.open({ seats: 3, tier, house: players[1]!.addr });
+    const book: Book = new Map();
+    await g.join(0);
+    await g.join(1);
+    const [q, rem] = g.abortRake();
+    assert.equal(await g.sim.abortTable(q, rem, Number(g.ledger().roundDeadline) + 1), tier);
+    take(g, book);
+    const led = g.ledger();
+    assert.equal(led.phase, PHASE.aborted);
+    assert.deepEqual(
+      led.finalDigest,
+      finalDigestTs(
+        led.roundDigest,
+        g.config.tableId,
+        PHASE.aborted,
+        NO_WINNER,
+        0,
+        0n,
+        tier,
+        tier,
+        false,
+      ),
+      'the certificate counts the slot that went to the rake',
+    );
+    assertPracticeBook(g, book, 1, 1);
+  });
+
+  it('leaving a filling table: the person forfeits the fee, the house takes its stake back', async () => {
+    const g = await GameDriver.open({ seats: 2, tier, house: makePlayers(2)[0]!.addr });
+    const book: Book = new Map();
+    await g.join(0, { start: false });
+    await g.join(1, { start: false });
+    g.sim.asPlayer(g.players[1]!.sk);
+    assert.equal(await g.sim.resign(1, 0n, 0n, g.tick()), 0n, 'the person gets nothing back');
+    take(g, book);
+    assert.equal(book.get(hexOf(g.config.rakeAddress)), tier, 'its stake went to the rake');
+    g.sim.asPlayer(g.players[0]!.sk);
+    assert.equal(await g.sim.resign(0, 0n, 0n, g.tick()), tier);
+    take(g, book);
+    assert.deepEqual(g.heldSlots(), [], 'empty again, still filling');
+    assert.equal(g.ledger().phase, PHASE.filling);
+    assertPracticeBook(g, book, 1, 1);
+  });
+
+  it("the start's refunds: a late person's stake goes to the rake, a late house's back to it", async () => {
+    // Three joins land before the start of a two-seat table; the latest (`c`) is refunded by it.
+    const [a, b, c] = makePlayers(3);
+    for (const house of [a!, c!]) {
+      // a: the house sits in seat 0 and the late PERSON's refund goes to the rake.
+      // c: the house is the late joiner -- refunded, it never sits at its own table, so the
+      //    whole pot goes to the rake and nothing of it to the winner.
+      const g = await GameDriver.open({ seats: 2, tier, house: house.addr });
+      const book: Book = new Map();
+      for (const [p, slot] of [
+        [a!, 3],
+        [b!, 1],
+        [c!, 0],
+      ] as const) {
+        g.sim.asPlayer(p.sk);
+        await g.sim.join(p.addr, g.tick(), g.clock, slot);
+      }
+      await g.start();
+      take(g, book);
+      assert.deepEqual([...g.paidOut().values()], [tier], 'the start refunds one stake');
+      // b, a person in seat 1 either way, resigns in round one; seat 0 wins the walkover.
+      g.sim.asPlayer(b!.sk);
+      assert.equal(await g.sim.resign(1, 0n, 0n, g.tick()), 0n);
+      assert.equal(await settle(g, book), 0);
+      assertPracticeBook(g, book, 1, 2);
+    }
+  });
+
+  it('bot against bot -- or a person who records the house as payout -- is all the house’s', async () => {
+    // Both seats pay to the house: both stakes come back to it and the rake's send, which would
+    // be zero, is not made at all.
+    const [a, b] = makePlayers(2);
+    const g = await GameDriver.open({ seats: 2, tier, house: a!.addr });
+    const book: Book = new Map();
+    g.sim.asPlayer(a!.sk);
+    await g.sim.join(a!.addr, g.tick(), g.clock, 0);
+    g.sim.asPlayer(b!.sk);
+    await g.sim.join(a!.addr, g.tick(), g.clock, 1);
+    await g.start();
+    g.sim.asPlayer(b!.sk);
+    assert.equal(await g.sim.resign(1, 0n, 0n, g.tick()), tier, 'paid as the house');
+    assert.equal(await settle(g, book), 0);
+    assert.deepEqual([...g.paidOut().keys()], [hexOf(a!.addr)], 'one send, to the house');
+    assert.equal(await redeem(g, book, 1), tier);
+    assertPracticeBook(g, book, 2, 0);
+  });
+
+  it('an ordinary table, the same walkover, is paid exactly as before', async () => {
+    // The regression: `house` all zero is the schedule, the winner's pot less 1%, and the
+    // resigner's own refund -- to the addresses recorded at join.
+    const g = await seated({ seats: 2, tier }, { strategy: 'bestScore', holds: alwaysStopEarly });
+    const book: Book = new Map();
+    await g.playRound(0);
+    await g.playRound(1);
+    const q = (tier * 2n) / 13n;
+    g.sim.asPlayer(g.players[0]!.sk);
+    assert.equal(await g.sim.resign(0, q, tier * 2n - q * 13n, g.tick()), tier - q);
+    const pot = g.ledger().pot;
+    assert.equal(pot, tier * 2n - (tier - q));
+    assert.equal(await settle(g, book), 1);
+    assert.equal(await redeem(g, book, 0), tier - q);
+    assert.equal(book.get(hexOf(g.players[1]!.addr)), pot - pot / 100n, 'the winner');
+    assert.equal(book.get(hexOf(g.config.rakeAddress)), pot / 100n, 'the 1% rake');
+    assert.equal(book.get(hexOf(g.players[0]!.addr)), tier - q, 'the resigner');
+    assert.equal(book.size, 3);
+    g.assertFullyDrained();
+  });
+});

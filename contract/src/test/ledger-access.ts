@@ -107,17 +107,17 @@ const FIELDS = fieldNames();
  * `assertFieldMapIsComplete` rather than as a silently mislabelled read.
  */
 const ADT_FIELDS: ReadonlyArray<readonly [PathKey, string]> = [
-  ['2,1', 'seatIdentity'],
-  ['2,2', 'seatCard'],
-  ['2,3', 'seatProgress'],
-  ['2,4', 'seatTurn'],
-  ['2,5', 'seatRedeemable'],
-  ['2,6', 'seatReceipt'],
-  ['2,7', 'joinedKeys'],
-  // Declared after `padStore` (2,8) with the other late fields, between `started` and
-  // `fillOpenedAt` -- and `slotJoinedAt`, the last field of all (table.compact section 9).
-  ['2,11', 'seatPaid'],
-  ['2,14', 'slotJoinedAt'],
+  ['2,0', 'seatIdentity'],
+  ['2,1', 'seatCard'],
+  ['2,2', 'seatProgress'],
+  ['2,3', 'seatTurn'],
+  ['2,4', 'seatRedeemable'],
+  ['2,5', 'seatReceipt'],
+  ['2,6', 'joinedKeys'],
+  // Declared after `padStore` (2,7) with the other late fields, between `started` and
+  // `fillOpenedAt` -- and `slotJoinedAt` (table.compact section 9), just before `house`.
+  ['2,10', 'seatPaid'],
+  ['2,13', 'slotJoinedAt'],
 ];
 for (const [key, name] of ADT_FIELDS) FIELDS.set(key, name);
 
@@ -148,12 +148,17 @@ export function assertFieldMapIsComplete(): void {
   // With `slotJoinedAt` (section 9) the compiler rebalanced again: bucket 1 now runs
   // seatLimit..winnerSeatIndex, and bucket 2 starts at finalDigest with the ADT block at
   // 2,1..2,7. Re-derived from the generated accessor on 2026-09-27.
-  expect('1,6', 'phase');
-  expect('2,0', 'finalDigest');
-  expect('2,8', 'padStore');
-  expect('2,9', 'startAfterSecs');
-  expect('2,12', 'fillOpenedAt');
-  expect('2,13', 'inviteHash');
+  // With `house` (section 10, the 33rd field) the two full buckets keep fifteen each and bucket 0
+  // takes the extra: `seatLimit` moves to 0,2, bucket 1 runs rakeAddress..finalDigest, and
+  // bucket 2 starts at the ADT block (2,0..2,6) and ends at `house` (2,14). Re-derived from the
+  // generated accessor on 2026-10-28.
+  expect('1,5', 'phase');
+  expect('1,14', 'finalDigest');
+  expect('2,7', 'padStore');
+  expect('2,8', 'startAfterSecs');
+  expect('2,11', 'fillOpenedAt');
+  expect('2,12', 'inviteHash');
+  expect('2,14', 'house');
 }
 
 /**

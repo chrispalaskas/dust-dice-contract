@@ -26,6 +26,7 @@ import {
   bgHeldSlots,
   bgRollForPly,
   bgStarter,
+  forfeitsTs,
   nativeBalanceOf,
   seedCommitmentTs,
 } from '@dust-dice/contract';
@@ -210,6 +211,11 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
     `  move timeout   ${final.moveTimeoutSecs} s   table timeout ${final.tableTimeoutSecs} s`,
   );
   console.log(`  phase          ${Backgammon.BgPhase[final.phase]}`);
+  // A PRACTICE table (backgammon.compact section 7) pays no winner: each seat's stake goes back to
+  // the house if it is the house's, and to the rake address otherwise.
+  const house = final.house.bytes;
+  const practice = !house.every((b) => b === 0);
+  if (practice) console.log(`  practice       house ${hex(house)} (no winner is paid)`);
 
   if (final.phase !== Backgammon.BgPhase.settled) {
     console.log(
@@ -420,16 +426,34 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
     c.ok('the pot was both stakes', pot === final.tier * 2n, `pot ${pot}`);
     c.ok('settle spent ZERO user inputs', sumNative(tx.unshieldedSpentOutputs) === 0n);
     c.ok('settle created exactly the pot', sumNative(tx.unshieldedCreatedOutputs) === pot);
-    c.ok(
-      `the winner (seat ${final.winner}) was paid pot - 1% at its join-time address`,
-      sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, winnerAddr)) === pot - q,
-      `expected ${pot - q}`,
-    );
-    c.ok(
-      'the rake was paid 1% at the address sealed at deploy',
-      sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, final.rakeAddress.bytes)) === q,
-      `expected ${q}`,
-    );
+    if (practice) {
+      let lost = 0n;
+      for (const s of [0n, 1n]) {
+        if (forfeitsTs(final.seatIdentity.lookup(s).addr.bytes, house)) lost += 1n;
+      }
+      const raked = final.tier * lost;
+      c.ok(
+        'practice: the house got back exactly its own stakes, whoever won',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, house)) === pot - raked,
+        `expected ${pot - raked}`,
+      );
+      c.ok(
+        'practice: the rake took every other stake, whole -- no winner was paid',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, final.rakeAddress.bytes)) === raked,
+        `expected ${raked}`,
+      );
+    } else {
+      c.ok(
+        `the winner (seat ${final.winner}) was paid pot - 1% at its join-time address`,
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, winnerAddr)) === pot - q,
+        `expected ${pot - q}`,
+      );
+      c.ok(
+        'the rake was paid 1% at the address sealed at deploy',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, final.rakeAddress.bytes)) === q,
+        `expected ${q}`,
+      );
+    }
     c.ok('the pot is empty afterwards', final.pot === 0n);
   }
 

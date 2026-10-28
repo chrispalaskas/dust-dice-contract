@@ -499,3 +499,43 @@ export function finalDigestTs(
     verifiable,
   });
 }
+
+// ---------------------------------------------------------------------------------------
+// Practice tables: who is actually paid
+// ---------------------------------------------------------------------------------------
+
+const isZero = (b: Uint8Array): boolean => b.every((x) => x === 0);
+const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
+  a.length === b.length && a.every((x, i) => x === b[i]);
+
+/**
+ * Mirror of `forfeits`, the one fact the practice rule turns on (table.compact section 10,
+ * backgammon.compact section 7 -- the two contracts state it identically). True when a stake
+ * recorded at `addr` goes to the rake address instead of back: only at a practice table (`house`
+ * not all zero), and only for an address that is not the house's. Takes the raw 32 bytes of each
+ * `UserAddress`.
+ */
+export function forfeitsTs(addr: Uint8Array, house: Uint8Array): boolean {
+  return !isZero(house) && !sameBytes(addr, house);
+}
+
+/** Mirror of `payeeOf`: where a stake recorded at `addr` is actually sent back to. */
+export function payeeTs(addr: Uint8Array, house: Uint8Array, rake: Uint8Array): Uint8Array {
+  return forfeitsTs(addr, house) ? rake : addr;
+}
+
+/**
+ * What Yacht's `eliminate` hands back to the seat recorded at `addr` (into its
+ * `seatRedeemable`, or straight back for a leaver): `tier - penalty` at an ordinary table; at a
+ * practice table the whole `tier` for the house and nothing for anyone else, whatever the
+ * schedule says -- the house cannot lose part of its stake by leaving the game.
+ */
+export function eliminationRefundTs(
+  tier: bigint,
+  penalty: bigint,
+  addr: Uint8Array,
+  house: Uint8Array,
+): bigint {
+  if (isZero(house)) return tier - penalty;
+  return forfeitsTs(addr, house) ? 0n : tier;
+}

@@ -23,7 +23,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { ContractState } from '@midnight-ntwrk/compact-runtime';
+import { CompactTypeUnsignedInteger, ContractState } from '@midnight-ntwrk/compact-runtime';
 
 import {
   NATIVE_TOKEN_HEX,
@@ -31,7 +31,6 @@ import {
   nativeBalanceOf,
   unshieldedBalances,
 } from '../custody.ts';
-import { Table } from '../index.ts';
 
 const OTHER_TOKEN = `01${'00'.repeat(31)}`;
 
@@ -43,6 +42,40 @@ function fixtureState(): ContractState {
   return ContractState.deserialize(Uint8Array.from(Buffer.from(hex, 'hex')));
 }
 
+/**
+ * The few ledger fields this test needs, read from the fixture AT THE 0.4.7 ADDRESSES it was
+ * captured under -- not through the current `Table.ledger()`.
+ *
+ * A ledger field's address is `[bucket, index]`, and the compiler rebalances the buckets by the
+ * total field count (src/test/ledger-access.ts), so adding ANY field moves every address. The
+ * practice table's `house` (table.compact section 10) did exactly that, and the current bindings
+ * read this real state's `pot` from what is, in 0.4.7, `roundDeadline`. A state has to be read
+ * with the layout that wrote it -- the same reason a deployed table keeps its own build. A
+ * replacement capture needs a live chain; until there is one this pins the 0.4.7 layout here,
+ * and the assertions below are unchanged.
+ */
+function fixtureLedger047(state: ContractState) {
+  const U8 = new CompactTypeUnsignedInteger(255n, 1);
+  const U64 = new CompactTypeUnsignedInteger(18446744073709551615n, 8);
+  const root = state.data.state.asArray()!;
+  const cell = (bucket: number, index: number) => [
+    ...root[bucket]!.asArray()![index]!.asCell().value,
+  ];
+  const redeemable = root[2]!.asArray()![5]!.asMap()!;
+  return {
+    tier: U64.fromValue(cell(0, 1)),
+    seatCount: U8.fromValue(cell(1, 7)),
+    pot: U64.fromValue(cell(1, 12)),
+    seatRedeemable: (seat: bigint): bigint => {
+      for (const key of redeemable.keys()) {
+        if (U8.fromValue([...key.value]) === seat)
+          return U64.fromValue([...redeemable.get(key)!.asCell().value]);
+      }
+      return 0n;
+    },
+  };
+}
+
 describe('custody: a real table state', () => {
   it('carries the staked NIGHT in its balance map', () => {
     const state = fixtureState();
@@ -52,11 +85,11 @@ describe('custody: a real table state', () => {
 
   it('backs the pot the contract itself claims -- the custody invariant', () => {
     const state = fixtureState();
-    const led = Table.ledger(state.data);
+    const led = fixtureLedger047(state);
 
     let redeemable = 0n;
     for (let seat = 0n; seat < led.seatCount; seat++) {
-      if (led.seatRedeemable.member(seat)) redeemable += led.seatRedeemable.lookup(seat);
+      redeemable += led.seatRedeemable(seat);
     }
 
     // docs/table-interface.md §6: the ledger holds the pot plus anything owed but not yet paid.

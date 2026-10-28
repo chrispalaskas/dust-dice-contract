@@ -46,6 +46,8 @@ export type BgConfig = {
   moveTimeoutSecs: bigint;
   tableTimeoutSecs: bigint;
   inviteHash: Uint8Array;
+  /** A practice table's house (backgammon.compact section 7). Omitted = all zeros, ordinary. */
+  house?: UserAddress;
 };
 
 export function bytes32(fill: number): Uint8Array {
@@ -94,6 +96,7 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
         config.moveTimeoutSecs,
         config.tableTimeoutSecs,
         config.inviteHash,
+        config.house ?? { bytes: new Uint8Array(32) },
       ),
     );
     return sim;
@@ -158,6 +161,21 @@ export class BackgammonSimulator extends BaseSimulator<TablePrivateState> {
     this.blockTime = blockTime;
     return this.run('abortTable', (ctx) => this.bg.impureCircuits.abortTable(ctx));
   }
+}
+
+/**
+ * What the last circuit sent, by payout address (hex) -- the same reading as the Yacht driver's
+ * `paidOut`. The simulator moves no real NIGHT (docs/bugs-found.md #11), but it does record each
+ * `sendUnshielded`'s amount and recipient, which is the half a wrong-recipient bug shows up in.
+ */
+export function paidOut(sim: BackgammonSimulator): Map<string, bigint> {
+  const out = new Map<string, bigint>();
+  const spends = sim.lastEffects?.claimedUnshieldedSpends as
+    Map<[unknown, { tag: string; address?: string }], bigint> | undefined;
+  for (const [[, to], amount] of spends ?? []) {
+    if (to.tag === 'user' && to.address) out.set(to.address, (out.get(to.address) ?? 0n) + amount);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------
