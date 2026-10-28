@@ -155,6 +155,8 @@ const largestDustCoinFirst: DustCoins.CoinSelection = (coins) =>
  * ledger-8 build produces when pointed at a ledger-9 devnet. Two devnets of different generations
  * can sit on one machine (main's board holds the default ports), so this asks the node first.
  * Ledger-8 nodes report `=8.1.x`; ledger-9 nodes report `... crate-ledger-9.1.0.0-rc.N ...`.
+ * Blockfrost's preprod node (2.1.0, same runtime) reports `8.1.1` with no `=`: the old pattern
+ * refused it, and every wallet on dustdice.xyz with it (2026-10-28), so the `=` is optional.
  */
 export async function assertLedgerGeneration(network: NetworkConfig): Promise<void> {
   const rpc = network.node.replace(/^ws/, 'http');
@@ -167,7 +169,7 @@ export async function assertLedgerGeneration(network: NetworkConfig): Promise<vo
   if (typeof result !== 'string') {
     throw new Error(`node at ${rpc} did not answer midnight_ledgerVersion (HTTP ${res.status})`);
   }
-  if (!/(^=|ledger-)8\./.test(result)) {
+  if (!/(^=?|ledger-)8\./.test(result)) {
     throw new Error(
       `node at ${rpc} speaks ledger "${result}" but this build speaks ledger 8 — wrong network or ` +
         `ports? Set MIDNIGHT_NODE_URL / MIDNIGHT_INDEXER_URL / MIDNIGHT_INDEXER_WS_URL / ` +
