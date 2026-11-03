@@ -49,6 +49,9 @@ export interface GqlTransaction {
   unshieldedSpentOutputs: GqlUnshieldedUtxo[];
 }
 
+/** What the chain did with a transaction: all of it, only some of its segments, or none. */
+export type TxStatus = 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILURE';
+
 /** One entry in a contract's public history. `entryPoint` is absent on the deploy. */
 export interface ContractAction {
   kind: 'ContractDeploy' | 'ContractCall' | 'ContractUpdate';
@@ -56,6 +59,11 @@ export interface ContractAction {
   txHash: string;
   blockHeight: number;
   blockTimestamp: number;
+  /**
+   * The transaction's result. The indexer lists EVERY call of a partial success, the ones whose
+   * segment failed included; `contracts.ts`'s `callOutcomes` says which took effect.
+   */
+  txStatus?: TxStatus;
 }
 
 /**
@@ -232,7 +240,7 @@ function subscribeUntil<T>(
   });
 }
 
-const sameAddress = (a: string, b: string): boolean =>
+export const sameAddress = (a: string, b: string): boolean =>
   a.replace(/^0x/, '').toLowerCase() === b.replace(/^0x/, '').toLowerCase();
 
 /**
@@ -256,7 +264,11 @@ export async function contractActions(address: string, limit = 1000): Promise<Co
   type Row = {
     __typename: ContractAction['kind'];
     entryPoint?: string;
-    transaction: { hash: string; block: { height: number; timestamp: string | number } };
+    transaction: {
+      hash: string;
+      block: { height: number; timestamp: string | number };
+      transactionResult?: { status: TxStatus };
+    };
   };
   const head = await gql<{
     contractAction: (Row & { deploy?: { transaction: { block: { height: number } } } }) | null;
@@ -290,7 +302,10 @@ export async function contractActions(address: string, limit = 1000): Promise<Co
        contractActions(address: $address, offset: $offset) {
          __typename
          ... on ContractCall { entryPoint }
-         transaction { hash block { height timestamp } }
+         transaction {
+           hash block { height timestamp }
+           ... on RegularTransaction { transactionResult { status } }
+         }
        }
      }`,
     { address, offset: { height: fromHeight } },
@@ -304,7 +319,40 @@ export async function contractActions(address: string, limit = 1000): Promise<Co
     txHash: a.transaction.hash,
     blockHeight: a.transaction.block.height,
     blockTimestamp: Number(a.transaction.block.timestamp),
+    txStatus: a.transaction.transactionResult?.status,
   }));
+}
+
+/** A transaction's bytes and its result, segment by segment where it was a partial success. */
+export interface TransactionOutcome {
+  raw: string;
+  status: TxStatus;
+  /** Segment 0 is the guaranteed part; each intent's fallible part is a segment of its own. */
+  segments: { id: number; success: boolean }[];
+}
+
+export async function transactionOutcome(hash: string): Promise<TransactionOutcome> {
+  const data = await gql<{
+    transactions: {
+      raw: string;
+      transactionResult?: { status: TxStatus; segments: TransactionOutcome['segments'] | null };
+    }[];
+  }>(
+    `query ($hash: HexEncoded!) {
+       transactions(offset: { hash: $hash }) {
+         raw
+         ... on RegularTransaction { transactionResult { status segments { id success } } }
+       }
+     }`,
+    { hash },
+  );
+  const tx = data.transactions[0];
+  if (!tx?.transactionResult) throw new Error(`transaction ${hash} has no result on the indexer`);
+  return {
+    raw: tx.raw,
+    status: tx.transactionResult.status,
+    segments: tx.transactionResult.segments ?? [],
+  };
 }
 
 /** The state a specific transaction left the contract in, as the indexer's hex; null if none. */

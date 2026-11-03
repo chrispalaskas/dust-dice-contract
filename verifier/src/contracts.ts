@@ -17,6 +17,7 @@
 import { withIndexerRetry } from '@dust-dice/api';
 import { CompiledContract } from '@midnight-ntwrk/midnight-js-protocol/compact-js';
 import { ContractState } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
+import { ContractCall, Transaction } from '@midnight-ntwrk/midnight-js-protocol/ledger';
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
 import {
   Table,
@@ -31,7 +32,7 @@ import {
 } from '@dust-dice/contract';
 
 import { NETWORK } from './config.ts';
-import { contractStateHexAt } from './indexer.ts';
+import { contractStateHexAt, sameAddress, transactionOutcome } from './indexer.ts';
 
 export { Table, Lobby, Backgammon };
 
@@ -123,6 +124,47 @@ export async function readContractState(address: string, at?: LedgerAt): Promise
   const hex = await contractStateHexAt(address, at.txHash);
   if (!hex) throw new Error(`no contract state at ${address} after tx ${at.txHash}`);
   return ContractState.deserialize(Buffer.from(hex.replace(/^0x/, ''), 'hex'));
+}
+
+/** One call a transaction made on a contract, and whether the chain applied its segment. */
+export interface CallOutcome {
+  entryPoint: string;
+  segment: number;
+  applied: boolean;
+}
+
+/**
+ * The calls a transaction made on `address`, in segment order, each with whether it took effect.
+ *
+ * Every intent of a transaction runs its fallible part as a segment of its own, and a PARTIAL
+ * success keeps the segments that passed. The indexer lists every call of such a transaction
+ * with no segment and no outcome of its own, and reports the result per segment on the
+ * transaction; only the transaction's bytes say which call sat in which segment. Seen on the
+ * fork devnet (2026-11-02): one-transaction Backgammon plies that landed after a finality stall
+ * with the move (segment 1) applied and the operator's roll (segment 2) failed its time check.
+ */
+export async function callOutcomes(address: string, txHash: string): Promise<CallOutcome[]> {
+  const { raw, status, segments } = await transactionOutcome(txHash);
+  const failed = new Set(segments.filter((s) => !s.success).map((s) => s.id));
+  const tx = Transaction.deserialize(
+    'signature',
+    'proof',
+    'binding',
+    Buffer.from(raw.replace(/^0x/, ''), 'hex'),
+  );
+  const out: CallOutcome[] = [];
+  for (const [segment, intent] of [...(tx.intents ?? [])].sort(([a], [b]) => a - b)) {
+    for (const call of intent.actions) {
+      if (!(call instanceof ContractCall) || !sameAddress(call.address, address)) continue;
+      const ep = call.entryPoint;
+      out.push({
+        entryPoint: typeof ep === 'string' ? ep : new TextDecoder().decode(ep),
+        segment,
+        applied: status === 'SUCCESS' || (status === 'PARTIAL_SUCCESS' && !failed.has(segment)),
+      });
+    }
+  }
+  return out;
 }
 
 export async function readTableLedger(address: string, at?: LedgerAt): Promise<TableLedger> {

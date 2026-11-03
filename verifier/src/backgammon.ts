@@ -34,7 +34,7 @@ import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 
 import { Checks, addressOf } from './checks.ts';
 import { NETWORK } from './config.ts';
-import { Backgammon, readContractState, type BackgammonLedger } from './contracts.ts';
+import { Backgammon, callOutcomes, readContractState, type BackgammonLedger } from './contracts.ts';
 import {
   contractActions,
   sumNative,
@@ -59,7 +59,10 @@ function expectedBalance(led: BackgammonLedger): bigint {
 interface Step {
   blockHeight: number;
   txHash: string;
+  /** The calls that took effect. */
   entryPoints: string[];
+  /** Calls the chain lists for this transaction but did not apply: their segment failed. */
+  failed: string[];
   led: BackgammonLedger;
   /** The contract's real native balance after this transaction. */
   balance: bigint;
@@ -85,10 +88,18 @@ async function readSteps(address: string): Promise<Step[]> {
   const steps: Step[] = [];
   for (const [txHash, calls] of byTx) {
     const state = await readContractState(address, { txHash });
+    // A partial success lists every call, the ones whose segment failed too: read which applied.
+    const outcomes =
+      calls[0]!.txStatus === undefined || calls[0]!.txStatus === 'SUCCESS'
+        ? undefined
+        : await callOutcomes(address, txHash);
     steps.push({
       blockHeight: calls[0]!.blockHeight,
       txHash,
-      entryPoints: calls.map((x) => x.entryPoint ?? '?'),
+      entryPoints: outcomes
+        ? outcomes.filter((o) => o.applied).map((o) => o.entryPoint)
+        : calls.map((x) => x.entryPoint ?? '?'),
+      failed: outcomes ? outcomes.filter((o) => !o.applied).map((o) => o.entryPoint) : [],
       led: Backgammon.ledger(state.data),
       balance: nativeBalanceOf(state),
     });
@@ -254,8 +265,19 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
 
   for (const [i, s] of steps.entries()) {
     const led = s.led;
-    const what = s.entryPoints.join('+');
+    const what = [...s.entryPoints, ...s.failed].join('+');
     if (verbose) console.log(`  tx ${i} ${what} (block ${s.blockHeight})`);
+
+    // A PARTIAL success: the chain applied some of the transaction's segments and not others --
+    // a one-transaction ply whose move landed while the operator's roll in it failed its time
+    // check after a finality stall. The failed calls changed nothing; the operator rolls again
+    // in a transaction of its own, and that roll is checked where it lands.
+    if (s.failed.length > 0) {
+      console.log(
+        `  tx ${i} (${what}): only ${s.entryPoints.join('+') || 'the fee'} took effect -- ` +
+          `${s.failed.join('+')} failed on chain (a partial success)`,
+      );
+    }
 
     // A call can be INCLUDED and do nothing: built against a state a racing call changed first
     // in the same block (a roll that lost to a resignation), it fails its fallible half and
