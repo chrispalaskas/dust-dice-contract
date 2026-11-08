@@ -280,6 +280,17 @@ costs the staller a penalty, not by the one that gives them their money back.
 
 ---
 
+## Practice tables
+
+A non-zero sealed `house` (the constructor's last argument) makes a practice table: the site's bot
+plays a person, the person's stake is a fee that is never returned, and the bot never gains or
+loses NIGHT. Every exit keeps the house's stakes whole and sends every other stake to the rake
+address — no winner is paid, no penalty is charged, no 1% is split. The rule, and why each circuit
+needed only a small change, is section 10 of `table.compact`'s header; the money per exit is in
+[table-interface.md](table-interface.md) §6.
+
+---
+
 ## Operator service consequences
 
 - The seed is persisted to disk at commit time, before the table opens, keyed by table address.

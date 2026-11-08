@@ -471,6 +471,8 @@ export type TableConfig = {
   startAfterSecs: bigint;
   /** `inviteCommitment(code)` for a private table; 32 zero bytes for a public one. */
   inviteHash: Uint8Array;
+  /** A practice table's house (table.compact section 10). Omitted = all zeros, an ordinary table. */
+  house?: UserAddress;
 };
 
 /**
@@ -524,6 +526,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
         config.fastMode,
         config.startAfterSecs,
         config.inviteHash,
+        config.house ?? { bytes: new Uint8Array(32) },
       ),
     );
     return sim;

@@ -64,6 +64,7 @@ import {
   rerollUnderMaskTs,
 } from '../policy-mirror.ts';
 import {
+  eliminationRefundTs,
   emptyRoundResult,
   genesisDigestTs,
   startDigestTs,
@@ -158,6 +159,8 @@ export type TableOptions = {
   startAfterSecs?: bigint;
   /** Seal an invite commitment to make the table private. Defaults to public. */
   inviteHash?: Uint8Array;
+  /** Make it a practice table with this house (table.compact section 10). Defaults to ordinary. */
+  house?: UserAddress;
 };
 
 export function tableConfig(opts: TableOptions): TableConfig {
@@ -182,6 +185,7 @@ export function tableConfig(opts: TableOptions): TableConfig {
     fastMode: opts.fastMode ?? false,
     startAfterSecs: opts.startAfterSecs ?? 0n,
     inviteHash: opts.inviteHash ?? new Uint8Array(32),
+    house: opts.house ?? { bytes: new Uint8Array(32) },
   };
 }
 
@@ -894,7 +898,18 @@ export class GameDriver {
     const owedBefore = led.seatRedeemable.lookup(BigInt(seat));
 
     const refund = await this.sim.eliminate(seat, q, rem, this.clock);
-    assert.equal(refund, this.config.tier - q, 'eliminate must return tier - penalty');
+    // `tier - penalty` -- or, at a practice table, the house's whole stake and nobody else's
+    // (table.compact section 10).
+    assert.equal(
+      refund,
+      eliminationRefundTs(
+        this.config.tier,
+        q,
+        this.players[seat]!.addr.bytes,
+        this.config.house?.bytes ?? new Uint8Array(32),
+      ),
+      'eliminate must return what the seat gets back: tier - penalty, or the practice rule',
+    );
 
     const after = this.ledger();
     const prog = after.seatProgress.lookup(BigInt(seat));

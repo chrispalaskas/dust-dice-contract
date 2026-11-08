@@ -1,7 +1,8 @@
 # Backgammon
 
 The second Dust Dice game. Two seats, one flat pot, Yacht's dust dice. The winner takes the
-pot less a 1% rake. There is no doubling cube and there are no gammons: a win is a win.
+pot less a 1% rake — except at a practice table, which pays no winner ([below](#practice-tables)).
+There is no doubling cube and there are no gammons: a win is a win.
 
 **This is the ledger-9 build** (branch `ledger-9`). Every roll hashes a secret from **each
 player** and nothing of the operator's: no VRF, no seed, no operator in the dice at all. Board,
@@ -145,6 +146,29 @@ table nobody opened is refunded).
 A player cannot stall its way into a refund: once one share is in, silence is answered by
 `eliminate`.
 
+## Practice tables
+
+The constructor's last argument, `house: UserAddress` (sealed as `house`), makes a practice
+table when it is not all zero: the site's bot deploys it and sits as `house`, and a person plays
+it. The person's stake is a fee for the DUST the house spends on their game, and the bot must
+never gain or lose NIGHT. Argument order: `(id, stake, rakeTo, seedCommit, moveTimeout,
+tableTimeout, invite, house)`; all zero is an ordinary table, unchanged.
+
+Every send of a stake goes through `payeeOf` (`backgammon.compact` section 7): a stake recorded
+at `house` goes back to it, exactly `tier`; any other goes to the rake address, whole. So:
+
+| Exit                                              | house seat / slot | person | rake address        |
+| ------------------------------------------------- | ----------------- | ------ | ------------------- |
+| `settle`, whoever won (play, timeout, resign)     | `tier`            | 0      | the person's `tier` |
+| `eliminate(slot, true)` while filling (leave)     | `tier`            | 0      | the leaver's `tier` |
+| the start's refund of a third joiner              | `tier`            | 0      | a person's `tier`   |
+| `abortTable` (never filled, never started, stall) | `tier`            | 0      | every other `tier`  |
+
+`q` and `r` are still required by `settle`, so the encoding is the same at every table. The
+closing certificate records `paid = 0` and `rake` = what the rake address took. A person who
+records `house` as their payout address is paid as the house, and a practice table the house
+never sat at sends every stake to the rake.
+
 ## Randomness: what is left
 
 No one -- player, operator, or any two of them together -- can choose a roll, and no one but the
@@ -176,3 +200,6 @@ compactc 0.34.0 (ledger 9), full keys, 2026-09-29:
   hash lives in `openingMove`, used once a game.
 - `start` is k=12, the lower edge of the node's proof-size admission floor (table.compact section
   3), which k=12 has always cleared.
+
+Practice tables (`house`, merged from the ledger-8 line 2026-11-08) cost no k on ledger 8;
+re-measure on this build with `npm run k` after the mainnet toolchain bump.

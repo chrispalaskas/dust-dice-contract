@@ -16,11 +16,18 @@ Measurements: [table-circuit.md](table-circuit.md).
 ## 1. The shape of a game
 
 One deployment per table. A table fills, plays **thirteen rounds**, and settles. The
-constructor's final argument, `fast: Boolean`, fixes the table's PLAY MODE for life in the
+constructor's `fast: Boolean` argument fixes the table's PLAY MODE for life in the
 sealed ledger field `fastMode`: `false` is the on-chain interactive mode this document mostly
 describes; `true` is the fast table (docs/fast-turn-design.md) whose turns happen off-chain
 against the operator and land as one composed settlement transaction of these same circuits.
 Joining is consent to the mode — it is public state any client can read before staking.
+
+The constructor's LAST argument, `house: UserAddress`, sealed as `house`, makes a **practice
+table** when it is not all zero: the site's bot plays a person, the person's stake is a fee that
+is never returned, and the bot never gains or loses NIGHT (§6, "Practice tables"). All zero is an
+ordinary table, and everything else in this document applies unchanged. Argument order:
+`(id, stake, seats, rakeTo, seedCommit, turnTimeout, tableTimeout, fast, startAfter, invite,
+house)`.
 
 ```
 filling ──(start: abortTable)──> playing ──(closeRound at round 12)──> playing, openRound == 13
@@ -221,6 +228,11 @@ nine and nine exist):
 In both modes `q` is the penalty, which **stays in the pot**; `tier - q` becomes the seat's
 `seatRedeemable`. Pays the caller nothing. **Declares no time.**
 
+**At a practice table** the schedule does not apply (the identity is still required): a house
+seat keeps its whole `tier` and any other seat keeps nothing — its stake stays in the pot for the
+rake. A leaver's stake is sent to the house if it is the house's and to the rake address
+otherwise. The return value is what the seat itself gets back.
+
 ### `settle(seed: Bytes<32>, q: Uint<64>, r: Uint<64>): Uint<8>` — anyone
 
 Pays the winner `pot - q` and the rake `q`. Returns the winning seat.
@@ -237,6 +249,10 @@ Pays the winner `pot - q` and the rake `q`. Returns the winning seat.
   `blockTimeGt(roundDeadline + tableTimeoutSecs)`, past which the check is waived and
   `revealedSeed` stays all-zero. See §7.
 - Eliminated seats cannot win. **Declares no time.**
+- **At a practice table no winner is paid.** The winner is still decided and recorded, but the
+  pot goes `tier` per house seat still in the game to `house` and the rest to the rake address
+  (each send skipped when it would be zero). `finalDigest` records `paid = 0` and `rake` = what
+  the rake address took.
 
 ### `redeem(seat: Uint<8>): Uint<64>` — anyone
 
@@ -267,6 +283,12 @@ Legal in exactly four situations, the first outranking the second:
 `q` and `rem` are the **per-seat** rake on `tier`, not on the pot: `q * 100 + rem == tier`,
 `rem < 100`. Required unconditionally even on the paths that pay no rake, so the encoding stays
 canonical. The rake is `q` times the seats that received a share.
+
+**At a practice table** every row above keeps the house whole and the fee: a house seat or slot
+gets its `tier` (as `seatRedeemable` for a seat, sent straight back for a slot), every other one
+gets nothing, and its stake goes to the rake address — no 1% split, and no exemption for an
+operator stall. The certificate's `rake` is everything the rake address took; `perSeat` is what a
+house seat may redeem.
 
 **THE START** (table.compact section 9). On a filling table this circuit starts the game when
 every seat is taken (at once, no clock) or when the early-start clock has run with two or more
@@ -472,6 +494,31 @@ penalty. One permissionless `abortTable` call waives the penalties, pays the rak
 table to `aborted`; only then does `redeem` pay the right number. A client that sees
 `phase == abandoned` should call `abortTable` and then `redeem`.
 
+### Practice tables
+
+A non-zero sealed `house` makes a practice table. Over its whole life, on every path money
+leaves (`table.compact` section 10):
+
+| stake recorded at | receives                                  |
+| ----------------- | ----------------------------------------- |
+| `house`           | exactly `tier`, back to `house`           |
+| any other address | nothing — the stake goes to `rakeAddress` |
+
+| exit                                                | house seat / slot                                                 | anyone else            | rake address               |
+| --------------------------------------------------- | ----------------------------------------------------------------- | ---------------------- | -------------------------- |
+| `settle` (play, walkover, waiver past the deadline) | `tier` (in the pot: by `settle`; eliminated earlier: by `redeem`) | 0                      | the rest of the pot        |
+| `eliminate` while playing (timeout or resignation)  | `tier` into `seatRedeemable`, no penalty                          | 0 (stays in the pot)   | — (paid at the end)        |
+| `eliminate` while filling (leave)                   | `tier`, sent at once                                              | 0                      | the leaver's `tier`        |
+| `abortTable`: start, never filled                   | unseated/refunded slot: `tier`                                    | 0                      | each other refunded `tier` |
+| `abortTable`: operator stalled, all out             | `tier` as `seatRedeemable`                                        | 0                      | every other stake          |
+| `redeem`                                            | its `tier`                                                        | refused (nothing owed) | —                          |
+
+The contract cannot tell the bot from a person, only `house` from other addresses: a person who
+records `house` as their payout address is paid as the house (their stake goes to the bot's
+address), and a practice table the house never sat at sends every stake to the rake. The
+verifier (`verifier/src/verify.ts`) and the mirrors `forfeitsTs` / `payeeTs` /
+`eliminationRefundTs` apply the same rule.
+
 ---
 
 ## 7. Verifiability
@@ -499,7 +546,8 @@ Read with a one-shot `queryContractState`, never `contractStateObservable`, for 
 
 `tableId`, `tier`, `seatLimit`, `rakeAddress`, `seedCommitment`, `turnTimeoutSecs`,
 `tableTimeoutSecs`, `fastMode`, `startAfterSecs` (0 = no early start), `inviteHash` (zero =
-public; otherwise `inviteCommitment(code)` and `join` needs the code).
+public; otherwise `inviteCommitment(code)` and `join` needs the code), `house` (zero = an
+ordinary table; otherwise a practice table, §6).
 
 ### Table state
 
@@ -629,7 +677,8 @@ operator that wants the full width of simultaneous rounds needs a pool of wallet
 5. **Do not seat the operator at a table it operates.** With interactive holds a seed-knowing
    player can compute all 32 hold outcomes before choosing — see the residual note in
    `table.compact`'s header. This is stronger than the old policy preview and the site's threat
-   model should say so.
+   model should say so. (A practice table's bot is seated by design; there the result moves no
+   money, so a seed-knowing house gains nothing by it.)
 
 ---
 

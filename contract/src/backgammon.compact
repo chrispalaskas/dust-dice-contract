@@ -5,8 +5,9 @@
 // every roll hashes a secret from EACH player and nothing of the operator's (backgammon-dice).
 //
 // One deployment per game, like the Yacht table (table.compact), and advertised the same way --
-// by a second instance of the unchanged Lobby. The winner takes the pot less a 1% rake. No
-// doubling cube and no gammons: a win is a win.
+// by a second instance of the unchanged Lobby. The winner takes the pot less a 1% rake -- except
+// at a PRACTICE table, which pays no winner at all (section 7). No doubling cube and no gammons:
+// a win is a win.
 //
 // -------------------------------------------------------------------------------------------
 // 1. WHAT THE CHAIN ENFORCES, AND WHAT IT DOES NOT
@@ -111,6 +112,30 @@
 // Eight exported circuits: join, start, reveal, openingMove, move, eliminate, settle, abortTable.
 // With no VRF a move proves no curve arithmetic; `move` is k=15 because the opening's hash lives
 // in `openingMove`, used once a game. Measured values: cli/tools/circuit-k.mjs.
+//
+// -------------------------------------------------------------------------------------------
+// 7. PRACTICE TABLES: THE HOUSE NEVER WINS OR LOSES
+// -------------------------------------------------------------------------------------------
+//
+// A table sealed with a non-zero `house` is a practice table: the site's bot deploys it, sits in
+// one seat as `house`, and a person takes the other. The person's stake is the FEE for the DUST
+// the house spends running their game, so it is never returned, win or lose; and the bot must
+// never gain or lose NIGHT, or anyone could farm it. Over the table's whole life, on every path
+// money leaves:
+//
+//     a stake whose payout address is `house`    ->  back to `house`, exactly `tier`
+//     any other stake                            ->  the rake address, whole (no 1% split)
+//
+// That is all `payeeOf` says, and every send of a stake goes through it: the leave, the start's
+// refunds, the abort's refunds -- and `settle`, which on a practice table pays no winner but
+// returns each seat's stake through `payeeOf` exactly as an abort would. So who won, who timed
+// out (the house included) and who resigned changes nothing about the money.
+//
+// The contract cannot tell the bot from a person, only `house` from other addresses, so two
+// edge cases read literally: a person who records `house` as their payout address is paid as the
+// house (their stake goes to the bot's address -- a gift, never a gain for them), and a practice
+// table the house never sat at sends every stake to the rake. `house` all zero is an ordinary
+// table and nothing above applies.
 
 pragma language_version >= 0.26;
 
@@ -274,6 +299,14 @@ export ledger joinSlots: Map<Uint<8>, BgSlot>;
 
 /** Sink for the transaction padding. See table.compact section 3. */
 export ledger padStore: Bytes<4096>;
+
+/**
+ * The practice table's house (section 7); all zeros on an ordinary table. Declared last, like
+ * table.compact's late fields -- which does NOT keep the earlier fields' ledger addresses: the
+ * compiler re-buckets every field by the total count, so a state must be read with the build
+ * that wrote it.
+ */
+export sealed ledger house: UserAddress;
 
 pure circuit paddingConstant(): Bytes<4096> {
   return pad(4096, "dust-dice:bg:v1:pad");
@@ -443,25 +476,63 @@ pure circuit pickTwo(acc: Pick2, s: SlotInfo): Pick2 {
                      latest: s.joinedAt > acc.latest ? s.joinedAt : acc.latest, };
 }
 
-/** Refund every occupied slot, except the two seated ones when `keep`. */
-circuit refundSlots(slots: Vector<8, SlotInfo>, keepA: Uint<8>, keepB: Uint<8>, keep: Boolean): [] {
+/**
+ * Is this a stake the table keeps for the rake rather than returning (section 7)? Only at a
+ * practice table, and only a stake whose payout address is not the house's.
+ */
+pure circuit forfeits(addr: UserAddress, home: UserAddress): Boolean {
+  return home != default<UserAddress> && addr != home;
+}
+
+/**
+ * Who is actually paid when the stake `addr` put in leaves the table: `addr` itself, or the rake
+ * address when the stake `forfeits`. `home` and `rake` are the sealed `house` and `rakeAddress`,
+ * passed in so a caller sending several stakes reads each once.
+ */
+pure circuit payeeOf(addr: UserAddress, home: UserAddress, rake: UserAddress): UserAddress {
+  return forfeits(addr, home) ? rake : addr;
+}
+
+/** Refund every occupied slot, except the two seated ones when `keep`. Through `payeeOf`. */
+circuit refundSlots(
+          slots: Vector<8, SlotInfo>,
+          keepA: Uint<8>,
+          keepB: Uint<8>,
+          keep: Boolean,
+          home: UserAddress,
+          rake: UserAddress,
+          ): [] {
   for (const s of slots) {
     if (s.occupied && !(keep && (s.slot == keepA || s.slot == keepB))) {
-      sendUnshielded(nativeToken(), tier as Uint<128>, right<ContractAddress, UserAddress>(s.addr));
+      sendUnshielded(
+        nativeToken(),
+        tier as Uint<128>,
+        right<ContractAddress, UserAddress>(payeeOf(s.addr, home, rake))
+        );
     }
   }
+}
+
+/** 1 if this stake went to the rake under section 7, else 0: `abortTable`'s certificate counts. */
+pure circuit lost(occupied: Boolean, addr: UserAddress, home: UserAddress): Uint<64> {
+  return occupied && forfeits(addr, home) ? 1 : 0;
 }
 
 // ===========================================================================================
 // Constructor
 // ===========================================================================================
 
+/**
+ * `houseAddr` is the practice table's house (section 7), or all zeros for an ordinary table. The
+ * LAST argument, so a caller that predates practice tables only has to append a zero address.
+ */
 constructor(id: Bytes<32>,
             stake: Uint<64>,
             rakeTo: UserAddress,
             moveTimeout: Uint<64>,
             tableTimeout: Uint<64>,
             invite: Bytes<32>,
+            houseAddr: UserAddress,
             ) {
   assert(stake >= minTier(), "tier must be at least 100 so the 1% rake is non-zero");
   assert(stake <= maxTier(), "tier is above the maximum a table may stake");
@@ -475,6 +546,7 @@ constructor(id: Bytes<32>,
   moveTimeoutSecs = disclose(moveTimeout);
   tableTimeoutSecs = disclose(tableTimeout);
   inviteHash = disclose(invite);
+  house = disclose(houseAddr);
 
   phase = BgPhase.filling;
   seatCount = 0;
@@ -572,7 +644,7 @@ export circuit start(now: Uint<64>): [] {
   assert(p.count >= 2, "start: fewer than two players have joined");
   seatIdentity.insert(0, slotSeat(p.a));
   seatIdentity.insert(1, slotSeat(p.b));
-  refundSlots(slots, p.a, p.b, true);
+  refundSlots(slots, p.a, p.b, true, house, rakeAddress);
   pot = (tier * 2) as Uint<64>;
   seatCount = 2;
   phase = BgPhase.playing;
@@ -744,8 +816,14 @@ export circuit eliminate(seat: Uint<8>, voluntary: Boolean): Uint<8> {
          );
 
   if (filling) {
-    // Leaving empties the slot for someone else, and reads nothing another join writes.
-    sendUnshielded(nativeToken(), tier as Uint<128>, right<ContractAddress, UserAddress>(who.addr));
+    // Leaving empties the slot for someone else, and reads nothing another join writes (`house`
+    // and `rakeAddress` are sealed). At a practice table a person's stake is not returned even
+    // before the game: the fee is for the table, not for the game (section 7).
+    sendUnshielded(
+      nativeToken(),
+      tier as Uint<128>,
+      right<ContractAddress, UserAddress>(payeeOf(who.addr, house, rakeAddress))
+      );
     joinSlots.insert(s, emptySlot());
   } else {
     winner = other;
@@ -764,6 +842,12 @@ export circuit eliminate(seat: Uint<8>, voluntary: Boolean): Uint<8> {
  * Pay the winner the pot less the 1% rake. Permissionless: every input is on the ledger, and
  * nothing is left to reveal -- every roll was proven by the move that played it, and replays from
  * the secrets the moves revealed.
+ *
+ * A PRACTICE TABLE PAYS NO WINNER (section 7). The same two sends carry each seat's stake
+ * through `payeeOf` instead -- the house's back to it, the person's to the rake -- so the result
+ * is decided and recorded exactly as anywhere else and moves no money between the seats. `q` and
+ * `r` are still required, so the argument encoding is the same at every table. The certificate
+ * records `paid` 0 (no winner was paid) and `rake` as what the rake address took.
  */
 export circuit settle(q: Uint<64>, r: Uint<64>): Uint<8> {
   assert(phase == BgPhase.decided, "settle: the game is not decided");
@@ -772,20 +856,35 @@ export circuit settle(q: Uint<64>, r: Uint<64>): Uint<8> {
 
   const w = winner;
   const split = bgSplitPot(pot, disclose(q), disclose(r));
+  const home = house;
+  const rake = rakeAddress;
+  const practice = home != default<UserAddress>;
+  const a0 = seatIdentity.lookup(0).addr;
+  const a1 = seatIdentity.lookup(1).addr;
+  // Ordinary: the winner `pot - q`, the rake `q`. Practice: seat 0's stake, then seat 1's.
   sendUnshielded(
     nativeToken(),
-    split[0] as Uint<128>,
-    right<ContractAddress, UserAddress>(seatIdentity.lookup(w).addr)
+    (practice ? tier : split[0]) as Uint<128>,
+    right<ContractAddress, UserAddress>(practice ? payeeOf(a0, home, rake) : (w == 0 ? a0 : a1))
     );
   sendUnshielded(
     nativeToken(),
-    split[1] as Uint<128>,
-    right<ContractAddress, UserAddress>(rakeAddress)
+    (practice ? tier : split[1]) as Uint<128>,
+    right<ContractAddress, UserAddress>(practice ? payeeOf(a1, home, rake) : rake)
     );
+  const raked = (tier * (lost(true, a0, home) + lost(true, a1, home))) as Uint<64>;
 
   pot = 0;
   finalDigest =
-    finalDigestOf(tableId, BgPhase.settled as Uint<8>, w, turn, split[0], split[1], board);
+    finalDigestOf(
+      tableId,
+      BgPhase.settled as Uint<8>,
+      w,
+      turn,
+      practice ? 0 : split[0],
+      practice ? raked : split[1],
+      board
+      );
   phase = BgPhase.settled;
 
   padTransaction();
@@ -803,6 +902,10 @@ export circuit settle(q: Uint<64>, r: Uint<64>): Uint<8> {
  *     table nobody started);
  *   * the opening, NEITHER seat has revealed its share, and a table timeout has passed on top of
  *     the deadline. One share in and the other missing is the missing seat's fault: `eliminate`.
+ *
+ * At a practice table "refunds" means `payeeOf`: the house's stake comes back and every other
+ * goes to the rake, even when the stall was the operator's (section 7 -- the fee is never
+ * returned). The certificate's `rake` records what the rake address took.
  */
 export circuit abortTable(): Uint<64> {
   const filling = phase == BgPhase.filling;
@@ -822,26 +925,44 @@ export circuit abortTable(): Uint<64> {
 
   // While filling, nothing counted the stakes (section 6): the slots are the account of them.
   // After the start the seated players are still in their slots, so those are refunded as SEATS
-  // and the slots are not touched -- refunding both would pay them twice.
+  // and the slots are not touched -- refunding both would pay them twice. Every refund goes
+  // through `payeeOf`: at a practice table only the house's comes back (section 7).
   assertCustody();
+  const home = house;
+  const rake = rakeAddress;
+  const a0 = seatIdentity.lookup(0).addr;
+  const a1 = seatIdentity.lookup(1).addr;
   if (filling) {
-    refundSlots(slots, 0, 0, false);
+    refundSlots(slots, 0, 0, false, home, rake);
   } else {
     sendUnshielded(
       nativeToken(),
       tier as Uint<128>,
-      right<ContractAddress, UserAddress>(seatIdentity.lookup(0).addr)
+      right<ContractAddress, UserAddress>(payeeOf(a0, home, rake))
       );
     sendUnshielded(
       nativeToken(),
       tier as Uint<128>,
-      right<ContractAddress, UserAddress>(seatIdentity.lookup(1).addr)
+      right<ContractAddress, UserAddress>(payeeOf(a1, home, rake))
       );
   }
 
   const refunded = filling ? (tier * (p.count as Uint<64>)) as Uint<64> : pot;
+  // The certificate's `rake`: what went to the rake address rather than back -- zero at an
+  // ordinary table, where every stake is refunded.
+  const lostSlots =
+          lost(slots[0].occupied, slots[0].addr, home) +
+          lost(slots[1].occupied, slots[1].addr, home) +
+          lost(slots[2].occupied, slots[2].addr, home) +
+          lost(slots[3].occupied, slots[3].addr, home) +
+          lost(slots[4].occupied, slots[4].addr, home) +
+          lost(slots[5].occupied, slots[5].addr, home) +
+          lost(slots[6].occupied, slots[6].addr, home) +
+          lost(slots[7].occupied, slots[7].addr, home);
+  const lostSeats = lost(true, a0, home) + lost(true, a1, home);
+  const raked = (tier * (filling ? lostSlots : lostSeats)) as Uint<64>;
   pot = 0;
-  finalDigest = finalDigestOf(tableId, BgPhase.aborted as Uint<8>, noWinner(), turn, 0, 0, board);
+  finalDigest = finalDigestOf(tableId, BgPhase.aborted as Uint<8>, noWinner(), turn, 0, raked, board);
   phase = BgPhase.aborted;
 
   padTransaction();

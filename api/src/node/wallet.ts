@@ -170,6 +170,9 @@ const LEDGER_9_VERSIONS = ['=1.0.0', 'ledger-9'];
  * the WASM package name (`@midnightntwrk/ledger-v9`). So this matches the generation this build
  * speaks against a list of strings known to mean it, and refuses anything else rather than
  * trying to parse a number whose meaning has already changed once.
+ *
+ * Blockfrost's preprod node reports `8.1.1` with no `=` (2026-10-28), and mainnet's node 2.1.101
+ * reports `9.1.0.1` -- so a bare `9.` prefix is accepted too, with or without the `=`.
  */
 export async function assertLedgerGeneration(network: NetworkConfig): Promise<void> {
   const rpc = network.node.replace(/^ws/, 'http');
@@ -182,7 +185,10 @@ export async function assertLedgerGeneration(network: NetworkConfig): Promise<vo
   if (typeof result !== 'string') {
     throw new Error(`node at ${rpc} did not answer midnight_ledgerVersion (HTTP ${res.status})`);
   }
-  if (!LEDGER_9_VERSIONS.some((v) => result === v || result.includes(v))) {
+  if (
+    !LEDGER_9_VERSIONS.some((v) => result === v || result.includes(v)) &&
+    !/^=?9\./.test(result)
+  ) {
     throw new Error(
       `node at ${rpc} speaks ledger "${result}" but this build speaks ledger 9 — wrong network or ` +
         `ports? Set MIDNIGHT_NODE_URL / MIDNIGHT_INDEXER_URL / MIDNIGHT_INDEXER_WS_URL / ` +

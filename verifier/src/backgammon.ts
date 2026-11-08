@@ -31,13 +31,14 @@ import {
   bgPlyDiceTs,
   bgStartPick,
   bgStarter,
+  forfeitsTs,
   nativeBalanceOf,
 } from '@dust-dice/contract';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 
 import { Checks, addressOf } from './checks.ts';
 import { NETWORK } from './config.ts';
-import { Backgammon, readContractState, type BackgammonLedger } from './contracts.ts';
+import { Backgammon, callOutcomes, readContractState, type BackgammonLedger } from './contracts.ts';
 import {
   contractActions,
   sumNative,
@@ -62,7 +63,10 @@ function expectedBalance(led: BackgammonLedger): bigint {
 interface Step {
   blockHeight: number;
   txHash: string;
+  /** The calls that took effect. */
   entryPoints: string[];
+  /** Calls the chain lists for this transaction but did not apply: their segment failed. */
+  failed: string[];
   led: BackgammonLedger;
   /** The contract's real native balance after this transaction. */
   balance: bigint;
@@ -88,10 +92,18 @@ async function readSteps(address: string): Promise<Step[]> {
   const steps: Step[] = [];
   for (const [txHash, calls] of byTx) {
     const state = await readContractState(address, { txHash });
+    // A partial success lists every call, the ones whose segment failed too: read which applied.
+    const outcomes =
+      calls[0]!.txStatus === undefined || calls[0]!.txStatus === 'SUCCESS'
+        ? undefined
+        : await callOutcomes(address, txHash);
     steps.push({
       blockHeight: calls[0]!.blockHeight,
       txHash,
-      entryPoints: calls.map((x) => x.entryPoint ?? '?'),
+      entryPoints: outcomes
+        ? outcomes.filter((o) => o.applied).map((o) => o.entryPoint)
+        : calls.map((x) => x.entryPoint ?? '?'),
+      failed: outcomes ? outcomes.filter((o) => !o.applied).map((o) => o.entryPoint) : [],
       led: Backgammon.ledger(state.data),
       balance: nativeBalanceOf(state),
     });
@@ -233,6 +245,11 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
     `  move timeout   ${final.moveTimeoutSecs} s   table timeout ${final.tableTimeoutSecs} s`,
   );
   console.log(`  phase          ${Backgammon.BgPhase[final.phase]}`);
+  // A PRACTICE table (backgammon.compact section 7) pays no winner: each seat's stake goes back to
+  // the house if it is the house's, and to the rake address otherwise.
+  const house = final.house.bytes;
+  const practice = !house.every((b) => b === 0);
+  if (practice) console.log(`  practice       house ${hex(house)} (no winner is paid)`);
 
   if (final.phase !== Backgammon.BgPhase.settled) {
     console.log(
@@ -253,8 +270,19 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
 
   for (const [i, s] of steps.entries()) {
     const led = s.led;
-    const what = s.entryPoints.join('+');
+    const what = [...s.entryPoints, ...s.failed].join('+');
     if (verbose) console.log(`  tx ${i} ${what} (block ${s.blockHeight})`);
+
+    // A PARTIAL success: the chain applied some of the transaction's segments and not others --
+    // a one-transaction ply whose move landed while the operator's roll in it failed its time
+    // check after a finality stall. The failed calls changed nothing; the operator rolls again
+    // in a transaction of its own, and that roll is checked where it lands.
+    if (s.failed.length > 0) {
+      console.log(
+        `  tx ${i} (${what}): only ${s.entryPoints.join('+') || 'the fee'} took effect -- ` +
+          `${s.failed.join('+')} failed on chain (a partial success)`,
+      );
+    }
 
     // A call can be INCLUDED and do nothing: built against a state a racing call changed first
     // in the same block (a roll that lost to a resignation), it fails its fallible half and
@@ -450,16 +478,34 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
     c.ok('the pot was both stakes', pot === final.tier * 2n, `pot ${pot}`);
     c.ok('settle spent ZERO user inputs', sumNative(tx.unshieldedSpentOutputs) === 0n);
     c.ok('settle created exactly the pot', sumNative(tx.unshieldedCreatedOutputs) === pot);
-    c.ok(
-      `the winner (seat ${final.winner}) was paid pot - 1% at its join-time address`,
-      sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, winnerAddr)) === pot - q,
-      `expected ${pot - q}`,
-    );
-    c.ok(
-      'the rake was paid 1% at the address sealed at deploy',
-      sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, final.rakeAddress.bytes)) === q,
-      `expected ${q}`,
-    );
+    if (practice) {
+      let lost = 0n;
+      for (const s of [0n, 1n]) {
+        if (forfeitsTs(final.seatIdentity.lookup(s).addr.bytes, house)) lost += 1n;
+      }
+      const raked = final.tier * lost;
+      c.ok(
+        'practice: the house got back exactly its own stakes, whoever won',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, house)) === pot - raked,
+        `expected ${pot - raked}`,
+      );
+      c.ok(
+        'practice: the rake took every other stake, whole -- no winner was paid',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, final.rakeAddress.bytes)) === raked,
+        `expected ${raked}`,
+      );
+    } else {
+      c.ok(
+        `the winner (seat ${final.winner}) was paid pot - 1% at its join-time address`,
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, winnerAddr)) === pot - q,
+        `expected ${pot - q}`,
+      );
+      c.ok(
+        'the rake was paid 1% at the address sealed at deploy',
+        sumNativeFor(tx.unshieldedCreatedOutputs, addressOf(tx, final.rakeAddress.bytes)) === q,
+        `expected ${q}`,
+      );
+    }
     c.ok('the pot is empty afterwards', final.pot === 0n);
   }
 

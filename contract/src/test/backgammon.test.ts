@@ -56,6 +56,7 @@ import {
   diceOf,
   freeSlots,
   openTable,
+  paidOut,
   playOut,
   rng,
   seatBoth,
@@ -63,6 +64,7 @@ import {
   sharesOf,
   SLOT_COUNT,
   userAddress,
+  type BgConfig,
 } from './bg-harness.ts';
 
 v8.setFlagsFromString('--expose-gc');
@@ -865,5 +867,244 @@ describe('settling', () => {
       sim.run('settle', (ctx) => sim.bg.impureCircuits.settle(ctx, 199n, 0n)),
       /rake split/,
     );
+  });
+});
+
+// =============================================================================================
+// Practice tables (backgammon.compact section 7)
+// =============================================================================================
+
+describe('practice tables: the house never wins or loses, the fee is never returned', () => {
+  // THE INVARIANT, over a table's whole life and every path money leaves by: the house gets back
+  // exactly `tier` per stake recorded at its address, the rake address takes every other stake
+  // whole (no 1% split), nobody else is paid anything, and the contract ends holding nothing.
+  // Each test keeps a BOOK of every send the table made and checks it against that at the end.
+
+  type Book = Map<string, bigint>;
+
+  const HOUSE = seats()[0];
+  const PERSON = seats()[1];
+  const practice = (house = HOUSE.addr, overrides: Partial<BgConfig> = {}) =>
+    defaultBgConfig({ house, ...overrides });
+
+  /** Add what the last circuit sent to the book. */
+  function take(sim: BackgammonSimulator, book: Book): void {
+    for (const [addr, v] of paidOut(sim)) book.set(addr, (book.get(addr) ?? 0n) + v);
+  }
+
+  function assertPracticeBook(
+    sim: BackgammonSimulator,
+    book: Book,
+    houseStakes: number,
+    otherStakes: number,
+  ): void {
+    const { tier, rakeAddress, house } = sim.config;
+    const h = hex(house!.bytes);
+    const r = hex(rakeAddress.bytes);
+    assert.equal(
+      book.get(h) ?? 0n,
+      tier * BigInt(houseStakes),
+      'the house gets exactly its stakes',
+    );
+    assert.equal(book.get(r) ?? 0n, tier * BigInt(otherStakes), 'the rake takes every other stake');
+    for (const [addr, v] of book) {
+      if (addr !== h && addr !== r) assert.fail(`${addr.slice(0, 8)}… was paid ${v}`);
+    }
+    const l = sim.getLedger();
+    assert.equal(l.pot, 0n, 'the contract holds nothing');
+    // Nothing is left in a slot either: every occupied slot was paid out or became a seat.
+    if (l.phase === BG_PHASE.filling) assert.equal(freeSlots(l).length, SLOT_COUNT);
+  }
+
+  it('seals the house, and an ordinary table seals zeros', async () => {
+    const sim = await BackgammonSimulator.create(practice());
+    assert.equal(hex(sim.getLedger().house.bytes), hex(HOUSE.addr.bytes));
+    const plain = await BackgammonSimulator.create(defaultBgConfig());
+    assert.equal(hex(plain.getLedger().house.bytes), hex(new Uint8Array(32)));
+  });
+
+  it('pays no winner: a played game returns the house its stake and the fee to the rake, whoever won', async () => {
+    const winners: number[] = [];
+    for (const houseSeat of [0, 1]) {
+      // The same game twice -- the house is in no hash, the dice come from the seats' secrets --
+      // with the house in the other seat.
+      const config = practice(seats()[houseSeat].addr, { tableId: bytes32(0x41) });
+      const { sim, players } = await openedGame(config);
+      const game = await playOut(sim, players, rng(1), T0 + 10, (msg, ok) => assert.ok(ok, msg));
+      winners.push(game.winner);
+      sim.asOperator();
+      assert.equal(await sim.settle(game.t + 5), BigInt(game.winner));
+      const book: Book = new Map();
+      take(sim, book);
+      assertPracticeBook(sim, book, 1, 1);
+      assert.equal(sim.getLedger().phase, BG_PHASE.settled);
+      gc();
+    }
+    assert.equal(winners[0], winners[1], 'one game, so the house won it once and lost it once');
+  });
+
+  it('a timeout decides the game, not the money: the house timing out still gets exactly its stake', async () => {
+    const whoTimedOut: string[] = [];
+    for (const houseSeat of [0, 1]) {
+      const { sim, mover } = await openedGame(practice(seats()[houseSeat].addr));
+      whoTimedOut.push(mover === houseSeat ? 'house' : 'person');
+      const deadline = Number(sim.getLedger().deadline);
+      sim.asOperator();
+      await sim.eliminate(mover, false, deadline + 1);
+      assert.equal(Number(sim.getLedger().winner), 1 - mover);
+      await sim.settle(deadline + 2);
+      const book: Book = new Map();
+      take(sim, book);
+      assertPracticeBook(sim, book, 1, 1);
+    }
+    assert.deepEqual(whoTimedOut.sort(), ['house', 'person']);
+  });
+
+  it('a resignation by either side moves no money between them', async () => {
+    for (const houseSeat of [0, 1]) {
+      const { sim, players } = await openedGame(practice(seats()[houseSeat].addr));
+      sim.asPlayer(players[1]!.sk);
+      await sim.eliminate(1, true, T0 + 15);
+      sim.asOperator();
+      assert.equal(await sim.settle(T0 + 16), 0n);
+      const book: Book = new Map();
+      take(sim, book);
+      assertPracticeBook(sim, book, 1, 1);
+    }
+  });
+
+  it('leaving a filling table: the person forfeits the fee, the house takes its stake back', async () => {
+    const sim = await BackgammonSimulator.create(practice());
+    const book: Book = new Map();
+    sim.asPlayer(HOUSE.sk);
+    await sim.join(HOUSE.addr, T0, T0, 2);
+    sim.asPlayer(PERSON.sk);
+    await sim.join(PERSON.addr, T0 + 1, T0 + 1, 5);
+    await sim.eliminate(5, true, T0 + 5);
+    take(sim, book);
+    assert.equal(book.get(hex(sim.config.rakeAddress.bytes)), sim.config.tier, 'to the rake');
+    sim.asPlayer(HOUSE.sk);
+    await sim.eliminate(2, true, T0 + 6);
+    take(sim, book);
+    assert.equal(sim.getLedger().phase, BG_PHASE.filling, 'empty again, still joinable');
+    assertPracticeBook(sim, book, 1, 1);
+  });
+
+  it('a table that never fills, or is never started: only the house is refunded', async () => {
+    for (const [who, stakes] of [
+      [[PERSON], [0, 1]],
+      [[HOUSE], [1, 0]],
+      [
+        [HOUSE, PERSON],
+        [1, 1],
+      ],
+    ] as const) {
+      const sim = await BackgammonSimulator.create(practice());
+      for (const [i, p] of who.entries()) {
+        sim.asPlayer(p.sk);
+        await sim.join(p.addr, T0 + i, T0 + i, 3 + i);
+      }
+      const last = T0 + who.length - 1;
+      await rejects(sim.abortTable(last + 600), /not stalled/);
+      assert.equal(await sim.abortTable(last + 601), sim.config.tier * BigInt(who.length));
+      const book: Book = new Map();
+      take(sim, book);
+      assert.equal(sim.getLedger().phase, BG_PHASE.aborted);
+      assertPracticeBook(sim, book, stakes[0], stakes[1]);
+    }
+  });
+
+  it('the opening stalls with no share from either seat: the house is refunded and the fee still is not', async () => {
+    // The abort's other branch: started, and neither seat revealed its share of the opening.
+    const { sim } = await startedGame(practice());
+    const deadline = Number(sim.getLedger().deadline);
+    await rejects(sim.abortTable(deadline + 600), /not stalled/);
+    assert.equal(await sim.abortTable(deadline + 601), 20_000n);
+    const book: Book = new Map();
+    take(sim, book);
+    assertPracticeBook(sim, book, 1, 1);
+  });
+
+  it("the start's refunds: a late person's stake goes to the rake, a late house's back to it", async () => {
+    // Three joiners; the latest (`c`, slot 6) is refunded by the start, as in 'joining' above,
+    // and `a` and `b` take seats 0 and 1.
+    const [a, b] = seats();
+    const c = { sk: bytes32(0x33), addr: userAddress(0x03) };
+    for (const house of [b, c]) {
+      // b: the house sits in seat 1, and the late PERSON's refund goes to the rake.
+      // c: the house is the late joiner -- refunded, it never sits at its own table.
+      const sim = await BackgammonSimulator.create(practice(house.addr));
+      const book: Book = new Map();
+      sim.asPlayer(c.sk);
+      await sim.join(c.addr, T0 + 5, T0 + 5, 6);
+      sim.asPlayer(a.sk);
+      await sim.join(a.addr, T0 + 1, T0 + 5, 2);
+      sim.asPlayer(b.sk);
+      await sim.join(b.addr, T0 + 3, T0 + 5, 4);
+      sim.asOperator();
+      await sim.start(T0 + 20);
+      take(sim, book);
+      assert.equal(hex(sim.getLedger().seatIdentity.lookup(1n).addr.bytes), hex(b.addr.bytes));
+      assert.equal(sim.getLedger().pot, 20_000n);
+      // Seat 0 (a person either way) resigns; seat 1 wins.
+      sim.asPlayer(a.sk);
+      await sim.eliminate(0, true, T0 + 21);
+      sim.asOperator();
+      await sim.settle(T0 + 22);
+      take(sim, book);
+      // One stake at the house's address either way, the other two to the rake.
+      assertPracticeBook(sim, book, 1, 2);
+    }
+  });
+
+  it('bot against bot -- or a person who records the house as payout -- is all the house’s', async () => {
+    const sim = await BackgammonSimulator.create(practice());
+    sim.asPlayer(HOUSE.sk);
+    await sim.join(HOUSE.addr, T0, T0, 0);
+    sim.asPlayer(PERSON.sk);
+    await sim.join(HOUSE.addr, T0 + 1, T0 + 1, 1); // a second key, the house's address
+    sim.asOperator();
+    await sim.start(T0 + 10);
+    sim.asPlayer(PERSON.sk);
+    await sim.eliminate(1, true, T0 + 11);
+    sim.asOperator();
+    await sim.settle(T0 + 12);
+    const book: Book = new Map();
+    take(sim, book);
+    assertPracticeBook(sim, book, 2, 0);
+  });
+
+  it('an ordinary table is paid exactly as before: the winner pot - 1%, refunds in full', async () => {
+    const tier = defaultBgConfig().tier;
+    // Settle.
+    const { sim, players, mover } = await openedGame();
+    sim.asPlayer(players[mover]!.sk);
+    await sim.eliminate(mover, true, T0 + 20);
+    sim.asOperator();
+    await sim.settle(T0 + 21);
+    const pot = tier * 2n;
+    let out = paidOut(sim);
+    assert.equal(out.get(hex(players[1 - mover]!.addr.bytes)), pot - pot / 100n);
+    assert.equal(out.get(hex(sim.config.rakeAddress.bytes)), pot / 100n);
+    assert.equal(out.size, 2);
+
+    // A leave, and an abort: each stake back to its own address.
+    const filling = await BackgammonSimulator.create(defaultBgConfig());
+    filling.asPlayer(PERSON.sk);
+    await filling.join(PERSON.addr, T0, T0, 1);
+    await filling.eliminate(1, true, T0 + 1);
+    assert.deepEqual([...paidOut(filling)], [[hex(PERSON.addr.bytes), tier]]);
+    filling.asPlayer(HOUSE.sk);
+    await filling.join(HOUSE.addr, T0 + 2, T0 + 2, 3);
+    await filling.abortTable(T0 + 2 + 601);
+    assert.deepEqual([...paidOut(filling)], [[hex(HOUSE.addr.bytes), tier]]);
+
+    // Started, no share from either seat: the abort refunds both seats in full.
+    const stalled = await startedGame();
+    await stalled.sim.abortTable(Number(stalled.sim.getLedger().deadline) + 601);
+    out = paidOut(stalled.sim);
+    assert.equal(out.get(hex(stalled.players[0]!.addr.bytes)), tier);
+    assert.equal(out.get(hex(stalled.players[1]!.addr.bytes)), tier);
+    assert.equal(out.size, 2);
   });
 });
