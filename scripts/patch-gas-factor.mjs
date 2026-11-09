@@ -47,14 +47,14 @@ const TARGETS = [
   join(ROOT, 'node_modules/@midnight-ntwrk/compact-js/dist/esm/effect/internal/executable.js'),
   ...globSync(join(ROOT, 'node_modules/@midnight-ntwrk/midnight-js-protocol/dist/shared/compose-options-*.js')),
 ];
-// 1 SINCE LEDGER 9.1.0.1 (node 2.1.101, mainnet): the node refuses a fallible transcript whose
-// declared gas is above its measured cost -- "ran out of gas budget" on a lone `join` at x4 and
-// x16 and x200, SucceedEntirely at x1 (devnet, 2026-11-09). The release notes: "Each segment's
-// writes are priced separately" and transcripts "declaring gas beyond the block limits ... are
-// rejected as malformed". So the inflation that saved multi-call turns on ledger 8/9.0 now sinks
-// every call. Left in place at 1 (a no-op) so the knob exists if a merged turn under-budgets
-// again (midnight-ledger #745 is still open); MIDNIGHT_GAS_FACTOR raises it for a process.
-const DEFAULT_FACTOR = 1;
+// TIME ONLY since ledger 9.1.0.1 (node 2.1.101, mainnet). The node refuses a fallible transcript
+// whose declared BYTES exceed what it writes or deletes -- "ran out of gas budget" on a lone `join`
+// with every dimension x4, x16 or x200; SucceedEntirely with the bytes exact and the two times x4
+// (devnet, 2026-11-09; the 9.1.0.1 notes: "Each segment's writes are priced separately"). So the
+// bytes are left as measured and only readTime and computeTime carry the headroom. The headroom is
+// still needed: a merged Yacht turn's three resolves ran out of budget at x1 while the player's
+// parts passed (midnight-ledger #745, open). MIDNIGHT_GAS_FACTOR raises or lowers it per process.
+const DEFAULT_FACTOR = 4;
 
 // `const partitioned = <call to partitionTranscripts(...)>;` in `partitionAllTranscripts` -- the
 // esm and cjs builds differ only in how the ledger import is spelled.
@@ -70,7 +70,7 @@ const helpers = (indent) =>
   [
     `${indent}// PATCHED by scripts/patch-gas-factor.mjs -- see docs/bugs-found.md #21 and #36.`,
     `${indent}const __gasFactor = (() => { try { return BigInt(process.env.MIDNIGHT_GAS_FACTOR ?? ${DEFAULT_FACTOR}); } catch { return ${DEFAULT_FACTOR}n; } })();`,
-    `${indent}const __gasInflate = (t) => t === undefined ? t : ({ ...t, gas: { readTime: t.gas.readTime * __gasFactor, computeTime: t.gas.computeTime * __gasFactor, bytesWritten: t.gas.bytesWritten * __gasFactor, bytesDeleted: t.gas.bytesDeleted * __gasFactor } });`,
+    `${indent}const __gasInflate = (t) => t === undefined ? t : ({ ...t, gas: { readTime: t.gas.readTime * __gasFactor, computeTime: t.gas.computeTime * __gasFactor, bytesWritten: t.gas.bytesWritten, bytesDeleted: t.gas.bytesDeleted } });`,
   ].join('\n');
 
 for (const target of TARGETS) {
