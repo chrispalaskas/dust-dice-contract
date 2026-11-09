@@ -51,9 +51,18 @@ const TARGETS = [
 // whose declared BYTES exceed what it writes or deletes -- "ran out of gas budget" on a lone `join`
 // with every dimension x4, x16 or x200; SucceedEntirely with the bytes exact and the two times x4
 // (devnet, 2026-11-09; the 9.1.0.1 notes: "Each segment's writes are priced separately"). So the
-// bytes are left as measured and only readTime and computeTime carry the headroom. The headroom is
-// still needed: a merged Yacht turn's three resolves ran out of budget at x1 while the player's
-// parts passed (midnight-ledger #745, open). MIDNIGHT_GAS_FACTOR raises or lowers it per process.
+// bytes are left as measured and only readTime and computeTime carry the headroom. Measured slack
+// on the bytes (same join, 1186 bytes written): +1 and +16 land, +64 and +200 fail -- a few per
+// cent at most, so `MIDNIGHT_GAS_BYTES_PAD` (default 0) is a probe knob, not a fix. The headroom
+// on time is still needed: a merged Yacht turn's three resolves ran out of budget at x1 while the
+// player's parts passed (midnight-ledger #745, open). MIDNIGHT_GAS_FACTOR sets it per process.
+//
+// WHAT THIS CANNOT FIX: two seats' fast turns settling in one block. The second one's resolves
+// were built on the state before the first landed; the first's `vrfAnswer` inserts change the
+// map, the second's inserts then write more bytes than declared, and the node fails its fallible
+// segments (both Yacht games on 2026-11-09, segments 1-3 "ran out of gas budget"). The fix is in
+// the operator: one fast settlement in flight per TABLE, and the resolves rebuilt on the live
+// state right before the merge (they are deterministic in B; only their gas changes).
 const DEFAULT_FACTOR = 4;
 
 // `const partitioned = <call to partitionTranscripts(...)>;` in `partitionAllTranscripts` -- the
@@ -63,14 +72,15 @@ const DEFAULT_FACTOR = 4;
 const SITE = /^(\s*)((?:const )?partitioned) = (.*partitionTranscripts\(.*\));$/m;
 // This script's own previous output, so re-running re-applies rather than skips.
 const APPLIED_HELPERS =
-  /^[^\n]*PATCHED by scripts\/patch-gas-factor\.mjs[^\n]*\n[^\n]*__gasFactor = [^\n]*\n[^\n]*__gasInflate = [^\n]*\n/m;
+  /^[^\n]*PATCHED by scripts\/patch-gas-factor\.mjs[^\n]*\n[^\n]*__gasFactor = [^\n]*\n(?:[^\n]*__gasBytesPad = [^\n]*\n)?[^\n]*__gasInflate = [^\n]*\n/m;
 const APPLIED_SITE = /^(\s*)((?:const )?partitioned) = \((.*)\)\.map\(\(\[g, f\][^\n]*\);$/m;
 
 const helpers = (indent) =>
   [
     `${indent}// PATCHED by scripts/patch-gas-factor.mjs -- see docs/bugs-found.md #21 and #36.`,
     `${indent}const __gasFactor = (() => { try { return BigInt(process.env.MIDNIGHT_GAS_FACTOR ?? ${DEFAULT_FACTOR}); } catch { return ${DEFAULT_FACTOR}n; } })();`,
-    `${indent}const __gasInflate = (t) => t === undefined ? t : ({ ...t, gas: { readTime: t.gas.readTime * __gasFactor, computeTime: t.gas.computeTime * __gasFactor, bytesWritten: t.gas.bytesWritten, bytesDeleted: t.gas.bytesDeleted } });`,
+    `${indent}const __gasBytesPad = (() => { try { return BigInt(process.env.MIDNIGHT_GAS_BYTES_PAD ?? 0); } catch { return 0n; } })();`,
+    `${indent}const __gasInflate = (t) => t === undefined ? t : ({ ...t, gas: { readTime: t.gas.readTime * __gasFactor, computeTime: t.gas.computeTime * __gasFactor, bytesWritten: t.gas.bytesWritten + __gasBytesPad, bytesDeleted: t.gas.bytesDeleted + __gasBytesPad } });`,
   ].join('\n');
 
 for (const target of TARGETS) {
