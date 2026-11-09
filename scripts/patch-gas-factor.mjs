@@ -47,7 +47,14 @@ const TARGETS = [
   join(ROOT, 'node_modules/@midnight-ntwrk/compact-js/dist/esm/effect/internal/executable.js'),
   ...globSync(join(ROOT, 'node_modules/@midnight-ntwrk/midnight-js-protocol/dist/shared/compose-options-*.js')),
 ];
-const DEFAULT_FACTOR = 4;
+// 1 SINCE LEDGER 9.1.0.1 (node 2.1.101, mainnet): the node refuses a fallible transcript whose
+// declared gas is above its measured cost -- "ran out of gas budget" on a lone `join` at x4 and
+// x16 and x200, SucceedEntirely at x1 (devnet, 2026-11-09). The release notes: "Each segment's
+// writes are priced separately" and transcripts "declaring gas beyond the block limits ... are
+// rejected as malformed". So the inflation that saved multi-call turns on ledger 8/9.0 now sinks
+// every call. Left in place at 1 (a no-op) so the knob exists if a merged turn under-budgets
+// again (midnight-ledger #745 is still open); MIDNIGHT_GAS_FACTOR raises it for a process.
+const DEFAULT_FACTOR = 1;
 
 // `const partitioned = <call to partitionTranscripts(...)>;` in `partitionAllTranscripts` -- the
 // esm and cjs builds differ only in how the ledger import is spelled.
