@@ -94,7 +94,6 @@ import {
 } from '@dust-dice/contract';
 
 
-import { NETWORK } from './config.ts';
 import { Checks, addressOf } from './checks.ts';
 import { verifyBackgammon } from './backgammon.ts';
 import {

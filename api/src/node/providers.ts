@@ -105,11 +105,22 @@ export class InMemoryPrivateStateProvider<
  *   NodeZkConfigProvider reads `keys/`, `zkir/` and `compiler/` from under it.
  * @param phases Optional timing sink (see Gate 0's Q2 methodology).
  */
+/**
+ * midnight-js's six providers, plus the wallet they were made from: code that assembles its own
+ * transactions (merged parts, the inclusion submitter) balances through the wallet directly, so it
+ * holds the wallet's own handle -- the one `revert` takes when a block drops.
+ */
+export type DappProviders<CK extends string, PS = unknown> = MidnightProviders<
+  CK,
+  PrivateStateId,
+  PS
+> & { readonly walletContext: WalletContext };
+
 export function createProviders<CK extends string, PS = unknown>(
   ctx: WalletContext,
   managedDir: string,
   phases?: Phases,
-): MidnightProviders<CK, PrivateStateId, PS> {
+): DappProviders<CK, PS> {
   // midnight-js 5 hands the wallet era-tagged handles; the wallet SDK takes its own. They meet as
   // bytes: read with this build's ledger copy, then adopted at the wallet's protocol version.
   const walletProvider = createLedger9WalletProvider({
@@ -168,5 +179,6 @@ export function createProviders<CK extends string, PS = unknown>(
     walletProvider,
     midnightProvider,
     config: { networkId: ctx.network.networkId, ttlSeconds: Math.floor(TX_TTL_MS / 1000) },
+    walletContext: ctx,
   };
 }

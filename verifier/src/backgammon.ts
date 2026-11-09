@@ -36,7 +36,6 @@ import {
 } from '@dust-dice/contract';
 
 import { Checks, addressOf } from './checks.ts';
-import { NETWORK } from './config.ts';
 import { Backgammon, callOutcomes, readContractState, type BackgammonLedger } from './contracts.ts';
 import {
   contractActions,
