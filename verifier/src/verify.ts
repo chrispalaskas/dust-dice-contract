@@ -93,7 +93,6 @@ import {
   type RoundResultTs,
 } from '@dust-dice/contract';
 
-import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 
 import { NETWORK } from './config.ts';
 import { Checks, addressOf } from './checks.ts';
@@ -262,7 +261,6 @@ interface SeatReplay {
 async function verify(address: string, verbose: boolean): Promise<number> {
   // `userAddressBytes` decodes bech32m, which is network-tagged; nothing here builds a wallet,
   // so the network id has to be set explicitly.
-  setNetworkId(NETWORK.networkId);
   const c = new Checks(verbose);
   console.log(`Verifying table ${address}\n`);
 

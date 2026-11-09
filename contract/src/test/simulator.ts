@@ -164,17 +164,14 @@ export class BaseSimulator<PS> {
   }
 
   context(circuitId: string) {
-    return createCircuitContext<PS>(
+    return createCircuitContext<PS>({
       circuitId,
-      this.address,
-      COIN_PUBLIC_KEY,
-      this.state,
-      this.privateState,
-      undefined,
-      undefined,
-      undefined,
-      this.blockTime,
-    );
+      contractAddress: this.address,
+      coinPublicKeyOrZswapState: COIN_PUBLIC_KEY,
+      contractState: this.state,
+      privateState: this.privateState,
+      time: this.blockTime,
+    });
   }
 
   /**

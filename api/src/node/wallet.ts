@@ -21,14 +21,8 @@
 import { Buffer } from 'node:buffer';
 
 import * as Rx from 'rxjs';
-import * as ledger from '@midnight-ntwrk/midnight-js-protocol/ledger';
-import { unshieldedToken } from '@midnight-ntwrk/midnight-js-protocol/ledger';
-import { setNetworkId, getNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
-import {
-  CoinsAndBalances as DustCoins,
-  CustomDustWallet,
-  V1Builder,
-} from '@midnight-ntwrk/wallet-sdk-dust-wallet/v1';
+import * as ledger from '@midnightntwrk/ledger-v9';
+import { unshieldedToken } from '@midnightntwrk/ledger-v9';
 import {
   WalletFacade,
   HDWallet,
@@ -38,11 +32,13 @@ import {
   NoOpTransactionHistoryStorage,
   PublicKey,
   UnshieldedWallet,
+  DustWallet,
   MidnightBech32m,
   UnshieldedAddress,
-} from '@midnight-ntwrk/wallet-sdk';
-import type { FacadeState } from '@midnight-ntwrk/wallet-sdk';
-import { DustAddress } from '@midnight-ntwrk/wallet-sdk-address-format';
+  WalletTransaction,
+} from '@midnightntwrk/wallet-sdk';
+import type { FacadeState, FinalizedTx, UnboundTx, WalletSeeds } from '@midnightntwrk/wallet-sdk';
+import { DustAddress } from '@midnightntwrk/wallet-sdk-address-format';
 
 import { TX_TTL_MS, type NetworkConfig } from './network.js';
 
@@ -50,6 +46,9 @@ export { unshieldedToken };
 
 export interface WalletContext {
   wallet: Awaited<ReturnType<typeof WalletFacade.init>>;
+  /** What the facade was started from (wallet-sdk 2.0.0): the three per-role seeds. */
+  seeds: WalletSeeds;
+  /** Derived from `seeds.shielded` with this build's ledger copy: the coin and encryption keys. */
   shieldedSecretKeys: ReturnType<typeof ledger.ZswapSecretKeys.fromSeed>;
   dustSecretKey: ReturnType<typeof ledger.DustSecretKey.fromSeed>;
   unshieldedKeystore: ReturnType<typeof createKeystore>;
@@ -73,8 +72,8 @@ function deriveKeys(seed: string) {
 /** `FacadeState.isSynced` minus the shielded term — see the module header. */
 function isUsableSync(state: FacadeState): boolean {
   return (
-    state.dust.state.progress.isStrictlyComplete() &&
-    state.unshielded.state.progress.isStrictlyComplete()
+    state.dust.progress.isStrictlyComplete() &&
+    state.unshielded.progress.isStrictlyComplete()
   );
 }
 
@@ -92,9 +91,9 @@ function describeProgress(state: FacadeState): string {
     return `${String(applied)}/${String(highest)}${p.isConnected === false ? ' (disconnected)' : ''}`;
   };
   return (
-    `unshielded ${pair(state.unshielded.state.progress)} · ` +
-    `dust ${pair(state.dust.state.progress)} · ` +
-    `shielded ${pair(state.shielded.state.progress)}`
+    `unshielded ${pair(state.unshielded.progress)} · ` +
+    `dust ${pair(state.dust.progress)} · ` +
+    `shielded ${pair(state.shielded.progress)}`
   );
 }
 
@@ -135,21 +134,17 @@ function signerFor(ctx: WalletContext): (data: Uint8Array) => Promise<ledger.Sig
 }
 
 /**
- * DUST coin selection: the LARGEST coin first.
- *
- * The SDK's default picks the smallest coin first. A wallet that has paid many fees holds a
- * dozen tiny DUST change coins beside a few large ones, and smallest-first then selects only the
- * tiny ones; the fee of a transaction with that many spends exceeds what they cover, the next
- * round of the SDK's balancing loop selects NOTHING, and the loop — which only stops when the
- * fee is covered — spins forever, allocating WASM transactions with the event loop blocked
- * (observed live: the operator daemon at 3 GB in nine minutes; docs/bugs-found.md #31). One
- * large coin covers any fee in a single iteration.
+ * DUST coin selection is the SDK's own since wallet-sdk 2.0.0. Until then this module replaced it
+ * with largest-first: the beta's smallest-first loop could select nothing and spin forever
+ * (docs/bugs-found.md #31). The 2.0.0 loop is bounded -- every pass must take a coin -- and retries
+ * largest-first itself when the configured order runs dry. Largest-first is now also the WRONG
+ * default on ledger 9: one large coin pays a fee with exactly one DUST spend, which the ledger can
+ * reject with `OutsideTimeToDismiss` (relnotes/ledger-9, midnight-ledger #838), while
+ * smallest-first tends to spend several.
  */
-const largestDustCoinFirst: DustCoins.CoinSelection = (coins) =>
-  [...coins].sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : 0)).at(0);
 
 /** What a ledger-9 node answers `midnight_ledgerVersion` with. See `assertLedgerGeneration`. */
-const LEDGER_9_VERSIONS = ['=1.0.0', 'ledger-9'];
+const LEDGER_9_VERSIONS = ['ledger-9'];
 
 /**
  * Refuses a node from another ledger generation before any wallet starts syncing against it.
@@ -172,8 +167,14 @@ const LEDGER_9_VERSIONS = ['=1.0.0', 'ledger-9'];
  * trying to parse a number whose meaning has already changed once.
  *
  * Blockfrost's preprod node reports `8.1.1` with no `=` (2026-10-28), and mainnet's node 2.1.101
- * reports `9.1.0.1` -- so a bare `9.` prefix is accepted too, with or without the `=`.
+ * reports `9.1.0.1` -- so a bare `9.` prefix is accepted too, with or without the `=`. The node
+ * 2.1.101 IMAGE on a local devnet reports `1.0.1` (2026-11-09): the renumbered crate again. So a
+ * ledger-9 answer is a `1.x` or a `9.x`, and an `8.x` is refused.
  */
+export function isLedger9Version(result: string): boolean {
+  return LEDGER_9_VERSIONS.some((v) => result.includes(v)) || /^=?(1|9)\./.test(result);
+}
+
 export async function assertLedgerGeneration(network: NetworkConfig): Promise<void> {
   const rpc = network.node.replace(/^ws/, 'http');
   const res = await fetch(rpc, {
@@ -185,10 +186,7 @@ export async function assertLedgerGeneration(network: NetworkConfig): Promise<vo
   if (typeof result !== 'string') {
     throw new Error(`node at ${rpc} did not answer midnight_ledgerVersion (HTTP ${res.status})`);
   }
-  if (
-    !LEDGER_9_VERSIONS.some((v) => result === v || result.includes(v)) &&
-    !/^=?9\./.test(result)
-  ) {
+  if (!isLedger9Version(result)) {
     throw new Error(
       `node at ${rpc} speaks ledger "${result}" but this build speaks ledger 9 — wrong network or ` +
         `ports? Set MIDNIGHT_NODE_URL / MIDNIGHT_INDEXER_URL / MIDNIGHT_INDEXER_WS_URL / ` +
@@ -206,8 +204,7 @@ export async function assertLedgerGeneration(network: NetworkConfig): Promise<vo
  * Zswap/NightExternal/Dust, index 0 — so the answers are the wallet's own.
  */
 export function deriveAddresses(seed: string, networkId: string): { night: string; dust: string } {
-  setNetworkId(networkId);
-  const id = getNetworkId();
+  const id = networkId;
   const keys = deriveKeys(seed);
   return {
     night: createKeystore({ kind: 'schnorr', secret: keys[Roles.NightExternal] }, id)
@@ -272,19 +269,22 @@ export async function createWallet(
   seed: string,
   snapshot?: WalletSnapshot,
 ): Promise<WalletContext> {
-  setNetworkId(network.networkId);
   await assertLedgerGeneration(network);
-  const networkId = getNetworkId();
+  const networkId = network.networkId;
 
+  // The three per-role seeds, from this module's own derivation (account 0, index 0) -- what
+  // `WalletSeeds.fromMasterSeed` gives too, spelled out so the addresses can never drift from
+  // `deriveAddresses`.
   const keys = deriveKeys(seed);
-  const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(keys[Roles.Zswap]);
-  const dustSecretKey = ledger.DustSecretKey.fromSeed(keys[Roles.Dust]);
-  // wallet-sdk 2.x takes a tagged UnshieldedSecretKey rather than raw bytes. Midnight's
-  // unshielded (NIGHT) keys are Schnorr.
-  const unshieldedKeystore = createKeystore(
-    { kind: 'schnorr', secret: keys[Roles.NightExternal] },
-    networkId,
-  );
+  const seeds: WalletSeeds = {
+    shielded: keys[Roles.Zswap],
+    unshielded: keys[Roles.NightExternal],
+    dust: keys[Roles.Dust],
+  };
+  const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(seeds.shielded);
+  const dustSecretKey = ledger.DustSecretKey.fromSeed(seeds.dust);
+  // Midnight's unshielded (NIGHT) keys are Schnorr.
+  const unshieldedKeystore = createKeystore({ kind: 'schnorr', secret: seeds.unshielded }, networkId);
 
   const configuration = {
     networkId,
@@ -292,10 +292,15 @@ export async function createWallet(
       indexerHttpUrl: network.indexer,
       indexerWsUrl: network.indexerWS,
     },
-    provingServerUrl: new URL(network.proofServer),
+    // Every transaction this process authors is a ledger-9 one: no ledger-8 prover.
+    provers: { v9: { kind: 'server' as const, url: new URL(network.proofServer) } },
     relayURL: new URL(network.node.replace(/^http/, 'ws')),
     txHistoryStorage: new NoOpTransactionHistoryStorage(),
     costParameters: { additionalFeeOverhead: 300_000_000_000_000n, feeBlocksMargin: 5 },
+    // A wallet made after the fork has no ledger-8 DUST to find, and on mainnet replaying the
+    // ledger-8 DUST history would cost hours: the chain re-emitted every DUST record as ledger-9
+    // events when it crossed. No effect on a chain born on ledger 9 (the devnet).
+    skipLedgerV8DustHistory: true,
   };
 
   // A snapshot is only restored into the wallet it came from, on the chain it came from.
@@ -315,36 +320,72 @@ export async function createWallet(
 
   const wallet = await WalletFacade.init({
     configuration,
-    shielded: async (config) =>
+    shielded: (config) =>
       restore
         ? ShieldedWallet(config).restore(restore.shielded)
-        : ShieldedWallet(config).startWithSecretKeys(shieldedSecretKeys),
-    unshielded: async (config) =>
+        : ShieldedWallet(config).startWithSeed(seeds.shielded),
+    unshielded: (config) =>
       restore
         ? UnshieldedWallet(config).restore(restore.unshielded)
         : UnshieldedWallet(config).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
-    dust: async (config) =>
-      restore
-        ? CustomDustWallet(
-            config,
-            new V1Builder().withDefaults().withCoinSelection(() => largestDustCoinFirst),
-          ).restore(restore.dust)
-        : CustomDustWallet(
-            config,
-            new V1Builder().withDefaults().withCoinSelection(() => largestDustCoinFirst),
-          ).startWithSecretKey(dustSecretKey, ledger.LedgerParameters.initialParameters().dust),
+    dust: (config) =>
+      restore ? DustWallet(config).restore(restore.dust) : DustWallet(config).startWithSeed(seeds.dust),
   });
 
-  await wallet.start(shieldedSecretKeys, dustSecretKey);
+  await wallet.start(seeds);
 
   return {
     wallet,
+    seeds,
     shieldedSecretKeys,
     dustSecretKey,
     unshieldedKeystore,
     address,
     network,
   };
+}
+
+/**
+ * A raw ledger-9 transaction this process built (a merge of proven parts, say), sealed into the
+ * handle the facade takes, at the protocol version the wallets are at. wallet-sdk 2.0.0 only takes
+ * handles: a transaction is stamped with the protocol version that built it, so a wallet on the
+ * other side of a fork refuses it instead of misreading it.
+ */
+export async function adoptUnbound(ctx: WalletContext, tx: { serialize(): Uint8Array }): Promise<UnboundTx> {
+  const state = await Rx.firstValueFrom(ctx.wallet.state());
+  return WalletTransaction.adopt('Unbound', tx as never, state.activeProtocolVersion);
+}
+
+/** The same for a finalized (proved, signed, bound) transaction, e.g. one to submit. */
+export async function adoptFinalized(
+  ctx: WalletContext,
+  tx: { serialize(): Uint8Array },
+): Promise<FinalizedTx> {
+  const state = await Rx.firstValueFrom(ctx.wallet.state());
+  return WalletTransaction.adopt('Finalized', tx as never, state.activeProtocolVersion);
+}
+
+/** A finalized handle's transaction, read back with this build's ledger copy. */
+export function finalizedLedgerTx(handle: FinalizedTx): ledger.FinalizedTransaction {
+  return ledger.Transaction.deserialize('signature', 'proof', 'binding', handle.serialize());
+}
+
+/**
+ * Balance an unbound ledger-9 transaction from this wallet (fees in DUST by default), sign what
+ * the balancing added, prove and bind it: the finalized handle, ready to submit.
+ */
+export async function balanceAndFinalize(
+  ctx: WalletContext,
+  tx: { serialize(): Uint8Array },
+  options: { ttl?: Date; tokenKindsToBalance?: ('dust' | 'shielded' | 'unshielded')[] } = {},
+): Promise<FinalizedTx> {
+  const handle = await adoptUnbound(ctx, tx);
+  const recipe = await ctx.wallet.balanceUnboundTransaction(handle, {
+    ttl: options.ttl ?? new Date(Date.now() + TX_TTL_MS),
+    ...(options.tokenKindsToBalance ? { tokenKindsToBalance: options.tokenKindsToBalance } : {}),
+  });
+  const signed = await ctx.wallet.signRecipe(recipe, signerFor(ctx));
+  return await ctx.wallet.finalizeRecipe(signed);
 }
 
 export interface Balances {
@@ -479,7 +520,6 @@ export async function transferTo(
 
   const recipe = await ctx.wallet.transferTransaction(
     [{ type: 'unshielded', outputs: [{ type: unshieldedToken().raw, receiverAddress, amount }] }],
-    { shieldedSecretKeys: ctx.shieldedSecretKeys, dustSecretKey: ctx.dustSecretKey },
     { ttl: new Date(Date.now() + TX_TTL_MS) },
   );
   const signed = await ctx.wallet.signRecipe(recipe, signerFor(ctx));

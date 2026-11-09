@@ -5,7 +5,7 @@ import { Bech32Error, decodeBech32m, unshieldedAddressBytes } from './bech32.js'
 // to check this decoder against the authoritative wallet-sdk one. It derives the keys itself
 // rather than through `createWallet`, which contacts the node (its ledger-generation check) and
 // the indexer (wallet sync) — neither has any bearing on how an address is spelled.
-import { HDWallet, Roles, createKeystore } from '@midnight-ntwrk/wallet-sdk';
+import { HDWallet, Roles, createKeystore } from '@midnightntwrk/wallet-sdk';
 import { GENESIS_SEED, userAddressBytes } from './node/index.js';
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString('hex');

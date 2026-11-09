@@ -38,17 +38,18 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const TARGETS = ['esm', 'cjs'].map((flavour) =>
-  join(
-    ROOT,
-    `node_modules/@midnight-ntwrk/compact-js/dist/${flavour}/effect/ContractExecutable.js`,
-  ),
-);
+// compact-js 3.0.0 (the GA, 2026-11) ships ESM only, and partitions in `internal/executable.js`
+// inside an Effect generator: `const partitioned = yield* tryBoundary(..., () =>
+// ledger.partitionTranscripts(...));`. Before 3.0.0 it was a plain call in ContractExecutable.js,
+// in an esm and a cjs build.
+const TARGETS = [
+  join(ROOT, 'node_modules/@midnight-ntwrk/compact-js/dist/esm/effect/internal/executable.js'),
+];
 const DEFAULT_FACTOR = 4;
 
 // `const partitioned = <call to partitionTranscripts(...)>;` in `partitionAllTranscripts` -- the
 // esm and cjs builds differ only in how the ledger import is spelled.
-const SITE = /^(\s*)const partitioned = (.*partitionTranscripts\)?\(.*\));$/m;
+const SITE = /^(\s*)const partitioned = (yield\* tryBoundary\(.*partitionTranscripts\(.*\)\));$/m;
 // This script's own previous output, so re-running re-applies rather than skips.
 const APPLIED_HELPERS =
   /^[^\n]*PATCHED by scripts\/patch-gas-factor\.mjs[^\n]*\n[^\n]*__gasFactor = [^\n]*\n[^\n]*__gasInflate = [^\n]*\n/m;

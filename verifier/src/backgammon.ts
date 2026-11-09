@@ -34,7 +34,6 @@ import {
   forfeitsTs,
   nativeBalanceOf,
 } from '@dust-dice/contract';
-import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 
 import { Checks, addressOf } from './checks.ts';
 import { NETWORK } from './config.ts';
@@ -231,7 +230,6 @@ const showPly = (ply: Rules.Ply): string =>
         .join(' ');
 
 export async function verifyBackgammon(address: string, verbose: boolean): Promise<number> {
-  setNetworkId(NETWORK.networkId);
   const c = new Checks(verbose);
   console.log(`Verifying Backgammon table ${address}\n`);
 

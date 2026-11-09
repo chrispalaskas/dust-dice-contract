@@ -15,9 +15,9 @@
  */
 
 import { withIndexerRetry } from '@dust-dice/api';
-import { CompiledContract } from '@midnight-ntwrk/midnight-js-protocol/compact-js';
-import { ContractState } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
-import { ContractCall, Transaction } from '@midnight-ntwrk/midnight-js-protocol/ledger';
+import { CompiledContract } from '@midnight-ntwrk/midnight-js-protocol/v9/compact-js';
+import { ContractState } from '@midnight-ntwrk/midnight-js-protocol/v9/compact-runtime';
+import { ContractCall, Transaction } from '@midnight-ntwrk/midnight-js-protocol/v9';
 import { indexerPublicDataProvider } from '@midnight-ntwrk/midnight-js-indexer-public-data-provider';
 import {
   Table,
@@ -116,13 +116,17 @@ export type LedgerAt = { txHash: string };
  */
 export async function readContractState(address: string, at?: LedgerAt): Promise<ContractState> {
   if (at === undefined) {
-    const pdp = indexerPublicDataProvider(NETWORK.indexer, NETWORK.indexerWS);
+    const pdp = indexerPublicDataProvider({
+      queryURL: NETWORK.indexer,
+      subscriptionURL: NETWORK.indexerWS,
+    });
     // The SDK's provider does not retry: a burst-throttled `403` from the public indexer
     // surfaces as `ServerError: Response not successful` and, untreated, kills the daemon tick
     // that asked. `contractStateHexAt` below goes through `gql`, which retries already.
-    const state = await withIndexerRetry(() => pdp.queryContractState(address));
-    if (!state) throw new Error(`no contract state at ${address}`);
-    return state;
+    const read = await withIndexerRetry(() => pdp.queryContractState(address));
+    if (!read) throw new Error(`no contract state at ${address}`);
+    // midnight-js 5.0.0 hands back the state SERIALIZED, tagged with the era that wrote it.
+    return read.contractState.deserialize({ v9: ContractState });
   }
   const hex = await contractStateHexAt(address, at.txHash);
   if (!hex) throw new Error(`no contract state at ${address} after tx ${at.txHash}`);
