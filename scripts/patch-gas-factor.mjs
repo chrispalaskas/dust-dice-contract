@@ -33,27 +33,31 @@
  * that no longer matches throws, which fails the install loudly rather than silently shipping an
  * unpatched SDK. Delete this script and its hook once the SDK budgets multi-call transactions.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, globSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-// compact-js 3.0.0 (the GA, 2026-11) ships ESM only, and partitions in `internal/executable.js`
-// inside an Effect generator: `const partitioned = yield* tryBoundary(..., () =>
-// ledger.partitionTranscripts(...));`. Before 3.0.0 it was a plain call in ContractExecutable.js,
-// in an esm and a cjs build.
+// TWO call sites since the GA (2026-11): compact-js 3.0.0 partitions in `internal/executable.js`
+// (ESM only), inside an Effect generator -- and midnight-js-protocol 5.0.0 partitions AGAIN, on its
+// own, for every call its contracts package builds (`resolvePartition` in compose-options). The
+// second one is the path every `createUnprovenCallTx*` takes, so patching the first alone left a
+// lone `join` on a GA devnet "ran out of gas budget" in its fallible segment (2026-11-09).
 const TARGETS = [
   join(ROOT, 'node_modules/@midnight-ntwrk/compact-js/dist/esm/effect/internal/executable.js'),
+  ...globSync(join(ROOT, 'node_modules/@midnight-ntwrk/midnight-js-protocol/dist/shared/compose-options-*.js')),
 ];
 const DEFAULT_FACTOR = 4;
 
 // `const partitioned = <call to partitionTranscripts(...)>;` in `partitionAllTranscripts` -- the
 // esm and cjs builds differ only in how the ledger import is spelled.
-const SITE = /^(\s*)const partitioned = (yield\* tryBoundary\(.*partitionTranscripts\(.*\)\));$/m;
+// `const partitioned = yield* tryBoundary(..., () => ledger.partitionTranscripts(...));` in
+// compact-js; `partitioned = ledger.partitionTranscripts([...], parameters);` in midnight-js-protocol.
+const SITE = /^(\s*)((?:const )?partitioned) = (.*partitionTranscripts\(.*\));$/m;
 // This script's own previous output, so re-running re-applies rather than skips.
 const APPLIED_HELPERS =
   /^[^\n]*PATCHED by scripts\/patch-gas-factor\.mjs[^\n]*\n[^\n]*__gasFactor = [^\n]*\n[^\n]*__gasInflate = [^\n]*\n/m;
-const APPLIED_SITE = /^(\s*)const partitioned = \((.*)\)\.map\(\(\[g, f\][^\n]*\);$/m;
+const APPLIED_SITE = /^(\s*)((?:const )?partitioned) = \((.*)\)\.map\(\(\[g, f\][^\n]*\);$/m;
 
 const helpers = (indent) =>
   [
@@ -67,15 +71,15 @@ for (const target of TARGETS) {
     throw new Error(`gas factor: ${target} not found -- is compact-js installed?`);
   const original = readFileSync(target, 'utf8')
     .replace(APPLIED_HELPERS, '')
-    .replace(APPLIED_SITE, (_line, indent, call) => `${indent}const partitioned = ${call};`);
+    .replace(APPLIED_SITE, (_line, indent, lhs, call) => `${indent}${lhs} = ${call};`);
   const match = SITE.exec(original);
   if (match === null) throw new Error(`gas factor: no partitionTranscripts call site in ${target}`);
-  const [line, indent, call] = match;
+  const [line, indent, lhs, call] = match;
   writeFileSync(
     target,
     original.replace(
       line,
-      `${helpers(indent)}\n${indent}const partitioned = (${call}).map(([g, f]) => [g, __gasInflate(f)]);`,
+      `${helpers(indent)}\n${indent}${lhs} = (${call}).map(([g, f]) => [g, __gasInflate(f)]);`,
     ),
   );
   console.log(`gas factor: patched ${target} (fallible budget x${DEFAULT_FACTOR} by default)`);
