@@ -134,6 +134,11 @@ export function createProviders<CK extends string, PS = unknown>(
           ttl: ttl ?? new Date(Date.now() + TX_TTL_MS),
         });
         return finalized.serialize();
+      } catch (err) {
+        // midnight-js 5.0.0 redacts this failure before the caller sees it ("read the provider's
+        // own logs"): these ARE the provider's own logs.
+        console.error(`[providers] balanceTx failed: ${describeWithCauses(err)}`);
+        throw err;
       } finally {
         if (phases) phases.balanceMs += performance.now() - t0;
       }
@@ -145,6 +150,9 @@ export function createProviders<CK extends string, PS = unknown>(
     try {
       const raw = Transaction.deserialize('signature', 'proof', 'binding', tx.serialize());
       return await ctx.wallet.submitTransaction(await adoptFinalized(ctx, raw));
+    } catch (err) {
+      console.error(`[providers] submitTx failed: ${describeWithCauses(err)}`);
+      throw err;
     } finally {
       if (phases) phases.submitMs += performance.now() - t0;
     }
@@ -181,4 +189,15 @@ export function createProviders<CK extends string, PS = unknown>(
     config: { networkId: ctx.network.networkId, ttlSeconds: Math.floor(TX_TTL_MS / 1000) },
     walletContext: ctx,
   };
+}
+
+/** An error's message followed by its `cause` chain. */
+export function describeWithCauses(err: unknown): string {
+  const parts: string[] = [];
+  let e: unknown = err;
+  for (let i = 0; i < 6 && e !== undefined && e !== null; i++) {
+    parts.push(e instanceof Error ? e.message : String(e));
+    e = e instanceof Error ? (e as { cause?: unknown }).cause : undefined;
+  }
+  return parts.join(' <- ');
 }
