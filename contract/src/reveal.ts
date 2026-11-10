@@ -20,6 +20,7 @@
 
 import type { JubjubPoint } from '@midnight-ntwrk/compact-runtime';
 import { firstRollTs, rerollUnderMaskTs } from './policy-mirror.ts';
+import { pureCircuits } from './managed/table/contract/index.js';
 import {
   answered,
   askedIndex,
@@ -98,4 +99,26 @@ export function revealFor(inputs: RevealInputs): Reveal | null {
       ? firstRollTs(tableId, digest, turn.mixed, round)
       : rerollUnderMaskTs(tableId, digest, turn.mixed, round, index, priorHold, previous);
   return { index, priorHold, rho, gamma, dice };
+}
+
+/**
+ * The seat's entropy secret as its final score revealed it, or undefined while its cell still
+ * holds `noSecret()` (table.compact: every seat's cell is written at `start`, so a reveal
+ * overwrites rather than grows the map). Both verifiers read the map through this.
+ */
+export function revealedSeatSecret(
+  led: {
+    readonly seatSecretRevealed: {
+      member(key: bigint): boolean;
+      lookup(key: bigint): Uint8Array;
+    };
+  },
+  seat: number,
+): Uint8Array | undefined {
+  const k = BigInt(seat);
+  if (!led.seatSecretRevealed.member(k)) return undefined;
+  const v = led.seatSecretRevealed.lookup(k);
+  const none = pureCircuits.noSecret();
+  if (v.length === none.length && v.every((b, i) => b === none[i])) return undefined;
+  return v;
 }

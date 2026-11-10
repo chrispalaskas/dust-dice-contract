@@ -723,6 +723,12 @@ export ledger revealedVrfSecret: Field;
  * remaining dice. A seat that is eliminated or aborted before its final score never reveals,
  * and its rolls stay verifiable only by the proofs that landed while it was live — the
  * verifier says so rather than pretending otherwise.
+ *
+ * PRE-POPULATED with `noSecret()` for every seat by `start`, so the final score OVERWRITES a
+ * cell instead of growing the map. Ledger 9.1 holds a transcript's declared gas to the state it
+ * executes against; a final score built while this map was empty and landing after another
+ * seat's had filled its cell failed `ran out of gas budget` (dust-dice bugs-found #37, devnet
+ * 2026-11-10). A reader takes `noSecret()` as "not revealed" (`revealedSeatSecret` in reveal.ts).
  */
 export ledger seatSecretRevealed: Map<Uint<8>, Bytes<32>>;
 
@@ -937,6 +943,15 @@ pure circuit noAnswer(): VrfAnswer {
   return VrfAnswer { round: noAnswerRound(),
                      blinded: default<JubjubPoint>,
                      response: default<JubjubPoint>, };
+}
+
+/**
+ * The `seatSecretRevealed` cell of a seat that has not revealed. A tag, not zeros: a seat secret
+ * is 32 random bytes, and no honest or dishonest choice of one is this string. Exported so the
+ * verifiers compare against the same bytes the chain holds.
+ */
+export pure circuit noSecret(): Bytes<32> {
+  return pad(32, "dust-dice:v1:no-secret");
 }
 
 /**
@@ -2892,6 +2907,9 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
         seatCard.insert(i as Uint<8>, emptyScorecard());
         seatReceipt.insert(i as Uint<8>, default<Bytes<32>>);
         seatTurn.insert(i as Uint<8>, idleTurn());
+        // Not revealed yet. A cell to overwrite, so the final score's write costs the same
+        // whatever the other seats have revealed by then (see `seatSecretRevealed`).
+        seatSecretRevealed.insert(i as Uint<8>, noSecret());
         // The seat's three answer cells, so every `vrfAnswer.lookup` a move makes is total.
         // Written here and not at the join: the seat index is the start's to give.
         vrfAnswer.insert(answerKey(i as Uint<8>, 0), noAnswer());

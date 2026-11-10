@@ -72,27 +72,27 @@ import {
   type Scorecard,
 } from '@dust-dice/api';
 import {
+  answerKey,
+  askedIndex,
+  blindQuery,
+  deriveBlinding,
   eliminationRefundTs,
   emptyRoundResult,
   firstRollTs,
   forfeitsTs,
   genesisDigestTs,
-  startDigestTs,
   mixEntropyTs,
-  answerKey,
-  askedIndex,
-  blindQuery,
-  deriveBlinding,
   packHoldMask,
   rerollUnderMaskTs,
+  revealedSeatSecret,
   rollDigestFor,
   roundDigestTs,
+  type RoundResultTs,
   samePoint,
+  startDigestTs,
   tableStartOrder,
   vrfPublicKeyOf,
-  type RoundResultTs,
 } from '@dust-dice/contract';
-
 
 import { Checks, addressOf } from './checks.ts';
 import { verifyBackgammon } from './backgammon.ts';
@@ -339,9 +339,7 @@ async function verify(address: string, verbose: boolean): Promise<number> {
     rolls: 0,
     eliminated: false,
     finishedAtRound: Number.POSITIVE_INFINITY,
-    secret: final.seatSecretRevealed.member(BigInt(s))
-      ? final.seatSecretRevealed.lookup(BigInt(s))
-      : undefined,
+    secret: revealedSeatSecret(final, s),
   }));
   const unreplayable = seats.map((r, i) => (r.secret === undefined ? i : -1)).filter((i) => i >= 0);
   if (unreplayable.length > 0) {
