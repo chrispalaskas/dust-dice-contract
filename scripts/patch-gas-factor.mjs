@@ -45,7 +45,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 // lone `join` on a GA devnet "ran out of gas budget" in its fallible segment (2026-11-09).
 const TARGETS = [
   join(ROOT, 'node_modules/@midnight-ntwrk/compact-js/dist/esm/effect/internal/executable.js'),
-  ...globSync(join(ROOT, 'node_modules/@midnight-ntwrk/midnight-js-protocol/dist/shared/compose-options-*.js')),
+  ...globSync(
+    join(
+      ROOT,
+      'node_modules/@midnight-ntwrk/midnight-js-protocol/dist/shared/compose-options-*.js',
+    ),
+  ),
 ];
 // TIME ONLY since ledger 9.1.0.1 (node 2.1.101, mainnet). The node refuses a fallible transcript
 // whose declared BYTES exceed what it writes or deletes -- "ran out of gas budget" on a lone `join`
@@ -57,12 +62,15 @@ const TARGETS = [
 // on time is still needed: a merged Yacht turn's three resolves ran out of budget at x1 while the
 // player's parts passed (midnight-ledger #745, open). MIDNIGHT_GAS_FACTOR sets it per process.
 //
-// WHAT THIS CANNOT FIX: two seats' fast turns settling in one block. The second one's resolves
-// were built on the state before the first landed; the first's `vrfAnswer` inserts change the
-// map, the second's inserts then write more bytes than declared, and the node fails its fallible
-// segments (both Yacht games on 2026-11-09, segments 1-3 "ran out of gas budget"). The fix is in
-// the operator: one fast settlement in flight per TABLE, and the resolves rebuilt on the live
-// state right before the merge (they are deterministic in B; only their gas changes).
+// THE BYTES RULE, MEASURED 2026-11-10 (ledger 9.1.0.1, three joins, docs/bugs-found.md #37): the
+// budget a fallible segment runs under is computed from its DECLARATION, with declared deletes
+// refunded. Declaring MORE writes than happen only buys headroom (+200 bytes: SucceedEntirely);
+// declaring more deletes than happen shrinks the budget below the real cost (+64 bytes: "ran out
+// of gas budget"); declaring NO deletes forgoes the refund and always lands (0.78 DUST instead of
+// 0.47 for a join). A part is built on the state its turn opened on and executes after whatever
+// landed meanwhile -- another seat's cells in the same map change the bytes a write re-declares
+// -- so the defaults here are: bytesWritten + 512 (the largest drift seen was ~400, a seat's
+// three answer cells filling in round 0) and bytesDeleted x0. Both are environment knobs.
 const DEFAULT_FACTOR = 4;
 
 // `const partitioned = <call to partitionTranscripts(...)>;` in `partitionAllTranscripts` -- the
@@ -72,15 +80,18 @@ const DEFAULT_FACTOR = 4;
 const SITE = /^(\s*)((?:const )?partitioned) = (.*partitionTranscripts\(.*\));$/m;
 // This script's own previous output, so re-running re-applies rather than skips.
 const APPLIED_HELPERS =
-  /^[^\n]*PATCHED by scripts\/patch-gas-factor\.mjs[^\n]*\n[^\n]*__gasFactor = [^\n]*\n(?:[^\n]*__gasBytesPad = [^\n]*\n)?[^\n]*__gasInflate = [^\n]*\n/m;
+  /^[^\n]*PATCHED by scripts\/patch-gas-factor\.mjs[^\n]*\n(?:[^\n]*__gas[A-Za-z]+ = [^\n]*\n)+/m;
 const APPLIED_SITE = /^(\s*)((?:const )?partitioned) = \((.*)\)\.map\(\(\[g, f\][^\n]*\);$/m;
 
 const helpers = (indent) =>
   [
     `${indent}// PATCHED by scripts/patch-gas-factor.mjs -- see docs/bugs-found.md #21 and #36.`,
     `${indent}const __gasFactor = (() => { try { return BigInt(process.env.MIDNIGHT_GAS_FACTOR ?? ${DEFAULT_FACTOR}); } catch { return ${DEFAULT_FACTOR}n; } })();`,
-    `${indent}const __gasBytesPad = (() => { try { return BigInt(process.env.MIDNIGHT_GAS_BYTES_PAD ?? 0); } catch { return 0n; } })();`,
-    `${indent}const __gasInflate = (t) => t === undefined ? t : ({ ...t, gas: { readTime: t.gas.readTime * __gasFactor, computeTime: t.gas.computeTime * __gasFactor, bytesWritten: t.gas.bytesWritten + __gasBytesPad, bytesDeleted: t.gas.bytesDeleted + __gasBytesPad } });`,
+    `${indent}const __gasEnv = (name, dflt) => { try { return BigInt(process.env[name] ?? dflt); } catch { return BigInt(dflt); } };`,
+    `${indent}const __gasWritePad = __gasEnv('MIDNIGHT_GAS_WRITE_PAD', 512);`,
+    `${indent}const __gasDeletePad = __gasEnv('MIDNIGHT_GAS_DELETE_PAD', 0);`,
+    `${indent}const __gasDeleteFactor = __gasEnv('MIDNIGHT_GAS_DELETE_FACTOR', 0);`,
+    `${indent}const __gasInflate = (t) => t === undefined ? t : ({ ...t, gas: { readTime: t.gas.readTime * __gasFactor, computeTime: t.gas.computeTime * __gasFactor, bytesWritten: t.gas.bytesWritten + __gasWritePad, bytesDeleted: t.gas.bytesDeleted * __gasDeleteFactor + __gasDeletePad } });`,
   ].join('\n');
 
 for (const target of TARGETS) {
