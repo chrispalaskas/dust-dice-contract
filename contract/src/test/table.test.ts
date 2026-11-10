@@ -2865,12 +2865,13 @@ describe('token custody, as far as the simulator can see it', () => {
 });
 
 // =========================================================================================
-describe('practice tables (section 10): the house never wins or loses, the fee is kept', () => {
+describe('practice tables (section 10): the house never wins or loses, the fee is kept once playing', () => {
   // =======================================================================================
   //
   // THE INVARIANT, over a table's whole life and every path money leaves by: the house gets back
   // exactly `tier` per stake recorded at its address, the rake address takes every other stake
-  // whole (no 1% split), nobody else is paid anything, and the contract ends holding nothing.
+  // whole (no 1% split), nobody else is paid anything -- except a stake refunded before the start,
+  // which goes back to its own address -- and the contract ends holding nothing.
   // Each test keeps a BOOK of every send the table made -- settle, redeem, the start, the
   // aborts, the leaves -- and checks it against that at the end. The driver checks the custody
   // invariant after every move, as it does at an ordinary table.
@@ -2901,14 +2902,18 @@ describe('practice tables (section 10): the house never wins or loses, the fee i
     book: Book,
     houseStakes: number,
     otherStakes: number,
+    refundedBeforeStart: readonly { bytes: Uint8Array }[] = [],
   ): void {
     const h = hexOf(g.config.house!);
     const r = hexOf(g.config.rakeAddress);
     const t = g.config.tier;
+    const back = new Set(refundedBeforeStart.map(hexOf));
     assert.equal(book.get(h) ?? 0n, t * BigInt(houseStakes), 'the house gets exactly its stakes');
     assert.equal(book.get(r) ?? 0n, t * BigInt(otherStakes), 'the rake takes every other stake');
+    for (const a of back) assert.equal(book.get(a) ?? 0n, t, 'a stake refunded before the start');
     for (const [addr, v] of book) {
-      if (addr !== h && addr !== r) assert.fail(`${addr.slice(0, 8)}… was paid ${v}`);
+      if (addr !== h && addr !== r && !back.has(addr))
+        assert.fail(`${addr.slice(0, 8)}… was paid ${v}`);
     }
     g.assertFullyDrained();
   }
@@ -3070,7 +3075,7 @@ describe('practice tables (section 10): the house never wins or loses, the fee i
     assertPracticeBook(g, book, 1, 1);
   });
 
-  it('a table that never fills: the house’s slot comes back, everyone else’s goes to the rake', async () => {
+  it('a table that never fills: every slot comes back to its own address -- no game, no fee', async () => {
     const players = makePlayers(3);
     const g = await GameDriver.open({ seats: 3, tier, house: players[1]!.addr });
     const book: Book = new Map();
@@ -3090,37 +3095,37 @@ describe('practice tables (section 10): the house never wins or loses, the fee i
         NO_WINNER,
         0,
         0n,
-        tier,
+        0n,
         tier,
         false,
       ),
-      'the certificate counts the slot that went to the rake',
+      'the certificate counts nothing for the rake',
     );
-    assertPracticeBook(g, book, 1, 1);
+    assertPracticeBook(g, book, 1, 0, [players[0]!.addr]);
   });
 
-  it('leaving a filling table: the person forfeits the fee, the house takes its stake back', async () => {
+  it('leaving a filling table: the person and the house both take their stakes back', async () => {
     const g = await GameDriver.open({ seats: 2, tier, house: makePlayers(2)[0]!.addr });
     const book: Book = new Map();
     await g.join(0, { start: false });
     await g.join(1, { start: false });
     g.sim.asPlayer(g.players[1]!.sk);
-    assert.equal(await g.sim.resign(1, 0n, 0n, g.tick()), 0n, 'the person gets nothing back');
+    assert.equal(await g.sim.resign(1, 0n, 0n, g.tick()), tier, 'the person gets its stake back');
     take(g, book);
-    assert.equal(book.get(hexOf(g.config.rakeAddress)), tier, 'its stake went to the rake');
+    assert.equal(book.get(hexOf(g.players[1]!.addr)), tier, 'to its own address');
     g.sim.asPlayer(g.players[0]!.sk);
     assert.equal(await g.sim.resign(0, 0n, 0n, g.tick()), tier);
     take(g, book);
     assert.deepEqual(g.heldSlots(), [], 'empty again, still filling');
     assert.equal(g.ledger().phase, PHASE.filling);
-    assertPracticeBook(g, book, 1, 1);
+    assertPracticeBook(g, book, 1, 0, [g.players[1]!.addr]);
   });
 
-  it("the start's refunds: a late person's stake goes to the rake, a late house's back to it", async () => {
+  it("the start's refunds: a late joiner's stake goes back to it, person or house", async () => {
     // Three joins land before the start of a two-seat table; the latest (`c`) is refunded by it.
     const [a, b, c] = makePlayers(3);
     for (const house of [a!, c!]) {
-      // a: the house sits in seat 0 and the late PERSON's refund goes to the rake.
+      // a: the house sits in seat 0 and the late PERSON is refunded to its own address.
       // c: the house is the late joiner -- refunded, it never sits at its own table, so the
       //    whole pot goes to the rake and nothing of it to the winner.
       const g = await GameDriver.open({ seats: 2, tier, house: house.addr });
@@ -3140,7 +3145,8 @@ describe('practice tables (section 10): the house never wins or loses, the fee i
       g.sim.asPlayer(b!.sk);
       assert.equal(await g.sim.resign(1, 0n, 0n, g.tick()), 0n);
       assert.equal(await settle(g, book), 0);
-      assertPracticeBook(g, book, 1, 2);
+      if (house === a) assertPracticeBook(g, book, 1, 1, [c!.addr]);
+      else assertPracticeBook(g, book, 1, 2);
     }
   });
 
@@ -3182,5 +3188,98 @@ describe('practice tables (section 10): the house never wins or loses, the fee i
     assert.equal(book.get(hexOf(g.players[0]!.addr)), tier - q, 'the resigner');
     assert.equal(book.size, 3);
     g.assertFullyDrained();
+  });
+});
+
+describe('free tables (section 11): tier 0 moves no NIGHT at all', () => {
+  // Every circuit's effects are checked, not only the book: a free table must never ask the
+  // transaction for an unshielded input, authorise an output or claim a spend -- the join's
+  // receive and every send are skipped, not made with a zero amount.
+  function assertNoNight(g: GameDriver, what: string): void {
+    const e = g.sim.lastEffects as {
+      unshieldedInputs: Map<unknown, bigint>;
+      unshieldedOutputs: Map<unknown, bigint>;
+      claimedUnshieldedSpends: Map<unknown, bigint>;
+    };
+    assert.equal(e.unshieldedInputs.size, 0, `${what}: no unshielded input`);
+    assert.equal(e.unshieldedOutputs.size, 0, `${what}: no unshielded output`);
+    assert.equal(e.claimedUnshieldedSpends.size, 0, `${what}: no send`);
+  }
+
+  it('accepts tier 0 and still refuses 1..99', async () => {
+    const base = tableConfig({ seats: 2 });
+    const free = await TableSimulator.create({ ...base, tier: 0n });
+    assert.equal(free.getLedger().tier, 0n);
+    await assert.rejects(() => TableSimulator.create({ ...base, tier: 1n }), /at least 100/);
+    // The check below is not vacuous: a staked join does ask for its stake.
+    const staked = await GameDriver.open({ seats: 2 });
+    await staked.join(0);
+    assert.equal(staked.sim.lastEffects.unshieldedInputs.size, 1);
+  });
+
+  it('a whole game: the joins take nothing, settle pays nothing, the result is still decided', async () => {
+    const g = await GameDriver.open({ seats: 2, tier: 0n }, { strategy: 'bestScore' });
+    await g.join(0);
+    assertNoNight(g, 'join');
+    await g.join(1, { start: false });
+    assertNoNight(g, 'join');
+    await g.start();
+    assertNoNight(g, 'start');
+    assert.equal(g.ledger().pot, 0n);
+    await g.playToEnd();
+    const [q, r] = g.rakeSplit();
+    assert.deepEqual([q, r], [0n, 0n]);
+    g.sim.asOperator();
+    const winner = Number(await g.sim.settle(g.config.vrfSecret, q, r, g.tick()));
+    assertNoNight(g, 'settle');
+    assert.equal(winner, g.expectedWinner());
+    assert.equal(g.ledger().phase, PHASE.settled);
+    await assert.rejects(() => g.sim.redeem(0), /nothing to redeem/);
+    g.assertFullyDrained();
+  });
+
+  it('a leave, the start’s refund and the never-filled refund move nothing', async () => {
+    const [a, b, c] = makePlayers(3);
+    const g = await GameDriver.open({ seats: 2, tier: 0n });
+    for (const [p, slot] of [
+      [a!, 0],
+      [b!, 1],
+      [c!, 2],
+    ] as const) {
+      g.sim.asPlayer(p.sk);
+      await g.sim.join(p.addr, g.tick(), g.clock, slot);
+      assertNoNight(g, 'join');
+    }
+    g.sim.asPlayer(c!.sk);
+    assert.equal(await g.sim.resign(2, 0n, 0n, g.tick()), 0n);
+    assertNoNight(g, 'leave');
+    g.sim.asPlayer(c!.sk);
+    await g.sim.join(c!.addr, g.tick(), g.clock, 2);
+    await g.start();
+    assertNoNight(g, 'the start, refunding the third joiner');
+    assert.equal(g.ledger().seatCount, 2n);
+
+    const lone = await GameDriver.open({ seats: 3, tier: 0n });
+    await lone.join(0);
+    const [q, rem] = lone.abortRake();
+    assert.equal(await lone.sim.abortTable(q, rem, Number(lone.ledger().roundDeadline) + 1), 0n);
+    assertNoNight(lone, 'the never-filled refund');
+    assert.equal(lone.ledger().phase, PHASE.aborted);
+  });
+
+  it('timeouts and the everyone-out waiver move nothing, at an ordinary and a practice table', async () => {
+    for (const house of [undefined, makePlayers(2)[1]!.addr]) {
+      const g = await seated({ seats: 2, tier: 0n, ...(house ? { house } : {}) });
+      for (let r = 0; r < 2; r++) await g.playRound(r);
+      assert.equal(await g.eliminate(0, 2), 0n);
+      assertNoNight(g, 'eliminate');
+      assert.equal(await g.eliminate(1, 2), 0n);
+      assert.equal(g.ledger().phase, PHASE.abandoned);
+      const [q, rem] = g.abortRake();
+      assert.equal(await g.sim.abortTable(q, rem, g.tick()), 0n);
+      assertNoNight(g, 'abortTable');
+      await assert.rejects(() => g.sim.redeem(1), /nothing to redeem/);
+      g.assertFullyDrained();
+    }
   });
 });

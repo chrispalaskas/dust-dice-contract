@@ -119,23 +119,34 @@
 //
 // A table sealed with a non-zero `house` is a practice table: the site's bot deploys it, sits in
 // one seat as `house`, and a person takes the other. The person's stake is the FEE for the DUST
-// the house spends running their game, so it is never returned, win or lose; and the bot must
-// never gain or lose NIGHT, or anyone could farm it. Over the table's whole life, on every path
-// money leaves:
+// the house spends running their game, so once the game has started it is never returned, win
+// or lose; and the bot must never gain or lose NIGHT, or anyone could farm it. For the two
+// seated stakes, on every path money leaves:
 //
 //     a stake whose payout address is `house`    ->  back to `house`, exactly `tier`
 //     any other stake                            ->  the rake address, whole (no 1% split)
 //
-// That is all `payeeOf` says, and every send of a stake goes through it: the leave, the start's
-// refunds, the abort's refunds -- and `settle`, which on a practice table pays no winner but
-// returns each seat's stake through `payeeOf` exactly as an abort would. So who won, who timed
-// out (the house included) and who resigned changes nothing about the money.
+// That is all `payeeOf` says, and every send of a SEATED stake goes through it: the opening
+// abort's refunds and `settle`, which on a practice table pays no winner but returns each
+// seat's stake through `payeeOf` exactly as an abort would. So who won, who timed out (the house
+// included) and who resigned changes nothing about the money.
+//
+// NO GAME, NO FEE. A stake still in a slot is not a fee yet: the leave, the start's refunds and
+// the never-filled refund send it back to its own address, house or not.
 //
 // The contract cannot tell the bot from a person, only `house` from other addresses, so two
 // edge cases read literally: a person who records `house` as their payout address is paid as the
 // house (their stake goes to the bot's address -- a gift, never a gain for them), and a practice
-// table the house never sat at sends every stake to the rake. `house` all zero is an ordinary
-// table and nothing above applies.
+// table that starts without the house sends both seated stakes to the rake. `house` all zero is
+// an ordinary table and nothing above applies.
+//
+// -------------------------------------------------------------------------------------------
+// 8. FREE TABLES: TIER 0 MOVES NO MONEY AT ALL
+// -------------------------------------------------------------------------------------------
+//
+// A table sealed with `tier` 0 is free play: the pot, every refund and both splits are zero, and
+// every send and the join's receive is skipped when its amount is zero, so a free table never
+// touches the ledger's NIGHT. Whether a zero-value send is legal is not relied on.
 
 pragma language_version >= 0.26;
 
@@ -168,7 +179,7 @@ pure circuit minMoveSecs(): Uint<64> {
   return 120;
 }
 
-/** Smallest stake: the 1% rake is never zero. */
+/** Smallest paid stake: the 1% rake is never zero. A free table stakes 0 (section 8). */
 pure circuit minTier(): Uint<64> {
   return 100;
 }
@@ -493,23 +504,22 @@ pure circuit payeeOf(addr: UserAddress, home: UserAddress, rake: UserAddress): U
   return forfeits(addr, home) ? rake : addr;
 }
 
-/** Refund every occupied slot, except the two seated ones when `keep`. Through `payeeOf`. */
-circuit refundSlots(
-          slots: Vector<8, SlotInfo>,
-          keepA: Uint<8>,
-          keepB: Uint<8>,
-          keep: Boolean,
-          home: UserAddress,
-          rake: UserAddress,
-          ): [] {
+/**
+ * Refund every occupied slot, except the two seated ones when `keep`, to the slot's own address:
+ * only ever before the game, so never a forfeit (section 7). Nothing at a free table.
+ */
+circuit refundSlots(slots: Vector<8, SlotInfo>, keepA: Uint<8>, keepB: Uint<8>, keep: Boolean): [] {
   for (const s of slots) {
-    if (s.occupied && !(keep && (s.slot == keepA || s.slot == keepB))) {
-      sendUnshielded(
-        nativeToken(),
-        tier as Uint<128>,
-        right<ContractAddress, UserAddress>(payeeOf(s.addr, home, rake))
-        );
+    if (tier != 0 && s.occupied && !(keep && (s.slot == keepA || s.slot == keepB))) {
+      sendUnshielded(nativeToken(), tier as Uint<128>, right<ContractAddress, UserAddress>(s.addr));
     }
+  }
+}
+
+/** Send `amount` to `to`, or nothing when it is zero (a free table, section 8). */
+circuit payOut(amount: Uint<64>, to: UserAddress): [] {
+  if (amount != 0) {
+    sendUnshielded(nativeToken(), amount as Uint<128>, right<ContractAddress, UserAddress>(to));
   }
 }
 
@@ -534,7 +544,9 @@ constructor(id: Bytes<32>,
             invite: Bytes<32>,
             houseAddr: UserAddress,
             ) {
-  assert(stake >= minTier(), "tier must be at least 100 so the 1% rake is non-zero");
+  assert(stake == 0 || stake >= minTier(),
+         "tier must be 0 (free play) or at least 100 so the 1% rake is non-zero"
+         );
   assert(stake <= maxTier(), "tier is above the maximum a table may stake");
   const floor = (timeSlackSecs() * timeoutSlackFactor()) as Uint<64>;
   assert(moveTimeout >= minMoveSecs(), "move timeout must be at least two minutes");
@@ -618,7 +630,9 @@ export circuit join(slot: Uint<8>, payoutTo: UserAddress, now: Uint<64>): Uint<8
          );
 
   joinSlots.insert(s, BgSlot { addr: who, keyCommit: commit, joinedAt: t });
-  receiveUnshielded(nativeToken(), tier as Uint<128>);
+  if (tier != 0) {
+    receiveUnshielded(nativeToken(), tier as Uint<128>);
+  }
 
   padTransaction();
   return s;
@@ -644,7 +658,7 @@ export circuit start(now: Uint<64>): [] {
   assert(p.count >= 2, "start: fewer than two players have joined");
   seatIdentity.insert(0, slotSeat(p.a));
   seatIdentity.insert(1, slotSeat(p.b));
-  refundSlots(slots, p.a, p.b, true, house, rakeAddress);
+  refundSlots(slots, p.a, p.b, true);
   pot = (tier * 2) as Uint<64>;
   seatCount = 2;
   phase = BgPhase.playing;
@@ -816,14 +830,9 @@ export circuit eliminate(seat: Uint<8>, voluntary: Boolean): Uint<8> {
          );
 
   if (filling) {
-    // Leaving empties the slot for someone else, and reads nothing another join writes (`house`
-    // and `rakeAddress` are sealed). At a practice table a person's stake is not returned even
-    // before the game: the fee is for the table, not for the game (section 7).
-    sendUnshielded(
-      nativeToken(),
-      tier as Uint<128>,
-      right<ContractAddress, UserAddress>(payeeOf(who.addr, house, rakeAddress))
-      );
+    // Leaving empties the slot for someone else, and reads nothing another join writes. The
+    // stake goes back to its own address at any table: no game, no fee (section 7).
+    payOut(tier, who.addr);
     joinSlots.insert(s, emptySlot());
   } else {
     winner = other;
@@ -862,16 +871,10 @@ export circuit settle(q: Uint<64>, r: Uint<64>): Uint<8> {
   const a0 = seatIdentity.lookup(0).addr;
   const a1 = seatIdentity.lookup(1).addr;
   // Ordinary: the winner `pot - q`, the rake `q`. Practice: seat 0's stake, then seat 1's.
-  sendUnshielded(
-    nativeToken(),
-    (practice ? tier : split[0]) as Uint<128>,
-    right<ContractAddress, UserAddress>(practice ? payeeOf(a0, home, rake) : (w == 0 ? a0 : a1))
-    );
-  sendUnshielded(
-    nativeToken(),
-    (practice ? tier : split[1]) as Uint<128>,
-    right<ContractAddress, UserAddress>(practice ? payeeOf(a1, home, rake) : rake)
-    );
+  payOut((practice ? tier : split[0]) as Uint<64>,
+         practice ? payeeOf(a0, home, rake) : (w == 0 ? a0 : a1)
+         );
+  payOut((practice ? tier : split[1]) as Uint<64>, practice ? payeeOf(a1, home, rake) : rake);
   const raked = (tier * (lost(true, a0, home) + lost(true, a1, home))) as Uint<64>;
 
   pot = 0;
@@ -903,9 +906,10 @@ export circuit settle(q: Uint<64>, r: Uint<64>): Uint<8> {
  *   * the opening, NEITHER seat has revealed its share, and a table timeout has passed on top of
  *     the deadline. One share in and the other missing is the missing seat's fault: `eliminate`.
  *
- * At a practice table "refunds" means `payeeOf`: the house's stake comes back and every other
- * goes to the rake, even when the stall was the operator's (section 7 -- the fee is never
- * returned). The certificate's `rake` records what the rake address took.
+ * At a practice table the opening's "refunds" mean `payeeOf`: the house's stake comes back and
+ * the other goes to the rake, even when the stall was the operator's (section 7 -- the fee is
+ * not returned once the game has started). A filling table's slots go back to their own
+ * addresses. The certificate's `rake` records what the rake address took.
  */
 export circuit abortTable(): Uint<64> {
   const filling = phase == BgPhase.filling;
@@ -923,44 +927,28 @@ export circuit abortTable(): Uint<64> {
          "abortTable: the table is not stalled past its deadline"
          );
 
-  // While filling, nothing counted the stakes (section 6): the slots are the account of them.
-  // After the start the seated players are still in their slots, so those are refunded as SEATS
-  // and the slots are not touched -- refunding both would pay them twice. Every refund goes
-  // through `payeeOf`: at a practice table only the house's comes back (section 7).
+  // While filling, nothing counted the stakes (section 6): the slots are the account of them,
+  // and each goes back to its own address. After the start the seated players are still in their
+  // slots, so those are refunded as SEATS and the slots are not touched -- refunding both would
+  // pay them twice. A seat's refund goes through `payeeOf`: at a practice table only the
+  // house's comes back (section 7).
   assertCustody();
   const home = house;
   const rake = rakeAddress;
   const a0 = seatIdentity.lookup(0).addr;
   const a1 = seatIdentity.lookup(1).addr;
   if (filling) {
-    refundSlots(slots, 0, 0, false, home, rake);
+    refundSlots(slots, 0, 0, false);
   } else {
-    sendUnshielded(
-      nativeToken(),
-      tier as Uint<128>,
-      right<ContractAddress, UserAddress>(payeeOf(a0, home, rake))
-      );
-    sendUnshielded(
-      nativeToken(),
-      tier as Uint<128>,
-      right<ContractAddress, UserAddress>(payeeOf(a1, home, rake))
-      );
+    payOut(tier, payeeOf(a0, home, rake));
+    payOut(tier, payeeOf(a1, home, rake));
   }
 
   const refunded = filling ? (tier * (p.count as Uint<64>)) as Uint<64> : pot;
   // The certificate's `rake`: what went to the rake address rather than back -- zero at an
-  // ordinary table, where every stake is refunded.
-  const lostSlots =
-          lost(slots[0].occupied, slots[0].addr, home) +
-          lost(slots[1].occupied, slots[1].addr, home) +
-          lost(slots[2].occupied, slots[2].addr, home) +
-          lost(slots[3].occupied, slots[3].addr, home) +
-          lost(slots[4].occupied, slots[4].addr, home) +
-          lost(slots[5].occupied, slots[5].addr, home) +
-          lost(slots[6].occupied, slots[6].addr, home) +
-          lost(slots[7].occupied, slots[7].addr, home);
+  // ordinary table and while filling, where every stake is refunded.
   const lostSeats = lost(true, a0, home) + lost(true, a1, home);
-  const raked = (tier * (filling ? lostSlots : lostSeats)) as Uint<64>;
+  const raked = (filling ? 0 : tier * lostSeats) as Uint<64>;
   pot = 0;
   finalDigest = finalDigestOf(tableId, BgPhase.aborted as Uint<8>, noWinner(), turn, 0, raked, board);
   phase = BgPhase.aborted;

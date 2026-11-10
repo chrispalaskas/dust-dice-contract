@@ -475,7 +475,13 @@ export async function verifyBackgammon(address: string, verbose: boolean): Promi
     c.ok('the pot was both stakes', pot === final.tier * 2n, `pot ${pot}`);
     c.ok('settle spent ZERO user inputs', sumNative(tx.unshieldedSpentOutputs) === 0n);
     c.ok('settle created exactly the pot', sumNative(tx.unshieldedCreatedOutputs) === pot);
-    if (practice) {
+    if (final.tier === 0n) {
+      // A free table (backgammon.compact section 8): no stake, so nothing to pay anyone.
+      c.ok(
+        'free table: the pot was 0 and settle created nothing',
+        pot === 0n && sumNative(tx.unshieldedCreatedOutputs) === 0n,
+      );
+    } else if (practice) {
       let lost = 0n;
       for (const s of [0n, 1n]) {
         if (forfeitsTs(final.seatIdentity.lookup(s).addr.bytes, house)) lost += 1n;

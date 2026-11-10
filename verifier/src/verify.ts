@@ -896,7 +896,8 @@ async function verify(address: string, verbose: boolean): Promise<number> {
           console.log(
             led.phase === Table.Phase.filling
               ? `  (a player left the filling table in block ${g.blockHeight}: its stake went ` +
-                  `straight back${practice ? ' -- to the rake unless it was the house' : ''} ` +
+                  'straight back to its own address -- at a practice table too, since no game ' +
+                  'means no fee -- ' +
                   'and its slot was freed)'
               : `  (an eliminate in block ${g.blockHeight} marked no new seat -- it landed on ` +
                   'chain without effect, or the replay had already accounted for it)',
@@ -1128,7 +1129,13 @@ async function verify(address: string, verbose: boolean): Promise<number> {
       created === potBefore,
       `created ${created}, pot ${potBefore}`,
     );
-    if (practice) {
+    if (final.tier === 0n) {
+      // A free table (table.compact section 11): no stake, so nothing to pay anyone.
+      c.ok(
+        'free table: the pot was 0 and settle created nothing',
+        potBefore === 0n && created === 0n,
+      );
+    } else if (practice) {
       // No winner is paid. Every house seat still in the game takes its `tier` back; the rest of
       // the pot -- every other stake, and the people's stakes eliminated seats left in it -- is
       // the rake's. (A house seat eliminated earlier holds its `tier` as a redeem, below.)

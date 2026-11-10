@@ -292,22 +292,25 @@
 // being among those seated rather than refunded in full.
 //
 // -------------------------------------------------------------------------------------------
-// 10. PRACTICE TABLES: THE HOUSE NEVER WINS OR LOSES, AND THE FEE IS NEVER RETURNED
+// 10. PRACTICE TABLES: THE HOUSE NEVER WINS OR LOSES, AND THE FEE IS NOT RETURNED ONCE PLAYING
 // -------------------------------------------------------------------------------------------
 //
 // A table sealed with a non-zero `house` is a practice table: the site's bot deploys it, sits in
 // a seat as `house`, and a person plays it. The person's stake is the FEE for the DUST the house
-// spends running their game -- never returned, win or lose -- and the bot must never gain or
-// lose NIGHT, or anyone could farm it. Over the table's whole life, on every path money leaves:
+// spends running their game -- never returned once the game has started, win or lose -- and the
+// bot must never gain or lose NIGHT, or anyone could farm it. From the start on, on every path
+// money leaves:
 //
-//     a seat or slot whose payout address is `house`  ->  back to `house`, exactly `tier`
-//     any other seat or slot                          ->  nothing; its stake goes to the rake
-//                                                         address, whole (no 1% split)
+//     a seat whose payout address is `house`  ->  back to `house`, exactly `tier`
+//     any other seat                          ->  nothing; its stake goes to the rake
+//                                                 address, whole (no 1% split)
 //
-// Every exit keeps that with one fact, `forfeits(addr, house)`, applied where money is split:
+// NO GAME, NO FEE. Before the start a stake is not a fee yet: the leave, the start's refunds and
+// the never-filled refund send every slot's stake back to its own address, house or not.
 //
-//   * A stake SENT straight back -- the leave, the start's and the never-filled refunds -- goes
-//     to `payeeOf(addr)`: the address itself, or the rake address for a forfeit.
+// From the start on, every exit keeps the rule with one fact, `forfeits(addr, house)`, applied
+// where money is split:
+//
 //   * `eliminate` moves `tier` out of the pot for the house and nothing for anyone else: the
 //     penalty schedule does not apply (its identity is still required, so the encoding stays
 //     canonical), so the house cannot lose part of its stake by timing out or resigning, and a
@@ -323,8 +326,18 @@
 // The contract cannot tell the bot from a person, only `house` from other addresses, so two
 // edge cases read literally: a person who records `house` as their payout address is paid as the
 // house (their stake goes to the bot's address -- a gift, never a gain for them), and a practice
-// table the house never sat at sends every stake to the rake. `house` all zero is an ordinary
-// table and nothing in this section applies.
+// table that starts without the house sends every stake to the rake. `house` all zero is an
+// ordinary table and nothing in this section applies.
+//
+// -------------------------------------------------------------------------------------------
+// 11. FREE TABLES: TIER 0 MOVES NO MONEY AT ALL
+// -------------------------------------------------------------------------------------------
+//
+// A table sealed with `tier` 0 is free play. Every amount is then zero -- the pot, every refund,
+// every penalty (the identity forces `q` and `rem` to 0), both rake splits -- and every send and
+// the join's receive is skipped when its amount is zero, so a free table never touches the
+// ledger's NIGHT at all. Whether a zero-value send is legal is not relied on. The custody
+// invariant holds trivially, and `redeem` refuses for want of anything to pay.
 //
 // -------------------------------------------------------------------------------------------
 // The randomness residual GREW with interactive holds, and the old wording no longer applies
@@ -1422,11 +1435,6 @@ pure circuit forfeits(addr: UserAddress, home: UserAddress): Boolean {
   return home != default<UserAddress> && addr != home;
 }
 
-/** Who is actually paid when the stake `addr` put in is sent back: it, or the rake address. */
-pure circuit payeeOf(addr: UserAddress, home: UserAddress, rake: UserAddress): UserAddress {
-  return forfeits(addr, home) ? rake : addr;
-}
-
 // ===========================================================================================
 // Slots (section 9)
 // ===========================================================================================
@@ -1583,9 +1591,11 @@ constructor(id: Bytes<32>,
             ) {
   assert(seats >= 2, "a table needs at least 2 seats");
   assert(seats <= maxSeats(), "a table holds at most 6 seats");
-  // Guarantees `q >= 1` in both rake splits (the pot's at `settle`, and the per-seat one at
-  // `abortTable`), so no payment path has to make a zero-value send conditional.
-  assert(stake >= minTier(), "tier must be at least 100 so the 1% rake is non-zero");
+  // Zero is a free table (section 11). Otherwise at least 100, so `q >= 1` in both rake splits
+  // (the pot's at `settle`, and the per-seat one at `abortTable`).
+  assert(stake == 0 || stake >= minTier(),
+         "tier must be 0 (free play) or at least 100 so the 1% rake is non-zero"
+         );
   // Keeps `tier * seatCount` and `tier * penaltyDenom()` inside `Uint<64>`, so no refund path
   // can be denied by a checked-cast overflow while `settle` still works. See `maxTier`.
   assert(stake <= maxTier(), "tier is above the maximum a table may stake");
@@ -1746,7 +1756,9 @@ export circuit join(slot: Uint<8>, payoutTo: UserAddress, now: Uint<64>): Uint<8
 
   seatIdentity.insert(s, SeatIdentity { addr: who, keyCommit: commit });
   slotJoinedAt.insert(s, t);
-  receiveUnshielded(nativeToken(), tier as Uint<128>);
+  if (tier != 0) {
+    receiveUnshielded(nativeToken(), tier as Uint<128>);
+  }
 
   // The two fill clocks, both blind writes. The early start runs from the latest join, and the
   // never-filled refund a table timeout after it -- so a table still attracting players is
@@ -2338,21 +2350,20 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
   // it cannot lose part of it by timing out or resigning -- and anyone else gets nothing back:
   // their stake stays in the pot, for the rake. `back` is what THIS seat gets, and what the
   // circuit returns; on an ordinary table it is exactly `refund`. While filling the schedule
-  // charges nothing, so a leaver's `refund` is the whole `tier` at any table.
+  // charges nothing and nothing is forfeit yet, so a leaver's `back` is the whole `tier` at any
+  // table.
   const home = house;
-  const lose = forfeits(id.addr, home);
+  const lose = !leaving && forfeits(id.addr, home);
   const back = (home != default<UserAddress> ? (lose ? 0 : tier) : refund) as Uint<64>;
 
   if (leaving) {
     // Leaving a filling table: the stake goes straight back and the slot is free again. Nothing
     // on chain counted it (section 9), so there is nothing else to undo -- and nothing here is
-    // read by another join, so a leave lands beside them (`house` and `rakeAddress` are sealed).
-    // A practice table's fee is for the table, not the game: a person who leaves forfeits it.
-    sendUnshielded(
-      nativeToken(),
-      refund as Uint<128>,
-      right<ContractAddress, UserAddress>(payeeOf(id.addr, home, rakeAddress))
-      );
+    // read by another join, so a leave lands beside them. A practice table's fee is charged
+    // only once the game starts (section 10), so a leaver is refunded there too.
+    if (refund != 0) {
+      sendUnshielded(nativeToken(), refund as Uint<128>, right<ContractAddress, UserAddress>(id.addr));
+    }
     seatIdentity.insert(s, freeSlot());
     slotJoinedAt.insert(s, 0);
   } else {
@@ -2484,8 +2495,8 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
  * the pot is split by whose stakes are in it: `tier` for every house seat still in the game goes
  * back to `house`, and the rest -- every other stake, including what eliminated people left in
  * it -- goes to the rake address. A house seat eliminated earlier already holds its `tier` as
- * `seatRedeemable`. Either send is skipped when it would be zero (bot against bot; or a house
- * already out); `q` and `r` are still required so the argument encoding is the same at every
+ * `seatRedeemable`. Either send is skipped when it would be zero (bot against bot; a house
+ * already out; or a free table, section 11); `q` and `r` are still required so the argument encoding is the same at every
  * table. The certificate records `paid` 0 -- no winner was paid -- and `rake` as what the rake
  * address took. The other seats' `seatIdentity` is read only at a practice table.
  */
@@ -2531,19 +2542,18 @@ export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
             houseInPlay(rows[5], home)))
           as Uint<64>;
   const forfeited = (pot - homeStakes) as Uint<64>;
-  if (!practice || homeStakes != 0) {
+  // Zero at a free table (section 11), and either may be zero at a practice one.
+  const toPlayer = (practice ? homeStakes : split[0]) as Uint<64>;
+  const toRake = (practice ? forfeited : split[1]) as Uint<64>;
+  if (toPlayer != 0) {
     sendUnshielded(
       nativeToken(),
-      (practice ? homeStakes : split[0]) as Uint<128>,
+      toPlayer as Uint<128>,
       right<ContractAddress, UserAddress>(practice ? home : seatIdentity.lookup(winner).addr)
       );
   }
-  if (!practice || forfeited != 0) {
-    sendUnshielded(
-      nativeToken(),
-      (practice ? forfeited : split[1]) as Uint<128>,
-      right<ContractAddress, UserAddress>(rakeAddress)
-      );
+  if (toRake != 0) {
+    sendUnshielded(nativeToken(), toRake as Uint<128>, right<ContractAddress, UserAddress>(rakeAddress));
   }
 
   pot = 0;
@@ -2715,10 +2725,10 @@ export circuit redeem(seat: Uint<8>): Uint<64> {
  *
  * A PRACTICE TABLE IS THE EXCEPTION TO ALL OF THE ABOVE (section 10), in every case including the
  * start: the house's stakes are kept for it whole -- `tier` each, no 1% -- and every other stake
- * goes to the rake address, even when the stall was the operator's. A stake still held in a slot
- * is sent through `payeeOf`; one in the game is left out of the share-out and sent here. The
- * certificate's `rake` is everything the rake address took, and `perSeat` what a house seat may
- * redeem.
+ * goes to the rake address, even when the stall was the operator's -- once the table has started.
+ * A stake still held in a slot was never a fee yet and goes back to its own address; one in the
+ * game is left out of the share-out and sent here. The certificate's `rake` is everything the
+ * rake address took, and `perSeat` what a house seat may redeem.
  *
  * `q` and `rem` are the PER-SEAT rake on `tier`, not on the pot: `q * 100 + rem == tier`,
  * `rem < 100`, so each seat gets `tier - q` and the rake gets `q * seatCount`. Dividing the pot
@@ -2799,18 +2809,17 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
 
   assertCustody();
 
-  // Section 10: at a practice table every stake that is not the house's is forfeit, to the rake.
-  // Weighed once per slot, and a slot is the seat of the same index once the table has started
-  // (`allSlots` reads `seatIdentity`), so one weighing serves the never-filled refund, the
-  // start's refunds and the share-out alike. All false at an ordinary table.
+  // Section 10: at a started practice table every stake that is not the house's is forfeit, to
+  // the rake. A slot is the seat of the same index once the table has started (`allSlots` reads
+  // `seatIdentity`). While filling nothing is forfeit: the never-filled refund and the start's
+  // refunds pay every slot back. All false at an ordinary table.
   const home = house;
-  const rakeTo = rakeAddress;
-  const lost0 = slots[0].held && forfeits(slots[0].id.addr, home);
-  const lost1 = slots[1].held && forfeits(slots[1].id.addr, home);
-  const lost2 = slots[2].held && forfeits(slots[2].id.addr, home);
-  const lost3 = slots[3].held && forfeits(slots[3].id.addr, home);
-  const lost4 = slots[4].held && forfeits(slots[4].id.addr, home);
-  const lost5 = slots[5].held && forfeits(slots[5].id.addr, home);
+  const lost0 = !filling && slots[0].held && forfeits(slots[0].id.addr, home);
+  const lost1 = !filling && slots[1].held && forfeits(slots[1].id.addr, home);
+  const lost2 = !filling && slots[2].held && forfeits(slots[2].id.addr, home);
+  const lost3 = !filling && slots[3].held && forfeits(slots[3].id.addr, home);
+  const lost4 = !filling && slots[4].held && forfeits(slots[4].id.addr, home);
+  const lost5 = !filling && slots[5].held && forfeits(slots[5].id.addr, home);
   const lostCount =
           ((lost0 ? 1 : 0) +
            (lost1 ? 1 : 0) +
@@ -2864,27 +2873,25 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
                   (e4 ? 1 : 0) +
                   (e5 ? 1 : 0))
                  as Uint<64>;
-  // Everything the rake address takes. The forfeits of a FILLING table leave through
-  // `refundSlot` below, so only a started one sends them here.
+  // Everything the rake address takes: zero while filling, and zero at a free table.
   const rakeTotal = (raking ? (rake * shares) : tier * lostCount) as Uint<64>;
 
-  if (raking || (lostCount != 0 && !filling)) {
+  if (rakeTotal != 0) {
     sendUnshielded(
       nativeToken(),
       rakeTotal as Uint<128>,
-      right<ContractAddress, UserAddress>(rakeTo)
+      right<ContractAddress, UserAddress>(rakeAddress)
       );
   }
 
   // Every held slot the table does not keep gets its stake straight back: all of them when it
-  // never filled, and at the start a key's second slot and any joiner beyond the seats. A
-  // forfeit stake goes to the rake instead (`payeeOf`, weighed above).
-  refundSlot(slots[0], ranked[0], n, fillingStalled, starting, lost0 ? rakeTo : slots[0].id.addr);
-  refundSlot(slots[1], ranked[1], n, fillingStalled, starting, lost1 ? rakeTo : slots[1].id.addr);
-  refundSlot(slots[2], ranked[2], n, fillingStalled, starting, lost2 ? rakeTo : slots[2].id.addr);
-  refundSlot(slots[3], ranked[3], n, fillingStalled, starting, lost3 ? rakeTo : slots[3].id.addr);
-  refundSlot(slots[4], ranked[4], n, fillingStalled, starting, lost4 ? rakeTo : slots[4].id.addr);
-  refundSlot(slots[5], ranked[5], n, fillingStalled, starting, lost5 ? rakeTo : slots[5].id.addr);
+  // never filled, and at the start a key's second slot and any joiner beyond the seats.
+  refundSlot(slots[0], ranked[0], n, fillingStalled, starting);
+  refundSlot(slots[1], ranked[1], n, fillingStalled, starting);
+  refundSlot(slots[2], ranked[2], n, fillingStalled, starting);
+  refundSlot(slots[3], ranked[3], n, fillingStalled, starting);
+  refundSlot(slots[4], ranked[4], n, fillingStalled, starting);
+  refundSlot(slots[5], ranked[5], n, fillingStalled, starting);
 
   if (starting) {
     // THE START (section 9): the first `n` joiners take seats 0..n-1 in join order, and the
@@ -2952,19 +2959,12 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
 }
 
 /**
- * Refund a held slot the table is not keeping (see `abortTable`), to `to`: the slot's own
- * address, or the rake address for a practice table's forfeit (section 10).
+ * Refund a held slot the table is not keeping (see `abortTable`) to the slot's own address. Only
+ * ever before the game, so never a practice table's forfeit (section 10). Nothing at a free table.
  */
-circuit refundSlot(
-          slot: SlotInfo,
-          r: Ranked,
-          n: Uint<8>,
-          stalled: Boolean,
-          starting: Boolean,
-          to: UserAddress,
-          ): [] {
-  if (slot.held && (stalled || (starting && !seated(r, n)))) {
-    sendUnshielded(nativeToken(), tier as Uint<128>, right<ContractAddress, UserAddress>(to));
+circuit refundSlot(slot: SlotInfo, r: Ranked, n: Uint<8>, stalled: Boolean, starting: Boolean): [] {
+  if (tier != 0 && slot.held && (stalled || (starting && !seated(r, n)))) {
+    sendUnshielded(nativeToken(), tier as Uint<128>, right<ContractAddress, UserAddress>(slot.id.addr));
   }
 }
 
