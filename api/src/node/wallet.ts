@@ -36,10 +36,12 @@ import {
   MidnightBech32m,
   UnshieldedAddress,
   WalletTransaction,
+  DefaultForkSchedule,
 } from '@midnightntwrk/wallet-sdk';
 import type { FacadeState, FinalizedTx, UnboundTx, WalletSeeds } from '@midnightntwrk/wallet-sdk';
 import { DustAddress } from '@midnightntwrk/wallet-sdk-address-format';
 
+import { dustTimelineStartProbe } from './dust-timeline.js';
 import { TX_TTL_MS, type NetworkConfig } from './network.js';
 
 export { unshieldedToken };
@@ -71,10 +73,7 @@ function deriveKeys(seed: string) {
 
 /** `FacadeState.isSynced` minus the shielded term — see the module header. */
 function isUsableSync(state: FacadeState): boolean {
-  return (
-    state.dust.progress.isStrictlyComplete() &&
-    state.unshielded.progress.isStrictlyComplete()
-  );
+  return state.dust.progress.isStrictlyComplete() && state.unshielded.progress.isStrictlyComplete();
 }
 
 /**
@@ -284,7 +283,10 @@ export async function createWallet(
   const shieldedSecretKeys = ledger.ZswapSecretKeys.fromSeed(seeds.shielded);
   const dustSecretKey = ledger.DustSecretKey.fromSeed(seeds.dust);
   // Midnight's unshielded (NIGHT) keys are Schnorr.
-  const unshieldedKeystore = createKeystore({ kind: 'schnorr', secret: seeds.unshielded }, networkId);
+  const unshieldedKeystore = createKeystore(
+    { kind: 'schnorr', secret: seeds.unshielded },
+    networkId,
+  );
 
   const configuration = {
     networkId,
@@ -299,8 +301,9 @@ export async function createWallet(
     costParameters: { additionalFeeOverhead: 300_000_000_000_000n, feeBlocksMargin: 5 },
     // A wallet made after the fork has no ledger-8 DUST to find, and on mainnet replaying the
     // ledger-8 DUST history would cost hours: the chain re-emitted every DUST record as ledger-9
-    // events when it crossed. No effect on a chain born on ledger 9 (the devnet).
-    skipLedgerV8DustHistory: true,
+    // events when it crossed. No effect on a chain born on ledger 9 (the devnet). Our search, not
+    // the SDK's `skipLedgerV8DustHistory` one, which times out against Blockfrost (dust-timeline.ts).
+    dustTimelineStartProbe: dustTimelineStartProbe(network.indexerWS, DefaultForkSchedule.v9),
   };
 
   // A snapshot is only restored into the wallet it came from, on the chain it came from.
@@ -329,7 +332,9 @@ export async function createWallet(
         ? UnshieldedWallet(config).restore(restore.unshielded)
         : UnshieldedWallet(config).startWithPublicKey(PublicKey.fromKeyStore(unshieldedKeystore)),
     dust: (config) =>
-      restore ? DustWallet(config).restore(restore.dust) : DustWallet(config).startWithSeed(seeds.dust),
+      restore
+        ? DustWallet(config).restore(restore.dust)
+        : DustWallet(config).startWithSeed(seeds.dust),
   });
 
   await wallet.start(seeds);
@@ -351,7 +356,10 @@ export async function createWallet(
  * handles: a transaction is stamped with the protocol version that built it, so a wallet on the
  * other side of a fork refuses it instead of misreading it.
  */
-export async function adoptUnbound(ctx: WalletContext, tx: { serialize(): Uint8Array }): Promise<UnboundTx> {
+export async function adoptUnbound(
+  ctx: WalletContext,
+  tx: { serialize(): Uint8Array },
+): Promise<UnboundTx> {
   const state = await Rx.firstValueFrom(ctx.wallet.state());
   return WalletTransaction.adopt('Unbound', tx as never, state.activeProtocolVersion);
 }
