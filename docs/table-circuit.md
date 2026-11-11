@@ -654,3 +654,43 @@ Not applied — reported for the owner of those documents.
   `contract/repro/README.md`, `docs/dice-circuit.md`, `docs/scoring-circuit.md` (markdown table
   alignment and one stray blank line). `docs/bugs-found.md` was reformatted, since this work
   appends to it.
+
+## 10. Per-move hashes on Poseidon (2026-11-11, contract 0.8.1)
+
+A Yacht move took 5.5-7.5 s on the proof server and the browser carried a 98.6 MB prover key
+to it on every move: `playerMove` was k=16. `zkir-v3 mock-compile -v` reports a circuit's rows
+in about a second, and removing one piece at a time showed where they went. The game logic was
+cheap (scoring ~650 rows, the dice ladder ~1,000, the two VRF `ecMul` ~950). Most of the rest
+was in-circuit SHA-256: ~2,000 rows per 64-byte block, plus the range checks that turn field
+elements into bytes for it. Those range checks also add 2^n lookup-table rows for each bit
+width n they use.
+
+Every hash a move runs is now `transientHash` (Poseidon) or goes straight into `hashToCurve`:
+`forcedEntropy`, `entropyKeyCommitment`, `mixEntropy`, `rollBytes`, `vrfRollDigest`,
+`vrfInputPoint`, and Backgammon's `bgForcedEntropy` and `bgRollBytes`. Shapes and domain tags
+are unchanged; only the primitive changed. The seed and invite commitments stay on
+`persistentHash` because no move circuit runs them.
+
+| circuit            | before (k, rows) | after (k, rows) | prover key       |
+| ------------------ | ---------------- | --------------- | ---------------- |
+| Yacht `playerMove` | 16, 39,196       | 14, 10,065      | 98.6 -> 16.8 MB  |
+| Yacht `join`       | 14, 8,296        | 13, 4,737       | 22.6 -> 11.3 MB  |
+| Yacht `eliminate`  | 14, 11,049       | 13, 7,490       | 24.7 -> 12.3 MB  |
+| BG `move`          | 15, 22,386       | 14, 9,933       | 45.2 -> 14.2 MB  |
+| BG `openingMove`   | 15, 22,413       | 14, 9,960       | 45.2 -> 14.2 MB  |
+| BG `reveal`        | 13, 8,061        | 10, 965         | 11.3 -> 0.9 MB   |
+
+Why it is sound:
+
+- The dice read bytes 0..19 of `transientHash(...) as Bytes<32>`, which is little-endian.
+  Those 160 low bits of a uniform field element are uniform to within 2^-94; only byte 31 is
+  capped, at 0x73. Measured on 100,000 dice: every face within 1% of 1/6.
+- The 2026-09 audit's argument for revealing thirteen `entropy_r` (outputs of a 256-bit secret
+  under a preimage-resistant hash) holds unchanged for Poseidon. Poseidon is the hash Midnight's
+  own commitments use, and this contract already used it for `rho` and the DLEQ challenge.
+- `transientHash` is not promised to stay the same across compiler versions. That is safe here
+  because every value it produces lives inside one deployed table, and the off-chain mirrors pin
+  the same `compact-runtime` as the circuits they mirror.
+- BG `reveal` at k=10 is below section 3's k >= 13. That rule was measured on the ledger-8 node.
+  On ledger 9, k=12 circuits (`resolveRoll`, BG `start`) land every time. k=10 is checked live
+  before release.

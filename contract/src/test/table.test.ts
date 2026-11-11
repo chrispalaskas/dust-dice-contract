@@ -1573,11 +1573,11 @@ describe('elimination', () => {
   });
 
   it('stops an eliminated seat playing, and stops it winning', async () => {
-    // Table 7 with seat 0 eliminated at round 10 was found by sweeping `replayGame` for a game
+    // Table 9 with seat 0 eliminated at round 10 was found by sweeping `replayGame` for a game
     // in which the ELIMINATED seat ends with the strictly highest total. Under the cursor model
     // it would have won; under simultaneous rounds elimination is permanent and economic, and it
     // has already been handed back `tier - penalty`, so paying it the pot would pay it twice.
-    const opts: TableOptions = { seats: 3, tableId: bytes32(7) };
+    const opts: TableOptions = { seats: 3, tableId: bytes32(9) };
     const plan: GamePlan = { strategy: 'bestScore', eliminations: [{ seat: 0, round: 10 }] };
     const preview = replayGame(tableConfig(opts), makePlayers(3), plan);
     assert.ok(preview.totals[0]! > preview.totals[1]!, 'this scenario was chosen for it');
@@ -2649,7 +2649,7 @@ describe('tie-break at table level', () => {
   // is the inputs that no longer reach its second leg.
 
   it('breaks a tie between two finishers by seat order', async () => {
-    const opts: TableOptions = { seats: 2, tableId: bytes32(106) };
+    const opts: TableOptions = { seats: 2, tableId: bytes32(147) };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(2), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');
@@ -2669,7 +2669,7 @@ describe('tie-break at table level', () => {
   });
 
   it('falls back to the lowest seat at a four-seat table', async () => {
-    const opts: TableOptions = { seats: 4, tableId: bytes32(8) };
+    const opts: TableOptions = { seats: 4, tableId: bytes32(163) };
     const plan: GamePlan = { strategy: 'firstLegal' };
     const preview = replayGame(tableConfig(opts), makePlayers(4), plan);
     assert.equal(preview.totals[0], preview.totals[1], 'this table id was chosen for its tie');

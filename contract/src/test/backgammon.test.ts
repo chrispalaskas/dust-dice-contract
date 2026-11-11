@@ -694,7 +694,10 @@ describe('moving', () => {
         const ply = Rules.legalPlies(mine, opp, [x, y]).find((p) => !real.has(JSON.stringify(p)));
         if (!ply || ply.length === 0) continue;
         tried += 1;
-        await rejects(sim.move(ply, T0 + 40), /not rolled|unused|do not have|holds|unplayed/);
+        await rejects(
+          sim.move(ply, T0 + 40),
+          /not rolled|unused|do not have|holds|unplayed|at most two dice/,
+        );
       }
     }
     assert.ok(tried > 0);

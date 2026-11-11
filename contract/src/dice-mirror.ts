@@ -15,10 +15,10 @@
  * src/test/dice.test.ts asserts the two agree on random inputs. Delegating would make the
  * cross-check vacuous.
  *
- * The one thing it does not reimplement is `persistentHash`. That is a Compact primitive
- * with a field-aligned binary encoding, so the mirror rebuilds the `RollContext` runtime
- * type from the runtime's own public type descriptors and calls the runtime's
- * `persistentHash`. Reimplementing the encoding would be reimplementing the platform, and
+ * The one thing it does not reimplement is the hash, `transientHash`. That is a Compact
+ * primitive with a field-aligned binary encoding, so the mirror rebuilds the `RollContext`
+ * runtime type from the runtime's own public type descriptors and calls the runtime's
+ * `transientHash`. Reimplementing the encoding would be reimplementing the platform, and
  * getting it subtly wrong is exactly the failure the cross-check is there to catch.
  *
  * Any edit to dice-core.compact must be made here too, and vice versa.
@@ -27,7 +27,8 @@
 import {
   CompactTypeBytes,
   CompactTypeUnsignedInteger,
-  persistentHash,
+  convertBigintToBytes,
+  transientHash,
   type CompactType,
 } from '@midnight-ntwrk/compact-runtime';
 
@@ -147,7 +148,7 @@ export function rollContext(
 
 /** Mirror of `rollBytes`: the 32 entropy bytes for one roll. */
 export function rollBytes(ctx: RollContextTs): Uint8Array {
-  return persistentHash(ROLL_CONTEXT_TYPE, ctx);
+  return convertBigintToBytes(32, transientHash(ROLL_CONTEXT_TYPE, ctx), 'rollBytes');
 }
 
 // ---------------------------------------------------------------------------------------

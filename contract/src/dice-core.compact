@@ -89,9 +89,12 @@ pure circuit rollContext(
                        stream: 0, };
 }
 
-/** The 32 entropy bytes for one roll. */
+/**
+ * The 32 entropy bytes for one roll: a Poseidon output's little-endian bytes. Only byte 31 is
+ * short of uniform (the field is ~2^255); the ladder reads bytes 0..19.
+ */
 pure circuit rollBytes(ctx: RollContext): Vector<32, Uint<8>> {
-  return persistentHash<RollContext>(ctx) as Vector<32, Uint<8>>;
+  return (transientHash<RollContext>(ctx) as Bytes<32>) as Vector<32, Uint<8>>;
 }
 
 // ---------------------------------------------------------------------------------------

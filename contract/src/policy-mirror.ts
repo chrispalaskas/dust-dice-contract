@@ -13,7 +13,7 @@
  *
  * Written INDEPENDENTLY of the compiled circuit rather than delegating to `pureCircuits`:
  * src/test/table.test.ts asserts the two agree over whole games, and delegating would make that
- * cross-check vacuous. The exceptions are the `persistentHash` primitive and its field-aligned
+ * cross-check vacuous. The exceptions are the hash primitives and their field-aligned
  * struct encoding, which come from the runtime -- reimplementing those would be reimplementing
  * the platform, and getting them subtly wrong is exactly the failure the cross-check exists to
  * catch.
@@ -49,7 +49,9 @@ import {
   CompactTypeBytes,
   CompactTypeUnsignedInteger,
   CompactTypeVector,
+  convertBigintToBytes,
   persistentHash,
+  transientHash,
   type CompactType,
 } from '@midnight-ntwrk/compact-runtime';
 import { deriveDiceTs, pad, rollContext } from './dice-mirror.ts';
@@ -106,6 +108,11 @@ const ENTROPY_CONTEXT_TYPE: CompactType<EntropyContextTs> = {
   }),
 };
 
+/** `transientHash(...) as Bytes<32>`, the circuit's form of the three per-move hashes. */
+function poseidonBytes<A>(type: CompactType<A>, value: A): Uint8Array {
+  return convertBigintToBytes(32, transientHash(type, value), 'policy-mirror');
+}
+
 /** Domain tags. Must equal the `pad(32, ...)` literals in policy-core.compact / table.compact. */
 export const TAG_ENTROPY = 'dust-dice:v1:entropy';
 export const TAG_ENTROPY_KEY = 'dust-dice:v1:entkey';
@@ -118,7 +125,7 @@ export function forcedEntropyTs(
   tableId: Uint8Array,
   round: number | bigint,
 ): Uint8Array {
-  return persistentHash(ENTROPY_CONTEXT_TYPE, {
+  return poseidonBytes(ENTROPY_CONTEXT_TYPE, {
     domain: pad(32, TAG_ENTROPY),
     sk,
     tableId,
@@ -134,7 +141,7 @@ export function forcedEntropyTs(
  * docs/client-rules.md.
  */
 export function entropyKeyCommitmentTs(tableId: Uint8Array, sk: Uint8Array): Uint8Array {
-  return persistentHash(VEC3_BYTES32, [pad(32, TAG_ENTROPY_KEY), tableId, sk]);
+  return poseidonBytes(VEC3_BYTES32, [pad(32, TAG_ENTROPY_KEY), tableId, sk]);
 }
 
 /**
@@ -164,7 +171,7 @@ export function inviteCommitmentTs(code: Uint8Array): Uint8Array {
  * section 2 of table.compact's header.
  */
 export function mixEntropyTs(entropy: Uint8Array, roundDigest: Uint8Array): Uint8Array {
-  return persistentHash(VEC3_BYTES32, [pad(32, TAG_MIX), entropy, roundDigest]);
+  return poseidonBytes(VEC3_BYTES32, [pad(32, TAG_MIX), entropy, roundDigest]);
 }
 
 // ---------------------------------------------------------------------------------------

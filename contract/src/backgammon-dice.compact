@@ -57,12 +57,12 @@ export struct BgEntropyContext {
 }
 
 export pure circuit bgForcedEntropy(sk: Bytes<32>, tableId: Bytes<32>, turn: Uint<16>): Bytes<32> {
-  return persistentHash<BgEntropyContext>(
+  return transientHash<BgEntropyContext>(
            BgEntropyContext { domain: pad(32, "dust-dice:bg:v3:entropy"),
                               sk: sk,
                               tableId: tableId,
                               turn: turn, }
-           );
+           ) as Bytes<32>;
 }
 
 /** A seat's share of the opening, revealed after the start. Index 0 -- no ply uses it. */
@@ -99,14 +99,14 @@ export pure circuit bgRollBytes(
                       turn: Uint<16>,
                       stream: Uint<8>,
                       ): Vector<32, Uint<8>> {
-  return persistentHash<BgRollContext>(
-           BgRollContext { domain: pad(32, "dust-dice:bg:v3:roll"),
-                           tableId: tableId,
-                           mine: mine,
-                           other: other,
-                           turn: turn,
-                           stream: stream, }
-           )
+  return (transientHash<BgRollContext>(
+            BgRollContext { domain: pad(32, "dust-dice:bg:v3:roll"),
+                            tableId: tableId,
+                            mine: mine,
+                            other: other,
+                            turn: turn,
+                            stream: stream, }
+            ) as Bytes<32>)
          as Vector<32, Uint<8>>;
 }
 

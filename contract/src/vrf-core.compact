@@ -19,6 +19,16 @@ pragma language_version >= 0.26;
 
 import CompactStandardLibrary;
 
+/** Everything one roll's VRF input point is hashed from. */
+export struct VrfInputContext {
+  domain: Bytes<32>,
+  tableId: Bytes<32>,
+  round: Uint<8>,
+  rollIndex: Uint<8>,
+  holdMask: Uint<8>,
+  sk: Bytes<32>,
+}
+
 /**
  * The VRF input point for one roll: `P = hashToCurve(tableId, round, rollIndex, holdMask, sk)`.
  *
@@ -27,12 +37,8 @@ import CompactStandardLibrary;
  * blinding would then protect the wire and nothing else. `holdMask` is the PREVIOUS roll's
  * holds, which is what stops a query for roll i+1 being formed before hold i is fixed.
  *
- * HASHED IN THE BYTES DOMAIN, deliberately. `tableId as Field` and `sk as Field` are traps: a
- * Bytes<32> is a 256-bit value and the Field modulus is ~2^255, so roughly half of all real
- * values are out of range and the cast fails AT RUNTIME with "exceeds maximum value of Field
- * type" — on half the tables, and only once one is played. Field to Bytes<32> is always
- * defined, so `meta` goes that way instead. The three counters pack into one Field injectively
- * because each is a Uint<8>.
+ * The struct goes to `hashToCurve` whole: no SHA-256 in front of it (the move circuit's cost) and
+ * no `Bytes<32>`-to-`Field` cast, which fails at runtime for about half of all 32-byte values.
  */
 export pure circuit vrfInputPoint(
   tableId: Bytes<32>,
@@ -41,13 +47,14 @@ export pure circuit vrfInputPoint(
   holdMask: Uint<8>,
   sk: Bytes<32>,
 ): JubjubPoint {
-  const meta = (round as Field) * 65536 + (rollIndex as Field) * 256 + (holdMask as Field);
-  return hashToCurve<Bytes<32>>(persistentHash<Vector<4, Bytes<32>>>([
-    pad(32, "dust-dice:v2:vrf-input"),
-    tableId,
-    meta as Bytes<32>,
-    sk,
-  ]));
+  return hashToCurve<VrfInputContext>(VrfInputContext {
+    domain: pad(32, "dust-dice:v2:vrf-input"),
+    tableId: tableId,
+    round: round,
+    rollIndex: rollIndex,
+    holdMask: holdMask,
+    sk: sk,
+  });
 }
 
 /** The Fiat-Shamir challenge over the whole DLEQ transcript. See the header. */
@@ -87,17 +94,25 @@ export pure circuit vrfDleqHolds(
   return first && second;
 }
 
+/** What `vrfRollDigest` hashes. */
+export struct VrfRollDigestInput {
+  domain: Bytes<32>,
+  x: Field,
+  y: Field,
+}
+
 /**
- * The 32 bytes a roll's dice are expanded from: `H("dust-dice:v2:roll", H(gamma.x, gamma.y))`.
+ * The 32 bytes a roll's dice are expanded from: `H("dust-dice:v2:roll", gamma.x, gamma.y)`.
  *
- * Deliberately the same shape as the seed-era digest so the ladder in `dice-core` is unchanged
- * — only where the 32 bytes come from moves.
+ * Poseidon over the coordinates as field elements: SHA-256 needed them as bytes, and that
+ * conversion's range checks cost more rows than the hash.
  */
 export pure circuit vrfRollDigest(gamma: JubjubPoint): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([
-    pad(32, "dust-dice:v2:roll"),
-    persistentHash<Vector<2, Field>>([jubjubPointX(gamma), jubjubPointY(gamma)]),
-  ]);
+  return transientHash<VrfRollDigestInput>(VrfRollDigestInput {
+    domain: pad(32, "dust-dice:v2:roll"),
+    x: jubjubPointX(gamma),
+    y: jubjubPointY(gamma),
+  }) as Bytes<32>;
 }
 
 /** Pack a hold mask into the byte the VRF input commits to. Position i is bit i. */

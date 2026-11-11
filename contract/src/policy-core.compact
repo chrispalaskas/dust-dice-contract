@@ -57,6 +57,9 @@
 // ---------------------------------------------------------------------------------------
 // Entropy, commitments, mixing
 // ---------------------------------------------------------------------------------------
+//
+// The three hashes `playerMove` runs on every move are `transientHash` (Poseidon), not
+// `persistentHash` (SHA-256): in-circuit SHA-256 is what held the move circuit at k=16.
 
 /**
  * The player's per-round entropy, forced: `entropy_s(r) = H(sk_s, tableId, r)`.
@@ -72,12 +75,12 @@
  * registered.
  */
 export pure circuit forcedEntropy(sk: Bytes<32>, tableId: Bytes<32>, round: Uint<8>): Bytes<32> {
-  return persistentHash<EntropyContext>(
+  return transientHash<EntropyContext>(
            EntropyContext { domain: pad(32, "dust-dice:v1:entropy"),
                             sk: sk,
                             tableId: tableId,
                             round: round, }
-           );
+           ) as Bytes<32>;
 }
 
 export struct EntropyContext {
@@ -96,7 +99,7 @@ export struct EntropyContext {
  * dice were never at risk -- this closes the identifier, not the randomness.
  */
 export pure circuit entropyKeyCommitment(tableId: Bytes<32>, sk: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dust-dice:v1:entkey"), tableId, sk]);
+  return transientHash<Vector<3, Bytes<32>>>([pad(32, "dust-dice:v1:entkey"), tableId, sk]) as Bytes<32>;
 }
 
 /**
@@ -141,7 +144,8 @@ export pure circuit inviteCommitment(code: Bytes<32>): Bytes<32> {
  * 2 of table.compact's header.
  */
 export pure circuit mixEntropy(entropy: Bytes<32>, roundDigest: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "dust-dice:v1:mix"), entropy, roundDigest]);
+  return transientHash<Vector<3, Bytes<32>>>([pad(32, "dust-dice:v1:mix"), entropy, roundDigest])
+         as Bytes<32>;
 }
 
 // ---------------------------------------------------------------------------------------

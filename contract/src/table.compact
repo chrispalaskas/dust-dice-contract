@@ -858,7 +858,7 @@ export struct SeatTurn {
    * `mixEntropy(entropy, roundDigest)`, latched by the OPEN.
    *
    * Carried in the ledger rather than recomputed at each reveal because recomputing it is a
-   * `persistentHash` per move. Not a new disclosure: both its inputs were already public.
+   * hash per move. Not a new disclosure: both its inputs were already public.
    */
   mixed: Bytes<32>,
   /**
