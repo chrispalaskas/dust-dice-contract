@@ -26,7 +26,7 @@
     "compact:lobby": "COMPACT_PATH=$PWD/src compact compile +0.36.0 src/lobby.compact src/managed/lobby",
     "compact:backgammon": "COMPACT_PATH=$PWD/src compact compile +0.36.0 src/backgammon.compact src/managed/backgammon",
     "gen:backgammon": "node scripts/gen-backgammon-board.mjs",
-    "prepublishOnly": "test $(ls dist/managed/table/keys/*.verifier 2>/dev/null | wc -l) -eq 9 && test -d dist/managed/lobby/keys && test $(ls dist/managed/backgammon/keys/*.verifier 2>/dev/null | wc -l) -eq 6 && test -f dist/managed/backgammon/compiler/contract-info.json && test -f dist/managed/table/compiler/contract-info.json && test -f dist/managed/lobby/compiler/contract-info.json || { echo 'refusing to publish: dist/managed lacks the proving keys or the compiler info \u2014 run a FULL `npm run compact` (not compact:fast) and `npm run build` first'; exit 1; }"
+    "prepublishOnly": "node scripts/check-publish.mjs"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-runtime": "0.21.0"
