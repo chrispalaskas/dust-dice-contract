@@ -263,6 +263,12 @@ export async function serializeWallet(ctx: WalletContext): Promise<WalletSnapsho
   };
 }
 
+/**
+ * How often each wallet re-reads the chain's tip on its own. A fork or a stalled indexer is noticed
+ * within this long; the first liveness check still runs at start-up.
+ */
+export const WALLET_TIP_POLL_MS = 5 * 60_000;
+
 export async function createWallet(
   network: NetworkConfig,
   seed: string,
@@ -304,6 +310,11 @@ export async function createWallet(
     // events when it crossed. No effect on a chain born on ledger 9 (the devnet). Our search, not
     // the SDK's `skipLedgerV8DustHistory` one, which times out against Blockfrost (dust-timeline.ts).
     dustTimelineStartProbe: dustTimelineStartProbe(network.indexerWS, DefaultForkSchedule.v9),
+    // Each wallet otherwise asks the indexer for its tip three times every 30 s: the unshielded
+    // wallet's liveness check and the shielded and dust wallets' protocol-version watches. That is
+    // ~8.6k requests a day per wallet against a Blockfrost quota of 50k for all of them.
+    livenessPollInterval: WALLET_TIP_POLL_MS,
+    versionWatch: { intervalMs: WALLET_TIP_POLL_MS },
   };
 
   // A snapshot is only restored into the wallet it came from, on the chain it came from.
