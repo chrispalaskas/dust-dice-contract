@@ -22,12 +22,14 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/midnightntwrk/compact/releases/latest/download/compact-installer.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/compact" update 0.34.0
+          "$HOME/.local/bin/compact" update 0.36.0
       - run: npm ci
       - name: Compile contracts WITH proving keys (the published tarball ships them)
         run: npm run compact -w contract
       - run: npm run build
       - run: npm test
+      # Trusted publishing (OIDC) needs npm 11.5.1 or later; Node 22 ships npm 10.
+      - run: npm install -g npm@^11.5.1
       - name: Publish what is not on the registry yet
         run: |
           set -e
