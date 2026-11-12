@@ -42,6 +42,7 @@ import type { FacadeState, FinalizedTx, UnboundTx, WalletSeeds } from '@midnight
 import { DustAddress } from '@midnightntwrk/wallet-sdk-address-format';
 
 import { dustTimelineStartProbe } from './dust-timeline.js';
+import { pacedTransactionLifecycle } from './tx-lifecycle.js';
 import { TX_TTL_MS, type NetworkConfig } from './network.js';
 
 export { unshieldedToken };
@@ -346,6 +347,8 @@ export async function createWallet(
       restore
         ? DustWallet(config).restore(restore.dust)
         : DustWallet(config).startWithSeed(seeds.dust),
+    // Pending transactions polled once a block, not once a second (tx-lifecycle.ts).
+    transactionLifecycleService: pacedTransactionLifecycle(),
   });
 
   await wallet.start(seeds);
