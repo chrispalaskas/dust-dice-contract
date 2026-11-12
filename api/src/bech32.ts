@@ -115,10 +115,18 @@ export function unshieldedAddressBytes(bech32: string, expectedNetworkId?: strin
         `(prefix '${hrp}')`,
     );
   }
-  if (expectedNetworkId !== undefined && !hrp.endsWith(expectedNetworkId)) {
+  if (expectedNetworkId !== undefined && addressNetwork(hrp) !== expectedNetworkId) {
     throw new Bech32Error(
       `address '${hrp}…' is not for network '${expectedNetworkId}' — wrong wallet network?`,
     );
   }
   return new Uint8Array(bytes);
+}
+
+/**
+ * The network a Midnight address prefix names: `mn_<type>_<network>`, and mainnet when there is no
+ * network segment at all (`mn_addr`), as the wallet SDK's MidnightBech32m spells it.
+ */
+function addressNetwork(hrp: string): string {
+  return hrp.split('_').slice(2).join('_') || 'mainnet';
 }

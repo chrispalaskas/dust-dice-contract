@@ -85,5 +85,35 @@ describe('decodeBech32m rejects what it should', () => {
   it('rejects an address for a different network when one is expected', () => {
     const good = 'mn_addr_undeployed1h3ssm5ru2t6eqy4g3she78zlxn96e36ms6pq996aduvmateh9p9sk96u7s';
     expect(() => unshieldedAddressBytes(good, 'testnet')).toThrow(/not for network/);
+    expect(() => unshieldedAddressBytes(good, 'mainnet')).toThrow(/not for network/);
   });
+});
+
+describe('a mainnet address has no network segment', () => {
+  // Mainnet's prefix is plain `mn_addr`; checking for a `mainnet` suffix refused every mainnet
+  // wallet (Lace and Moth, 2026-11-11).
+  const mainnet = (seed: string) => {
+    const hd = HDWallet.fromSeed(Buffer.from(seed, 'hex'));
+    if (hd.type !== 'seedOk') throw new Error('invalid seed');
+    const derived = hd.hdWallet.selectAccount(0).selectRoles([Roles.NightExternal]).deriveKeysAt(0);
+    if (derived.type !== 'keysDerived') throw new Error('key derivation failed');
+    return createKeystore({ kind: 'schnorr', secret: derived.keys[Roles.NightExternal] }, 'mainnet')
+      .getBech32Address()
+      .toString();
+  };
+
+  it('is accepted for mainnet and agrees with the wallet SDK', () => {
+    const address = mainnet('11'.repeat(32));
+    expect(address.startsWith('mn_addr1')).toBe(true);
+    expect(hex(unshieldedAddressBytes(address, 'mainnet'))).toBe(hex(userAddressBytes(address)));
+  }, 120_000);
+
+  it('is refused for any other network, and other networks are refused for mainnet', () => {
+    expect(() => unshieldedAddressBytes(mainnet('11'.repeat(32)), 'preprod')).toThrow(
+      /not for network/,
+    );
+    expect(() => unshieldedAddressBytes(mainnet('11'.repeat(32)), 'undeployed')).toThrow(
+      /not for network/,
+    );
+  }, 120_000);
 });
