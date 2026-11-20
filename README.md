@@ -49,7 +49,10 @@ settlement anyone can replay the whole game with `verifier`. A table force-settl
 operator went silent still pays its winner but cannot be replayed. The construction is in
 `contract/src/vrf-core.compact`, and its review is `docs/review/vrf-review.md`. On a **fast**
 table the ORDER of a player's rolls rests on the operator's word, and the docs say so wherever it
-matters. See `docs/security-review.md`.
+matters. The operator there also sees each roll before the turn lands, because the player's moves
+reach it before the chain, so it could go quiet after a roll it dislikes. The player's remedy is to
+play the rest of the turn on chain: a seat waiting on the operator cannot be eliminated in either
+mode. See `docs/fast-turn-dispute.md` and `docs/security-review.md`.
 
 ## Publishing (maintainers)
 

@@ -568,6 +568,14 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * contract rebuilds this same point when the roll is revealed, so a query built on anything
    * else is simply refused.
    */
+  /**
+   * The blinded query the ACTING player would commit for (round, rollIndex, holdMask) -- what an
+   * operator holding that player's proven move off-chain has seen, and can answer ahead of it.
+   */
+  queryFor(seat: number, round: bigint, rollIndex: bigint, holdMask: boolean[]): JubjubPoint {
+    return this.#query(seat, round, rollIndex, holdMask).blinded;
+  }
+
   #query(
     seat: number,
     round: bigint,
