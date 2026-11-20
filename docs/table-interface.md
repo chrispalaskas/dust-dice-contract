@@ -139,8 +139,14 @@ Returns the seat's **next stage**, so a client can drive the state machine off t
 second is still accepted; from the next second, `eliminate` is the seat's only exit. This
 is what makes `abortTable`'s operator-stalled branch sound: the player makes every move into
 an operator-owed stage, so without it an idle seat could make one move after the grace and
-abort the table into a full refund (security-audit-2026-09 Finding A). On a fast table the
-whole composed settlement must land by the deadline.
+abort the table into a full refund (security-audit-2026-09 Finding A).
+
+**An unanswered ask is refused in the round's last `2 * disputeGraceSecs()` (60 s)**: an `open`
+or `hold` past `roundDeadline - 60` fails with `too late in the round to ask for a roll`, unless
+the `vrfAnswer` cell of the roll it asks for already holds this round's answer to the exact query
+the move commits. A merged fast turn's resolves run first, so its asks are all pre-answered and
+exempt. A `score` asks for nothing and is never refused by this rule. This leaves the operator a
+full grace to answer any ask. See `docs/fast-turn-dispute.md`.
 
 **The unused arguments must carry exactly those sentinels.** They are part of the public log a
 settlement verifier replays, and two encodings of one move would make it ambiguous. The circuit
@@ -171,6 +177,11 @@ All-true is legal but pointless — score instead.
 **Declares no time.**
 
 ### `resolveRoll(seat, rollIndex, round, blinded, response, dleqA1, dleqA2, dleqZ): []` — operator
+
+**Refused in the round's last `disputeGraceSecs()` (30 s)** (`too late in the round to answer`),
+so every answer leaves the player a full grace to spend it, and an operator cannot answer late and
+eliminate at once. A merged fast turn carries resolves, so the whole turn must land by
+`roundDeadline - 30`.
 
 Answers one VRF query: writes `vrfAnswer[seat*3 + rollIndex] = {round, blinded, response}` after
 verifying the Chaum–Pedersen DLEQ `(dleqA1, dleqA2, dleqZ)` that `response = x·blinded` for the
@@ -215,9 +226,10 @@ nine and nine exist):
 - **`voluntary == false` (timeout)** — anyone. Requires `blockTimeGt(roundDeadline)`,
   `seatProgress[seat].round == openRound`, `!eliminated`, and the seat to be the **player's** to
   move (`playerOwes`: idle, or its asked roll answered in `vrfAnswer` — the player's silence).
-  An asked-and-unanswered seat is the operator's and is refused — **except on a fast table**
-  (`fastMode == true`), where resolves are off-chain and a seat parked at an asked stage past
-  the deadline is a stalled fast turn, so the owes-shield is waived. Penalty split: `q * 13 + rem == tier * (openRound + 1)`, `rem < 13`.
+  An asked-and-unanswered seat is the operator's and is refused, **in both modes**. Until
+  2026-11-20 fast tables waived this, which let an operator that had seen a seat's dice go quiet
+  and collect the penalty (popper-audit C009). A fast seat reaches an asked stage on chain only
+  by escalating; see `docs/fast-turn-dispute.md`. Penalty split: `q * 13 + rem == tier * (openRound + 1)`, `rem < 13`.
 - **`voluntary == true` (resignation)** — the seat itself: the `playerEntropySecret` witness must
   open `seatIdentity[seat].keyCommit`, the same authorisation `playerMove` demands. The deadline,
   stage-parity and played-this-round guards are all waived — resign any time while the table is

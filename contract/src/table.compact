@@ -528,6 +528,43 @@ pure circuit timeoutSlackFactor(): Uint<64> {
   return 2;
 }
 
+/**
+ * The grace each party is guaranteed to answer the other in, in seconds, before `roundDeadline`.
+ *
+ * THE ROUND HAS THREE CUT-OFFS, NOT ONE, and this constant spaces them:
+ *
+ *   ask      playerMove(open | hold)   !blockTimeGt(roundDeadline - 2 * grace)  [unless the
+ *                                      roll it asks for is already answered: see playerMove]
+ *   answer   resolveRoll               !blockTimeGt(roundDeadline - grace)
+ *   finish   playerMove(any)           !blockTimeGt(roundDeadline)            [Finding A]
+ *
+ * Each closes a last-second trick on the party that would otherwise move last:
+ *
+ *   - An operator that answers at the deadline's last second, and eliminates the next, leaves the
+ *     player no time to spend the answer: an elimination dressed as a timeout. Answers stop
+ *     `grace` before the deadline, so an answered seat always has `grace` to move.
+ *   - A player that asks at the deadline's last second leaves the operator no time to answer, and
+ *     turns its own stall into "waiting on the operator" -- the shield, and in time `abortTable`'s
+ *     refund. Unanswered asks stop `grace` before answers do, so every ask can be answered.
+ *
+ * So a merged fast turn, whose resolves run first and pre-answer every ask in it, has until the
+ * ANSWER cut-off to land; an on-chain turn's asks, answered later, stop at the ask cut-off.
+ *
+ * WHY IT MATTERS MOST ON A FAST TABLE. There the whole turn runs off-chain and the chain sees a
+ * stalled seat only at stage 0, so it cannot tell whose silence a stall is. The player's remedy is
+ * to land its own proven open on chain: from then on the seat is protected, and the operator owes
+ * an on-chain answer. Without these cut-offs that remedy would be an attack -- see
+ * docs/fast-turn-dispute.md.
+ *
+ * 30 s: a `playerMove` proves in ~1 s and is in a block ~6 s after submit (cli/src/inclusion.ts),
+ * so this is four times what one party needs, with room for a slow prover. At the 240 s timeout
+ * floor, and after a hostile `closeRound` has taken its full `timeSlackSecs()`, a seat still has
+ * over 60 s to ask -- a fast turn settles in ~35 s.
+ */
+pure circuit disputeGraceSecs(): Uint<64> {
+  return 30;
+}
+
 /** Rake denominator. 1% -- `scoring-core.compact`'s `rakeIsValid` hard-codes the 100. */
 pure circuit minTier(): Uint<64> {
   return 100;
@@ -651,16 +688,24 @@ export sealed ledger tableTimeoutSecs: Uint<64>;
  * reveals each roll only after holding the player's signed, pre-proven move) and lands as ONE
  * composed settlement transaction of these same circuits. The dice remain exactly as verifiable
  * (they are deterministic in the revealed seed); what becomes operator-ATTESTED rather than
- * chain-proven is the ordering. Between transactions a fast seat only ever rests at stage 0 or
- * stage 1 — the intermediate stages exist solely inside the settlement — which is why no
- * circuit needs to police the interactive path shut: there is no on-chain state for a defecting
- * hold to bind to, provided the operator never resolves a fast seat outside a settlement (its
- * published policy; an operator that breaks it is the colluding operator the threat model
- * already excludes, since it holds the seed).
+ * chain-proven is the ordering. Between settlements a fast seat rests at stage 0 -- or at an
+ * asked stage, if the player escalated.
  *
- * The one circuit that reads this is `eliminate`: on a fast table the stage-parity rule is
- * waived, because "odd stage = the operator's silence" is only meaningful when resolves are
- * on-chain obligations.
+ * ESCALATION (docs/fast-turn-dispute.md). Off-chain, the chain cannot tell whose silence a stall
+ * is: a seat whose operator went quiet after seeing its dice looks exactly like a seat whose
+ * player walked away from a bad roll -- both sit at stage 0, which `eliminate` charges. So the
+ * player may land its OWN open on chain -- the same open it sent the operator, since the entropy
+ * and the blinding are both forced -- and from that asked stage on it is shielded like any
+ * on-chain seat; the operator then owes an on-chain answer. The operator
+ * answers an escalated seat by landing, in ONE transaction, its resolve together with every
+ * proven move of that turn it already holds -- so the player cannot re-choose a hold it already
+ * sent, which would buy a second draw of the next roll (the hold mask is in the VRF input). The
+ * resolves in that transaction run first, so every held hold lands pre-answered and the ask
+ * cut-off does not refuse it. The cut-offs in `disputeGraceSecs` keep either side from
+ * escalating, or answering, at the last second.
+ *
+ * No circuit reads this field any more; it is the table's public, sealed promise of which path
+ * its operator serves.
  */
 export sealed ledger fastMode: Boolean;
 
@@ -1887,6 +1932,7 @@ export circuit playerMove(
   const holding = k == moveHold();
   const scoring = k == moveScore();
 
+
   // ---- canonical sentinels ------------------------------------------------------------
   // The unused arguments carry a fixed value so the public log has one representation of each
   // move. Cheap asserts; they are the difference between a replayable log and an ambiguous one.
@@ -1924,6 +1970,32 @@ export circuit playerMove(
          "playerMove: a hold needs an asked roll with another roll left"
          );
   assert(!scoring || between, "playerMove: nothing has been rolled to score");
+
+  // ---- the ask cut-off (see `disputeGraceSecs`) -----------------------------------------
+  //
+  // An open or a hold asks the operator for a roll, so landing it late could leave the operator
+  // owing an answer it has no time to give -- the shield, then `abortTable`'s refund. What the
+  // cut-off forbids is precisely that: an UNANSWERED ask past `roundDeadline - 2g`. An ask whose
+  // answer is already in its cell when the ask lands owes the operator nothing, and is legal up to
+  // the deadline. That is every ask of a merged fast turn, whose resolves run first (the rule
+  // above `stageIdle`), and every held hold an operator lands when it answers an escalation
+  // (docs/fast-turn-dispute.md) -- without this exemption a late escalation would leave those
+  // holds unlandable and hand the player a choice between rolls it had already seen.
+  //
+  // ONE extra lookup: the cell of the roll this move asks for (roll 1 on an open, the next on a
+  // hold), or the never-written sentinel cell for a score, which asks for nothing. Bound to this
+  // round and to the exact query this move commits, so a stale answer from an earlier round, or
+  // an answer to a different hold, exempts nothing. `roundDeadline` is at least
+  // `turnTimeoutSecs` (> 240) past a real block time while playing, so the subtraction cannot
+  // underflow.
+  const askIndex = opening ? 0 : (pend.stage == stageAskedRoll1() ? 1 : 2);
+  const preAnswer = vrfAnswer.lookup(scoring ? noAnswerKey() : answerKey(s, askIndex as Uint<8>));
+  const preAnswered = preAnswer.round == r && preAnswer.blinded == disclose(nextBlinded);
+  assert(scoring ||
+         preAnswered ||
+         !blockTimeGt((roundDeadline - disputeGraceSecs() - disputeGraceSecs()) as Uint<64>),
+         "playerMove: too late in the round to ask for a roll"
+         );
 
   // ---- reveal the roll this move acts on ------------------------------------------------
   //
@@ -2130,6 +2202,14 @@ export circuit resolveRoll(seat: Uint<8>,
   // key. It also keeps every key below `noAnswerKey()`.
   assert(s < seatCount, "resolveRoll: no such seat");
   assert(i < 3, "resolveRoll: a turn has three rolls");
+  // The ANSWER cut-off (see `disputeGraceSecs`): an answer must leave the player its grace to
+  // spend it, or answering late and eliminating at once is a penalty the player never had a
+  // chance to avoid. `roundDeadline` is not a constant, but no move writes it -- only the start
+  // and `closeRound`, which cannot run while a seat may still move -- so a merged fast turn's
+  // resolves still run first against an untouched state (the rule above `stageIdle`).
+  assert(!blockTimeGt((roundDeadline - disputeGraceSecs()) as Uint<64>),
+         "resolveRoll: too late in the round to answer"
+         );
 
   const b = disclose(blinded);
   const answer = disclose(response);
@@ -2343,11 +2423,14 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
 
   // A slot has no turn yet: turns are the start's to create (see the constructor).
   const pend = leaving ? idleTurn() : seatTurn.lookup(s);
-  // On a FAST table the owes-shield is waived: resolves are off-chain there, so a seat parked
-  // at an asked stage past the deadline is a stalled fast turn, not an operator debt. On-chain
-  // tables keep the rule exactly: an asked-but-unanswered stage is the operator's silence and
-  // eliminating it would punish the wrong party.
-  assert(vol || fastMode || playerOwes(s, pend),
+  // The owes-shield holds in BOTH modes. An asked-but-unanswered stage is the operator's silence
+  // and eliminating it would punish the wrong party. On a fast table that stage exists on chain
+  // only when the player put it there by landing its own open -- its remedy for an operator that
+  // went quiet off-chain -- and the ask cut-off guarantees the operator had `disputeGraceSecs()`
+  // to answer it. (It was waived on fast tables until 2026-11-20, which let an operator that had
+  // seen a seat's dice stop answering and collect the timeout penalty: popper-audit C009,
+  // docs/fast-turn-dispute.md.)
+  assert(vol || playerOwes(s, pend),
          "eliminate: this seat is waiting on the operator, not the other way round"
          );
 
