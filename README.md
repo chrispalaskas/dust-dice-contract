@@ -17,7 +17,7 @@ uses the word only to describe the style of play.
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `contract/` | `table.compact` (one deployment per table: stakes, seats, rolls, scoring, settlement), `lobby.compact` (a registry), the shared modules, TypeScript mirrors of every hash and rule, the witnesses, and 199 simulator tests |
 | `api/`      | Contract-interaction plumbing: providers, wallet helpers, bech32, pure game rules. `./node` is Node-only                                                                                                                   |
-| `verifier/` | `npm run verify -- <table address>` — re-derives every roll and score of a finished table from the indexer's record and the operator's revealed seed                                                                       |
+| `verifier/` | `npm run verify -- <table address>` — re-derives every roll and score of a finished table from the indexer's record, the revealed VRF key and each seat's revealed secret                                                  |
 | `docs/`     | The protocol: `table-interface.md` (start here), `security-review.md`, `client-rules.md`, the circuit notes, and `bugs-found.md`, a log of 30 upstream defects met while building on the ledger-9 line                     |
 
 ## Build
@@ -34,11 +34,22 @@ release is reproducible by compiling the tagged source with the pinned compiler.
 
 ## Trust model, in one paragraph
 
-Players' stakes sit in the table contract, paid out by its own circuits. The operator commits to
-a dice seed at deploy and every roll is a hash of that seed, the table's public round digest and
-the players' own entropy — the operator cannot choose the dice, and after settlement anyone can
-replay the whole game with `verifier`. On a **fast** table the ORDER of a player's rolls rests on
-the operator's word, and the docs say so wherever it matters. See `docs/security-review.md`.
+Players' stakes sit in the table contract, paid out by its own circuits. The dice come from a
+**blind VRF**. The operator seals one VRF public key per table at deploy. For each roll the player
+builds an input point from its own seat secret (pinned at join), the table, the round, the roll
+index and its previous hold, then blinds that point and posts it. The operator answers with its
+key applied to the blinded point, along with a DLEQ proof, checked in-circuit, that it used the
+sealed key. The player unblinds the answer in its next move, the contract checks the unblinding,
+and the dice are a hash of the result, mixed with the table's round digest and the seat's
+entropy. So the operator cannot choose a roll, because one query admits exactly one valid
+answer. It cannot see a roll before the player does, because it only ever sees blinded points.
+The player cannot steer a roll either, because its secret and its blinding are both fixed.
+`settle` reveals the VRF secret and each seat's final score reveals that seat's secret, so after
+settlement anyone can replay the whole game with `verifier`. A table force-settled after the
+operator went silent still pays its winner but cannot be replayed. The construction is in
+`contract/src/vrf-core.compact`, and its review is `docs/review/vrf-review.md`. On a **fast**
+table the ORDER of a player's rolls rests on the operator's word, and the docs say so wherever it
+matters. See `docs/security-review.md`.
 
 ## Publishing (maintainers)
 
