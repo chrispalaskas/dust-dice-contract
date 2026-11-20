@@ -1419,7 +1419,7 @@ circuit totalRedeemable(): Uint<64> {
  * The custody invariant, in-circuit: every atom the contract ever received is still accounted
  * for, either as pot or as somebody's redeemable.
  *
- * Asserted by the two circuits that zero the pot. It is bookkeeping against bookkeeping, not
+ * Asserted by `eliminate`; the two circuits that zero the pot assert the variant below. It is bookkeeping against bookkeeping, not
  * against the chain -- `unshieldedBalance` is inert under the simulator AND is the wrong thing
  * to read anyway (docs/bugs-found.md #11) -- so the ledger-vs-contract half of the check lives
  * in the E2E devnet run. What this catches is an arithmetic slip inside the contract, which is
@@ -1428,6 +1428,18 @@ circuit totalRedeemable(): Uint<64> {
 circuit assertCustody(): [] {
   assert((pot + totalRedeemable() + totalPaid()) == (tier * (seatCount as Uint<64>)),
          "custody invariant broken: pot + redeemable + paid != tier * seatCount"
+         );
+}
+
+/**
+ * The same invariant for a circuit that has just sent `sent` of the game's money to addresses
+ * that are not a seat's redeemable -- `settle`'s winner and rake, `abortTable`'s rake. Asserted
+ * AFTER that circuit's writes, so the arithmetic it checks is the arithmetic the circuit just
+ * did: a check before them could only re-read the balance the previous circuit left.
+ */
+circuit assertCustodyAfterSending(sent: Uint<64>): [] {
+  assert((pot + totalRedeemable() + totalPaid() + sent) == (tier * (seatCount as Uint<64>)),
+         "custody invariant broken: pot + redeemable + paid + sent != tier * seatCount"
          );
 }
 
@@ -2530,8 +2542,6 @@ export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
   const graceExpired = blockTimeGt((roundDeadline + tableTimeoutSecs) as Uint<64>);
   assert(opens || graceExpired, "settle: the secret does not match the table's VRF public key");
 
-  assertCustody();
-
   const n = seatCount;
   const rows = [survivorRow(0, n, seatProgress.lookup(0)),
                 survivorRow(1, n, seatProgress.lookup(1)),
@@ -2588,6 +2598,12 @@ export circuit settle(vrfSecret: Field, q: Uint<64>, r: Uint<64>): Uint<8> {
       opens
       );
   phase = Phase.settled;
+
+  // CUSTODY, AFTER THE WRITES, as in `abortTable`: a check before the sends could only re-read
+  // the balance `eliminate` left, never the split. The pot is gone, all of it to the winner (or
+  // the house) and the rake; the seats' redeemables and withdrawals are untouched, so this holds
+  // exactly when the pre-settle state balanced AND the two sends add up to the pot.
+  assertCustodyAfterSending((toPlayer + toRake) as Uint<64>);
 
   padTransaction();
   return winner;
@@ -2827,8 +2843,6 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
          "abortTable: the per-seat rake must satisfy q * 100 + rem == tier with rem < 100"
          );
 
-  assertCustody();
-
   // Section 10: at a started practice table every stake that is not the house's is forfeit, to
   // the rake. A slot is the seat of the same index once the table has started (`allSlots` reads
   // `seatIdentity`). While filling nothing is forfeit: the never-filled refund and the start's
@@ -2972,6 +2986,14 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
         );
     phase = Phase.aborted;
   }
+
+  // CUSTODY, AFTER THE WRITES. Checked here and not before the share-out: a check that ran
+  // first would read the pre-abort state, which `eliminate` has already proved balanced, and
+  // could never see a slip in the share, the rake or the start's pot. Afterwards the game's
+  // money is wherever this circuit put it -- the pot (a start), the seats' redeemables, the
+  // seats' earlier withdrawals, or the rake address -- and those must still add up to every
+  // seated stake. Slot refunds are not in it: nothing on chain counted a slot's stake.
+  assertCustodyAfterSending(rakeTotal);
 
   padTransaction();
   // A start shares nothing out; the refund paths return the per-seat share.
