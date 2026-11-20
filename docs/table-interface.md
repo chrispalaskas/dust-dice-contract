@@ -134,6 +134,14 @@ category: Uint<8>            0..12 on a score; 0 otherwise
 
 Returns the seat's **next stage**, so a client can drive the state machine off the return value.
 
+**Refused once the round deadline has passed**: every kind requires
+`!blockTimeGt(roundDeadline)` (`the round deadline has passed`). A move at the deadline
+second is still accepted; from the next second, `eliminate` is the seat's only exit. This
+is what makes `abortTable`'s operator-stalled branch sound: the player makes every move into
+an operator-owed stage, so without it an idle seat could make one move after the grace and
+abort the table into a full refund (security-audit-2026-09 Finding A). On a fast table the
+whole composed settlement must land by the deadline.
+
 **The unused arguments must carry exactly those sentinels.** They are part of the public log a
 settlement verifier replays, and two encodings of one move would make it ambiguous. The circuit
 rejects anything else with `only an open declares entropy` / `only a hold declares a mask` /
@@ -316,13 +324,21 @@ holds its OWN eliminations after an outage (`service/src/daemon.ts` `#noteOutage
   return.
 - For each FAST table, no seat is eliminated for a missed deadline until one full round length
   (that table's sealed `turnTimeoutSecs`) has passed since the return. The roster explains the
-  hold ("outage grace: seat N is past its deadline but keeps its turn until T").
+  hold ("outage grace: seat N missed its deadline while the operator was away; it can no
+  longer move, and the operator will not eliminate it before T").
 - On-chain tables are untouched: their players move by their own transactions, and the
   stage-parity rule already protects a seat waiting on the operator.
 - Every fresh gap restarts the hold; a daemon that keeps failing never eliminates anyone.
 
 The contract is unchanged: `eliminate` stays permissionless, so a third party could still act
 during the grace. This is the daemon's policy toward its own players.
+
+**The grace no longer gives the seat its turn back** (security-audit-2026-09 Finding A). The
+contract refuses every `playerMove` past `roundDeadline`, and the channel refuses such a turn
+before revealing anything. All the hold now does is keep the operator from being the party
+that eliminates for its own outage. A seat at stage 0 when the deadline passed has no
+penalty-free exit (`abortTable` needs a seat waiting on the operator), so once the grace ends
+it is eliminated as before.
 
 ### Creator-paid private tables (2026-09-06)
 

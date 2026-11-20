@@ -583,8 +583,11 @@ export enum Phase {
 //   seatTurn[s]     this seat's own
 //
 // and writes seatCard[s], seatProgress[s], seatTurn[s] -- all blind `insert`s on its own key.
-// No shared scalar is read-modify-written anywhere on that path. `pot`, `activeSeats`,
-// `roundDigest` and `roundDeadline` are not touched by `playerMove` at all.
+// No shared scalar is read-modify-written anywhere on that path. `pot` and `activeSeats` are
+// not touched by `playerMove` at all. It READS two round-scoped scalars and writes neither:
+// `roundDigest` (the open latches its mix from it) and `roundDeadline` (a move past it is
+// refused). While playing, both are written only by `closeRound`, which cannot run while a
+// seat may still move -- the same reason `openRound` is safe to read.
 //
 // `eliminate` DOES read-modify-write `pot` and `activeSeats`, and two concurrent eliminations
 // therefore conflict and one is rejected. That is correct and deliberate: they are the only
@@ -618,7 +621,8 @@ export sealed ledger rakeAddress: UserAddress;
 export sealed ledger vrfPublicKey: JubjubPoint;
 
 /**
- * How long a whole round gets, in seconds. Past it, seats that owe a move can be eliminated.
+ * How long a whole round gets, in seconds. Past it, no seat may move, and seats that owe a move
+ * can be eliminated.
  *
  * A ROUND, not a move. An interactive turn is up to four player transactions and three operator
  * ones, and they all share this one deadline -- so it has to be sized for the whole turn plus
@@ -694,6 +698,7 @@ export ledger roundDigest: Bytes<32>;
  * (join time + `tableTimeoutSecs`), which is what gives a table that never fills a deadline
  * without a second field. Every other deadline in the contract is derived from it:
  *
+ *   playerMove      !blockTimeGt(roundDeadline)                     [refused past it]
  *   eliminate       blockTimeGt(roundDeadline)
  *   abortTable      blockTimeGt(roundDeadline + tableTimeoutSecs)   [operator stalled]
  *   abortTable      blockTimeGt(roundDeadline)                      [never filled]
@@ -1857,6 +1862,14 @@ export circuit playerMove(
 
   const r = openRound;
   assert(r < roundCount(), "playerMove: the game is over");
+  // A seat past the round deadline is eliminable and may no longer act. This is what makes
+  // `abortTable`'s waiting-on-the-operator guard sound: without it a seat idle at an even stage
+  // could make one move after the grace, put itself "waiting on the operator", and abort the
+  // table into a full, rake-free refund (security-audit-2026-09 Finding A). Strict, like
+  // `eliminate`'s `blockTimeGt`: a move AT the deadline is still in time, and from the next
+  // second `eliminate` is the seat's only exit. `roundDeadline` is written only by the start and
+  // `closeRound` once the table is playing, so this read binds to nothing that moves in a round.
+  assert(!blockTimeGt(roundDeadline), "playerMove: the round deadline has passed");
 
   const opening = k == moveOpen();
   const holding = k == moveHold();
@@ -2707,6 +2720,13 @@ export circuit redeem(seat: Uint<8>): Uint<64> {
  *     both of those are permissionless and available a whole table-timeout before this circuit
  *     would have been. So the losing player's stall is answered by the remedy that costs them a
  *     penalty, not by the one that gives them their money back.
+ *
+ *     The guard is only sound because `playerMove` refuses every move past `roundDeadline`. The
+ *     player, not the operator, makes every move into an operator-owed stage (an open, a hold),
+ *     so without that refusal an idle seat could make one move after the grace and arrive here
+ *     "waiting on the operator" in the same transaction (security-audit-2026-09 Finding A).
+ *     With it, a seat can only be waiting on the operator at `roundDeadline + tableTimeoutSecs`
+ *     if it got there in time, so the operator really has had the whole grace to answer.
  *
  *   * `abandoned` -- every seat was eliminated. No further waiting: the deadline that produced
  *     it has already elapsed.

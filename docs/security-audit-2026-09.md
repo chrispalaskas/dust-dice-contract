@@ -19,14 +19,14 @@ ledger source rather than trusted (§4).
 
 ## 0. Summary
 
-| #   | Severity | Finding                                                                                                                | Status               |
-| --- | -------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| A   | **High** | A delinquent player manufactures an "operator stall" and aborts the table into a full, rake-free refund                | executed, fix tested |
-| B   | Medium   | The resignation discount makes the final round a free option: every loser recovers ≈7.7 % of its stake from the winner | executed             |
-| C   | Medium   | Six free join/leave cycles permanently burn every slot of a filling table (storefront denial of service)               | executed             |
-| D   | Low      | The chain-only verifier reports VERIFICATION FAILED on any legitimate table that had a pre-start leaver                | by inspection        |
-| E   | Low      | Release pipeline installs the compiler via an unpinned curl-pipe-sh installer and mutable action tags                  | by inspection        |
-| —   | Info     | Six observations, none exploitable in-contract (§3)                                                                    |                      |
+| #   | Severity | Finding                                                                                                                | Status           |
+| --- | -------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| A   | **High** | A delinquent player manufactures an "operator stall" and aborts the table into a full, rake-free refund                | fixed 2026-11-20 |
+| B   | Medium   | The resignation discount makes the final round a free option: every loser recovers ≈7.7 % of its stake from the winner | executed         |
+| C   | Medium   | Six free join/leave cycles permanently burn every slot of a filling table (storefront denial of service)               | executed         |
+| D   | Low      | The chain-only verifier reports VERIFICATION FAILED on any legitimate table that had a pre-start leaver                | by inspection    |
+| E   | Low      | Release pipeline installs the compiler via an unpinned curl-pipe-sh installer and mutable action tags                  | by inspection    |
+| —   | Info     | Six observations, none exploitable in-contract (§3)                                                                    |                  |
 
 **The direct impersonation question has a clean answer: no.** A seat's moves, resignation and
 nothing else are authorised by zero-knowledge proof of the seat's `sk_s`; the payout address is
@@ -89,6 +89,11 @@ tableTimeoutSecs`, that hold _outlasts_ the abort window and the exploit is dete
 A losing player therefore has a standing, zero-cost option: stop, wait, and if the table has
 not eliminated them by the end of the grace, take everyone's stake back. The rake is skipped
 too, so the operator loses its fee.
+
+**Status, 2026-11-20.** The fix below was verified on a scratch build at the time but never
+landed in `table.compact`; it has now been applied, with regression tests in
+`contract/src/test/table.test.ts` (`abortTable` suite) replacing this PoC, which no longer runs
+against the current harness (stage and resolve APIs were renamed since).
 
 **Fix (tested).** Refuse any `playerMove` once the round deadline has passed — a seat that is
 eliminable may not also act:

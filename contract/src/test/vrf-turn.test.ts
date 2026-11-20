@@ -18,6 +18,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  DEFAULT_BLOCK_TIME,
   MOVE_OPEN,
   MOVE_SCORE,
   NO_MASK,
@@ -26,6 +27,10 @@ import {
   userAddress,
   ZERO_BYTES32,
 } from './simulator.ts';
+
+// Moves run at the simulator's default block time, so the table starts just before it: playerMove
+// refuses every move past the round deadline (security-audit-2026-09 Finding A).
+const T0 = DEFAULT_BLOCK_TIME - 100;
 import { NO_GAMMA } from '../table-witnesses.ts';
 import * as vrf from '../vrf.ts';
 import { pureCircuits } from '../managed/table/contract/index.js';
@@ -54,10 +59,10 @@ describe('a turn played through the blind VRF', () => {
     const skB = bytes32(0xb2);
 
     sim.asPlayer(skA);
-    await sim.join(userAddress(0x01), 1_000);
+    await sim.join(userAddress(0x01), T0);
     sim.asPlayer(skB);
-    await sim.join(userAddress(0x02), 1_010);
-    await sim.start(1_010);
+    await sim.join(userAddress(0x02), T0 + 10);
+    await sim.start(T0 + 10);
 
     const seat = 0;
     sim.asPlayer(skA);
@@ -167,10 +172,10 @@ describe('a turn played through the blind VRF', () => {
     const sim = await TableSimulator.create(config());
     const skA = bytes32(0xa1);
     sim.asPlayer(skA);
-    await sim.join(userAddress(0x01), 1_000);
+    await sim.join(userAddress(0x01), T0);
     sim.asPlayer(bytes32(0xb2));
-    await sim.join(userAddress(0x02), 1_010);
-    await sim.start(1_010);
+    await sim.join(userAddress(0x02), T0 + 10);
+    await sim.start(T0 + 10);
 
     sim.asPlayer(skA);
     const round = sim.getLedger().openRound;
@@ -198,10 +203,10 @@ describe('a turn played through the blind VRF', () => {
     const sim = await TableSimulator.create(config());
     const skA = bytes32(0xa1);
     sim.asPlayer(skA);
-    await sim.join(userAddress(0x01), 1_000);
+    await sim.join(userAddress(0x01), T0);
     sim.asPlayer(bytes32(0xb2));
-    await sim.join(userAddress(0x02), 1_010);
-    await sim.start(1_010);
+    await sim.join(userAddress(0x02), T0 + 10);
+    await sim.start(T0 + 10);
 
     sim.asPlayer(skA);
     const round = sim.getLedger().openRound;

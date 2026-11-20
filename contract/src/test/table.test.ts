@@ -198,6 +198,7 @@ describe('conflict-freedom', () => {
       // Frozen for the whole game once the table is `playing`.
       'openRound', //     written ONLY by closeRound, which cannot run while a seat may move
       'phase', //         written only by the start and by the terminal circuits
+      'roundDeadline', // frozen for the round (closeRound-only); no move is accepted past it
       'roundDigest', //   frozen for the round (closeRound-only); the open latches its mix from it
       'seatCard', //      this seat's own
       'seatCount', //     written only by the start, which leaves `filling`
@@ -251,11 +252,13 @@ describe('conflict-freedom', () => {
     for (const field of moving) {
       assert.ok(!ledgerReads('resolveRoll').has(field), `resolveRoll must not read ${field}`);
     }
-    // `playerMove` has ONE exception and it is deliberate: the open reads `roundDigest` to latch
-    // the seat's mixed entropy (roll 1 used to), and the digest is frozen for the duration of a
-    // round precisely so that it can -- `closeRound` is its only writer and cannot run while any
-    // seat still has a move to make.
-    for (const field of moving.filter((f) => f !== 'roundDigest')) {
+    // `playerMove` has TWO exceptions and both are deliberate: the open reads `roundDigest` to
+    // latch the seat's mixed entropy (roll 1 used to), and every move reads `roundDeadline` to
+    // refuse itself once the round is over (security-audit-2026-09 Finding A). Both are frozen
+    // for the duration of a round precisely so that they can -- `closeRound` is their only
+    // writer while playing and cannot run while any seat still has a move to make.
+    const roundScoped = ['roundDigest', 'roundDeadline'];
+    for (const field of moving.filter((f) => !roundScoped.includes(f))) {
       assert.ok(!ledgerReads('playerMove').has(field), `playerMove must not read ${field}`);
     }
   });
@@ -1602,8 +1605,10 @@ describe('elimination', () => {
 
   it('refuses every move from an eliminated seat, for the rest of the game', async () => {
     const g = await atRound(2);
-    await g.eliminate(0, 2);
+    // Seat 1 plays first: `eliminate` moves the clock past the round deadline, and no seat may
+    // move after it (security-audit-2026-09 Finding A).
     await g.playTurn(1, 2, alwaysStopEarly);
+    await g.eliminate(0, 2);
     await g.closeRound(2);
     g.sim.asPlayer(g.players[0]!.sk);
     await assert.rejects(() => g.sim.openTurn(0, g.entropyFor(0, 3), g.clock), /been eliminated/);
@@ -1882,6 +1887,71 @@ describe('abortTable', () => {
     const { q, rem } = perSeatRake(g.config.tier);
     const long = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs) + 1_000_000;
     await assert.rejects(() => g.sim.abortTable(q, rem, long), /neither stalled/);
+  });
+
+  // security-audit-2026-09 Finding A. The guard above is only sound if a seat cannot put ITSELF
+  // "waiting on the operator" after the deadline: the player makes every move into an odd stage.
+  // Before the fix, one late open (or hold) followed by abortTable, composable into one
+  // transaction, turned a losing seat's stall into a full, rake-free refund.
+  for (const fastMode of [false, true]) {
+    const label = fastMode ? 'fast' : 'on-chain';
+
+    it(`refuses a late open, so an idle seat cannot manufacture an operator stall (${label})`, async () => {
+      const g = await seated({ seats: 2, fastMode }, { holds: alwaysStopEarly });
+      await g.playTurn(1, 0);
+      const tier = g.config.tier;
+      const { q, rem } = perSeatRake(tier);
+      const T = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs) + 1;
+
+      await assert.rejects(() => g.sim.abortTable(q, rem, T), /neither stalled/);
+      g.sim.asPlayer(g.players[0]!.sk);
+      await assert.rejects(
+        () => g.sim.openTurn(0, g.entropyFor(0, 0), T),
+        /round deadline has passed/,
+      );
+      assert.equal(g.ledger().seatTurn.lookup(0n).stage, BigInt(STAGE.idle));
+      await assert.rejects(() => g.sim.abortTable(q, rem, T), /neither stalled/);
+      assert.equal(g.ledger().phase, PHASE.playing);
+
+      // The exit that remains is the one that charges the straggler.
+      const p = penaltySplit(tier, 0);
+      g.sim.asOperator();
+      await g.sim.eliminate(0, p.q, p.rem, T);
+      assert.equal(g.ledger().seatProgress.lookup(0n).eliminated, true);
+      g.assertCustody();
+    });
+  }
+
+  it('refuses a late hold, so a seat rolled in time cannot go odd after the grace', async () => {
+    const g = await seated({ seats: 2 });
+    await g.playTurn(1, 0, alwaysStopEarly);
+    await rolledOnce(g, 0);
+    const { q, rem } = perSeatRake(g.config.tier);
+    const T = Number(g.ledger().roundDeadline + g.config.tableTimeoutSecs) + 1;
+    g.sim.asPlayer(g.players[0]!.sk);
+    await assert.rejects(() => g.sim.hold(0, maskOf(0), T), /round deadline has passed/);
+    await assert.rejects(() => g.sim.score(0, 0, T), /round deadline has passed/);
+    assert.equal(g.ledger().seatTurn.lookup(0n).stage, BigInt(STAGE.askedRoll1));
+    await assert.rejects(() => g.sim.abortTable(q, rem, T), /neither stalled/);
+  });
+
+  it('accepts a move AT the deadline and refuses it one second later', async () => {
+    // Strict, like eliminate's: the last second of the round still belongs to the player.
+    const g = await seated({ seats: 2 });
+    const deadline = Number(g.ledger().roundDeadline);
+    g.sim.asPlayer(g.players[0]!.sk);
+    await assert.rejects(
+      () => g.sim.openTurn(0, g.entropyFor(0, 0), deadline + 1),
+      /round deadline has passed/,
+    );
+    assert.equal(await g.sim.openTurn(0, g.entropyFor(0, 0), deadline), BigInt(STAGE.askedRoll1));
+    // A seat that asked in time and is never answered is a genuine operator stall: still aborts.
+    const { q, rem } = perSeatRake(g.config.tier);
+    const grace = deadline + Number(g.config.tableTimeoutSecs);
+    await assert.rejects(() => g.sim.abortTable(q, rem, grace), /neither stalled/);
+    assert.equal(await g.sim.abortTable(q, rem, grace + 1), g.config.tier);
+    assert.equal(g.ledger().phase, PHASE.aborted);
+    g.assertCustody();
   });
 
   it('refuses to abort a finished game -- settle is its exit', async () => {
