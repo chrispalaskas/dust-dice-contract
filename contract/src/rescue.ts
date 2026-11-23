@@ -21,6 +21,45 @@
 
 import type { Ledger as TableLedger } from './managed/table/contract/index.js';
 import { tableHeldSlots, tableJoinedPlayers } from './table-slots.ts';
+import { answerKey, askedIndex } from './vrf.ts';
+
+/**
+ * Does seat `seat` owe the next move? Idle, or its on-chain ask answered -- table.compact's
+ * `playerOwes`. Not the raw stage's parity: since the oracle map the ledger stage only says
+ * which roll is ASKED (1..3), and whether the operator has answered is in `vrfAnswer`.
+ */
+function playerOwes(led: TableLedger, seat: number): boolean {
+  const turn = led.seatTurn.lookup(BigInt(seat));
+  if (turn.stage === 0n) return true;
+  const a = led.vrfAnswer.lookup(answerKey(seat, askedIndex(turn.stage)));
+  return a.round === turn.round && a.blinded.x === turn.blinded.x && a.blinded.y === turn.blinded.y;
+}
+
+/**
+ * The seat clock (table.compact `seatClock`): the deadline seat `seat` must move by -- the
+ * round's, or later when its wait on the operator was credited -- and whether a marked ask's
+ * wait is still to be credited, which `eliminate` refuses until it is. Tables built before the
+ * clock have neither cell, and keep the round's deadline.
+ */
+export function seatClockOf(
+  led: TableLedger,
+  seat: number,
+): { deadline: bigint; creditDue: boolean } {
+  const ledger = led as TableLedger & {
+    seatDeadline?: typeof led.seatDeadline;
+    seatAsk?: typeof led.seatAsk;
+  };
+  if (!ledger.seatDeadline || !ledger.seatDeadline.member(BigInt(seat))) {
+    return { deadline: led.roundDeadline, creditDue: false };
+  }
+  const d = ledger.seatDeadline.lookup(BigInt(seat));
+  const a = ledger.seatAsk!.lookup(BigInt(seat));
+  return {
+    deadline:
+      d.round === led.openRound && d.deadline > led.roundDeadline ? d.deadline : led.roundDeadline,
+    creditDue: a.pending && a.round === led.openRound,
+  };
+}
 
 /** Rounds per seat, as `table.compact`'s `roundCount()` fixes it. */
 const ROUND_COUNT = 13;
@@ -123,15 +162,16 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
   if (!past(led.roundDeadline))
     return { kind: 'none', why: 'The round deadline has not passed yet.' };
 
-  // A seat still in the game that has not played the open round is what stops the table. The
-  // stage parity is the contract's rule about WHOSE silence it is: an odd stage means the seat
-  // is waiting on the operator, and eliminating it would punish the wrong party — except on a
-  // fast table, where resolves happen off chain and the shield is waived.
+  // A seat still in the game that has not played the open round is what stops the table --
+  // when it is the PLAYER's silence (table.compact `playerOwes`: idle, or its ask answered), past
+  // THAT seat's deadline (the seat clock may have credited it time), and with no credit still
+  // due. Both modes: the fast-table waiver is gone (popper-audit C009, 2026-11-20).
   for (let seat = 0; seat < Number(led.seatCount); seat++) {
     const progress = led.seatProgress.lookup(BigInt(seat));
     if (progress.eliminated || progress.round !== led.openRound) continue;
-    const stage = Number(led.seatTurn.lookup(BigInt(seat)).stage);
-    if (!led.fastMode && stage % 2 !== 0) continue; // the operator owes this one, not the player
+    if (!playerOwes(led, seat)) continue; // the operator owes this one, not the player
+    const clock = seatClockOf(led, seat);
+    if (clock.creditDue || !past(clock.deadline)) continue;
     return {
       kind: 'eliminate',
       seat,
@@ -168,7 +208,7 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
   // refuses, which is the one thing this module exists to avoid.
   const waitingOnOperator = (): boolean => {
     for (let seat = 0; seat < Number(led.seatCount); seat++) {
-      if (Number(led.seatTurn.lookup(BigInt(seat)).stage) % 2 !== 0) return true;
+      if (!playerOwes(led, seat)) return true;
     }
     return false;
   };

@@ -659,7 +659,18 @@ async function verify(address: string, verbose: boolean): Promise<number> {
   };
 
   for (let i = 0; i < groups.length; i++) {
-    const g = groups[i]!;
+    // THE SEAT CLOCK (table.compact `seatClock`) moves no dice, score, money or round: it only
+    // times a seat's wait on the operator. A transaction may carry it around a move -- the
+    // player's [credit, move, mark], or the operator's escalation answer with the credit last --
+    // so it is set aside here and the rest of the transaction is checked as if it were alone.
+    const whole = groups[i]!;
+    const clocks = whole.entryPoints.filter((k) => k === 'seatClock').length;
+    const g =
+      clocks === 0
+        ? whole
+        : { ...whole, entryPoints: whole.entryPoints.filter((k) => k !== 'seatClock') };
+    if (clocks > 0) console.log(`  (${clocks} seat clock call(s) in block ${g.blockHeight})`);
+    if (g.entryPoints.length === 0) continue;
     const led = g.led;
     const prev = before(i);
     const isTurn = g.entryPoints.every((k) => TURN_CALLS.has(k));

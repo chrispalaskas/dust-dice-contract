@@ -141,12 +141,11 @@ is what makes `abortTable`'s operator-stalled branch sound: the player makes eve
 an operator-owed stage, so without it an idle seat could make one move after the grace and
 abort the table into a full refund (security-audit-2026-09 Finding A).
 
-**An unanswered ask is refused in the round's last `2 * disputeGraceSecs()` (60 s)**: an `open`
-or `hold` past `roundDeadline - 60` fails with `too late in the round to ask for a roll`, unless
-the `vrfAnswer` cell of the roll it asks for already holds this round's answer to the exact query
-the move commits. A merged fast turn's resolves run first, so its asks are all pre-answered and
-exempt. A `score` asks for nothing and is never refused by this rule. This leaves the operator a
-full grace to answer any ask. See `docs/fast-turn-dispute.md`.
+**The deadline is the SEAT's** (`seatDeadlineOf`): the round's, or later when the seat clock
+credited it the time it waited on the operator (`seatClock`, below). There are no earlier
+cut-offs (removed 2026-11-23, `docs/fast-turn-dispute.md`): an ask may land in the deadline's
+last second. **A move reads no cell that a settlement writes ahead of it**: `seatAsk` never, and
+`seatDeadline` only, which nothing but the credit writes.
 
 **The unused arguments must carry exactly those sentinels.** They are part of the public log a
 settlement verifier replays, and two encodings of one move would make it ambiguous. The circuit
@@ -176,12 +175,22 @@ All-true is legal but pointless — score instead.
 
 **Declares no time.**
 
+### `seatClock(seat, now, mark): []` — player (mark), anyone (credit)
+
+The seat clock (`docs/fast-turn-dispute.md` section 5). `now` is pinned like `join`'s
+(`pinTime`). A credit due -- a marked ask of this round, now answered -- is applied first: the
+wait (`now - askedAt`) plus `clockSlackSecs()` (60 s) is added to `seatDeadline[seat]`, capped at
+`roundDeadline + tableTimeoutSecs - 240`. Then, with `mark`, the seat's current ask (it must be
+asking, unanswered, and no earlier ask may still wait) is recorded in `seatAsk[seat]` with `now`.
+Without `mark` and with nothing due it does nothing. Wholly fallible (`resolveBallast`), so it may
+follow a `playerMove` in one transaction. The page sends `[credit if due, playerMove, mark for an
+ask]`; the operator sends the credit after its answer, last in an escalation answer.
+
 ### `resolveRoll(seat, rollIndex, round, blinded, response, dleqA1, dleqA2, dleqZ): []` — operator
 
-**Refused in the round's last `disputeGraceSecs()` (30 s)** (`too late in the round to answer`),
-so every answer leaves the player a full grace to spend it, and an operator cannot answer late and
-eliminate at once. A merged fast turn carries resolves, so the whole turn must land by
-`roundDeadline - 30`.
+**No deadline**: an answer may land at any time, past the round's deadline too. The seat clock
+gives the player back the time it took (`seatClock`), and `eliminate` refuses a seat whose marked
+ask was answered but not credited, so an operator cannot answer late and eliminate at once.
 
 Answers one VRF query: writes `vrfAnswer[seat*3 + rollIndex] = {round, blinded, response}` after
 verifying the Chaum–Pedersen DLEQ `(dleqA1, dleqA2, dleqZ)` that `response = x·blinded` for the
@@ -223,7 +232,7 @@ advance the table.
 Knocks out a seat. Returns the seat's refund. Two modes on one circuit (the deploy ceiling is
 nine and nine exist):
 
-- **`voluntary == false` (timeout)** — anyone. Requires `blockTimeGt(roundDeadline)`,
+- **`voluntary == false` (timeout)** — anyone. Requires `blockTimeGt(seatDeadlineOf(seat))` and no seat-clock credit due,
   `seatProgress[seat].round == openRound`, `!eliminated`, and the seat to be the **player's** to
   move (`playerOwes`: idle, or its asked roll answered in `vrfAnswer` — the player's silence).
   An asked-and-unanswered seat is the operator's and is refused, **in both modes**. Until

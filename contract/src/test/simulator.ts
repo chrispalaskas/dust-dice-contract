@@ -750,6 +750,18 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
    * Six seats have six independent pipelines and may be interleaved freely; answering an idle
    * seat is accepted and unlocks nothing (see `resolveRollRaw` for the dishonest shapes).
    */
+  /**
+   * The seat clock (table.compact `seatClock`): `mark` after an on-chain ask, or credit the
+   * operator's wait once the answer is in. `now` is the declared time; `blockTime` what the
+   * chain says (defaults to `now`).
+   */
+  seatClock(seat: number, now: number, mark: boolean, blockTime = now): Promise<[]> {
+    this.blockTime = blockTime;
+    return this.run('seatClock', (ctx) =>
+      this.table.impureCircuits.seatClock(ctx, BigInt(seat), BigInt(now), mark),
+    );
+  }
+
   resolveRoll(seat: number, blockTime = DEFAULT_BLOCK_TIME): Promise<[]> {
     const t = this.getLedger().seatTurn.lookup(BigInt(seat));
     return this.resolveRollRaw(seat, vrf.askedIndex(t.stage), t.round, t.blinded, blockTime);

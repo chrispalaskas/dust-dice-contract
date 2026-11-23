@@ -113,12 +113,18 @@ const ADT_FIELDS: ReadonlyArray<readonly [PathKey, string]> = [
   // bucket 1 runs turnTimeoutSecs..finalDigest and ends with the first ADT, `seatIdentity`, at
   // 1,14, and bucket 2 opens with the rest of the ADT block at 2,0..2,6. Re-derived from the
   // generated accessor on 2026-11-08 (merge of main's practice tables into ledger-9).
-  ['1,11', 'seatSecretRevealed'],
-  ['1,14', 'seatIdentity'],
-  ['2,0', 'seatCard'],
-  ['2,1', 'seatProgress'],
-  ['2,2', 'seatTurn'],
-  ['2,3', 'vrfAnswer'],
+  // With the seat clock's `seatAsk` and `seatDeadline` (39 fields, 2026-11-23) bucket 1 opens two
+  // earlier: seatSecretRevealed 1,9, seatIdentity..seatProgress 1,12..1,14, and bucket 2 runs
+  // seatTurn, vrfAnswer, seatAsk, seatDeadline 2,0..2,3 before the rest. Re-derived from the
+  // generated accessor.
+  ['1,9', 'seatSecretRevealed'],
+  ['1,12', 'seatIdentity'],
+  ['1,13', 'seatCard'],
+  ['1,14', 'seatProgress'],
+  ['2,0', 'seatTurn'],
+  ['2,1', 'vrfAnswer'],
+  ['2,2', 'seatAsk'],
+  ['2,3', 'seatDeadline'],
   ['2,4', 'seatRedeemable'],
   ['2,5', 'seatReceipt'],
   ['2,6', 'joinedKeys'],
@@ -159,9 +165,10 @@ export function assertFieldMapIsComplete(): void {
   // With `house` (section 10, the 37th field) bucket 0 takes five, bucket 1 runs
   // turnTimeoutSecs..finalDigest plus `seatIdentity` at 1,14, and bucket 2 runs seatCard..house.
   // Re-derived from the generated accessor on 2026-11-08.
-  expect('1,3', 'phase');
-  expect('1,11', 'seatSecretRevealed');
-  expect('1,13', 'finalDigest');
+  // With the seat clock (39 fields, 2026-11-23): phase 1,1, finalDigest 1,11.
+  expect('1,1', 'phase');
+  expect('1,9', 'seatSecretRevealed');
+  expect('1,11', 'finalDigest');
   expect('2,7', 'padStore');
   expect('2,8', 'startAfterSecs');
   expect('2,11', 'fillOpenedAt');

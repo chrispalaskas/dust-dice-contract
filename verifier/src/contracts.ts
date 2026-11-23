@@ -58,7 +58,8 @@ export type TableCircuitId =
   | 'eliminate'
   | 'settle'
   | 'redeem'
-  | 'abortTable';
+  | 'abortTable'
+  | 'seatClock';
 
 export type LobbyCircuitId = 'openTableAt' | 'tableFilled';
 

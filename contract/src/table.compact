@@ -529,40 +529,37 @@ pure circuit timeoutSlackFactor(): Uint<64> {
 }
 
 /**
- * The grace each party is guaranteed to answer the other in, in seconds, before `roundDeadline`.
+ * THE SEAT CLOCK (docs/fast-turn-dispute.md, 2026-11-23). A seat's time stops while the operator
+ * owes it an answer it asked for ON CHAIN, and the wait is added to that seat's own deadline.
  *
- * THE ROUND HAS THREE CUT-OFFS, NOT ONE, and this constant spaces them:
+ *   mark     seatClock(s, now, true)   in the same transaction as the player's on-chain ask
+ *                                      (an escalated open, or a hold played on chain): records
+ *                                      `now`, pinned within `timeSlackSecs()` of block time
+ *   credit   seatClock(s, now, false)  after the operator's answer, by the operator in its answer
+ *                                      transaction (or by anyone later): adds the wait, plus
+ *                                      `clockSlackSecs()`, to `seatDeadline[s]`
+ *   finish   playerMove(any)           !blockTimeGt(seatDeadlineOf(s))        [Finding A]
+ *   timeout  eliminate                 blockTimeGt(seatDeadlineOf(s)), and no ask awaiting credit
  *
- *   ask      playerMove(open | hold)   !blockTimeGt(roundDeadline - 2 * grace)  [unless the
- *                                      roll it asks for is already answered: see playerMove]
- *   answer   resolveRoll               !blockTimeGt(roundDeadline - grace)
- *   finish   playerMove(any)           !blockTimeGt(roundDeadline)            [Finding A]
+ * WHY NOT CUT-OFFS. The first C009 fix (2026-11-20) stopped asks and answers at fixed points
+ * before the deadline and exempted an ask whose answer was already on the ledger. That exemption
+ * read the answer cell from `playerMove`, and a fast move is proven BEFORE the operator answers
+ * but runs AFTER the merged resolves have written that cell: the transcript's read no longer
+ * matched and every fast settlement failed (2026-11-23, local devnet). The cut-offs also took the
+ * last minute of the round from a player whose operator had gone quiet. The clock takes nothing:
+ * the operator may answer whenever it likes, and the player keeps the time it had.
  *
- * Each closes a last-second trick on the party that would otherwise move last:
+ * THE TRANSCRIPT RULE IT KEEPS. `seatDeadline` is written ONLY by the credit, which the operator
+ * places LAST in an escalation answer, after the player's held moves; so every move proven
+ * against the off-chain state reads the same `seatDeadline` cell it was proven against. `seatAsk`,
+ * which the mark writes, is read by no move at all.
  *
- *   - An operator that answers at the deadline's last second, and eliminates the next, leaves the
- *     player no time to spend the answer: an elimination dressed as a timeout. Answers stop
- *     `grace` before the deadline, so an answered seat always has `grace` to move.
- *   - A player that asks at the deadline's last second leaves the operator no time to answer, and
- *     turns its own stall into "waiting on the operator" -- the shield, and in time `abortTable`'s
- *     refund. Unanswered asks stop `grace` before answers do, so every ask can be answered.
- *
- * So a merged fast turn, whose resolves run first and pre-answer every ask in it, has until the
- * ANSWER cut-off to land; an on-chain turn's asks, answered later, stop at the ask cut-off.
- *
- * WHY IT MATTERS MOST ON A FAST TABLE. There the whole turn runs off-chain and the chain sees a
- * stalled seat only at stage 0, so it cannot tell whose silence a stall is. The player's remedy is
- * to land its own proven open on chain: from then on the seat is protected, and the operator owes
- * an on-chain answer. Without these cut-offs that remedy would be an attack -- see
- * docs/fast-turn-dispute.md.
- *
- * 30 s: a `playerMove` proves in ~1 s and is in a block ~6 s after submit (cli/src/inclusion.ts),
- * so this is four times what one party needs, with room for a slow prover. At the 240 s timeout
- * floor, and after a hostile `closeRound` has taken its full `timeSlackSecs()`, a seat still has
- * over 60 s to ask -- a fast turn settles in ~35 s.
+ * The credit is capped (see `seatClock`) so that a seat can never be moving, or asking, later
+ * than `timeSlackSecs() * timeoutSlackFactor()` before `abortTable`'s operator-stalled grace
+ * expires: the operator always has that long to answer the last possible ask.
  */
-pure circuit disputeGraceSecs(): Uint<64> {
-  return 30;
+pure circuit clockSlackSecs(): Uint<64> {
+  return 60;
 }
 
 /** Rake denominator. 1% -- `scoring-core.compact`'s `rakeIsValid` hard-codes the 100. */
@@ -700,9 +697,8 @@ export sealed ledger tableTimeoutSecs: Uint<64>;
  * answers an escalated seat by landing, in ONE transaction, its resolve together with every
  * proven move of that turn it already holds -- so the player cannot re-choose a hold it already
  * sent, which would buy a second draw of the next roll (the hold mask is in the VRF input). The
- * resolves in that transaction run first, so every held hold lands pre-answered and the ask
- * cut-off does not refuse it. The cut-offs in `disputeGraceSecs` keep either side from
- * escalating, or answering, at the last second.
+ * resolves in that transaction run first, so every held hold lands pre-answered. The seat clock
+ * (`clockSlackSecs`) gives the player back the time the operator took to answer.
  *
  * No circuit reads this field any more; it is the table's public, sealed promise of which path
  * its operator serves.
@@ -1016,6 +1012,36 @@ pure circuit noAnswer(): VrfAnswer {
 export pure circuit noSecret(): Bytes<32> {
   return pad(32, "dust-dice:v1:no-secret");
 }
+
+/**
+ * THE SEAT CLOCK's open ask (see `clockSlackSecs`): the on-chain ask a seat is waiting on the
+ * operator for, and when it was made. Written by `seatClock` only; read by `seatClock` and
+ * `eliminate`, and by NO move -- so marking an ask never changes a cell a held move reads.
+ */
+export struct SeatAsk {
+  /** The round of the ask. An ask from an earlier round is spent, whatever `pending` says. */
+  round: Uint<8>,
+  /** The asked stage (1..3 = waiting on roll 1..3), and the query, that the answer must match. */
+  stage: Uint<8>,
+  blinded: JubjubPoint,
+  /** Declared ask time, pinned within `timeSlackSecs()` of block time (`pinTime`). */
+  askedAt: Uint<64>,
+  /** Marked and not yet credited. */
+  pending: Boolean,
+}
+
+export ledger seatAsk: Map<Uint<8>, SeatAsk>;
+
+/**
+ * A seat's own deadline for `round`, when the seat clock has credited it time; otherwise the
+ * round's. Written ONLY by `seatClock`'s credit. See `seatDeadlineOf`.
+ */
+export struct SeatDeadline {
+  round: Uint<8>,
+  deadline: Uint<64>,
+}
+
+export ledger seatDeadline: Map<Uint<8>, SeatDeadline>;
 
 /**
  * Native NIGHT owed to a seat personally, and payable only to that seat's join-time address.
@@ -1924,9 +1950,12 @@ export circuit playerMove(
   // could make one move after the grace, put itself "waiting on the operator", and abort the
   // table into a full, rake-free refund (security-audit-2026-09 Finding A). Strict, like
   // `eliminate`'s `blockTimeGt`: a move AT the deadline is still in time, and from the next
-  // second `eliminate` is the seat's only exit. `roundDeadline` is written only by the start and
-  // `closeRound` once the table is playing, so this read binds to nothing that moves in a round.
-  assert(!blockTimeGt(roundDeadline), "playerMove: the round deadline has passed");
+  // second `eliminate` is the seat's only exit. THE SEAT'S deadline: the round's, plus any wait
+  // the seat clock credited it (`clockSlackSecs`). `roundDeadline` is written only by the start
+  // and `closeRound`, and `seatDeadline[s]` only by a credit -- which an escalation answer places
+  // after every move it carries -- so this read never changes under a move proven against the
+  // off-chain state.
+  assert(!blockTimeGt(seatDeadlineOf(s)), "playerMove: the round deadline has passed");
 
   const opening = k == moveOpen();
   const holding = k == moveHold();
@@ -1970,32 +1999,6 @@ export circuit playerMove(
          "playerMove: a hold needs an asked roll with another roll left"
          );
   assert(!scoring || between, "playerMove: nothing has been rolled to score");
-
-  // ---- the ask cut-off (see `disputeGraceSecs`) -----------------------------------------
-  //
-  // An open or a hold asks the operator for a roll, so landing it late could leave the operator
-  // owing an answer it has no time to give -- the shield, then `abortTable`'s refund. What the
-  // cut-off forbids is precisely that: an UNANSWERED ask past `roundDeadline - 2g`. An ask whose
-  // answer is already in its cell when the ask lands owes the operator nothing, and is legal up to
-  // the deadline. That is every ask of a merged fast turn, whose resolves run first (the rule
-  // above `stageIdle`), and every held hold an operator lands when it answers an escalation
-  // (docs/fast-turn-dispute.md) -- without this exemption a late escalation would leave those
-  // holds unlandable and hand the player a choice between rolls it had already seen.
-  //
-  // ONE extra lookup: the cell of the roll this move asks for (roll 1 on an open, the next on a
-  // hold), or the never-written sentinel cell for a score, which asks for nothing. Bound to this
-  // round and to the exact query this move commits, so a stale answer from an earlier round, or
-  // an answer to a different hold, exempts nothing. `roundDeadline` is at least
-  // `turnTimeoutSecs` (> 240) past a real block time while playing, so the subtraction cannot
-  // underflow.
-  const askIndex = opening ? 0 : (pend.stage == stageAskedRoll1() ? 1 : 2);
-  const preAnswer = vrfAnswer.lookup(scoring ? noAnswerKey() : answerKey(s, askIndex as Uint<8>));
-  const preAnswered = preAnswer.round == r && preAnswer.blinded == disclose(nextBlinded);
-  assert(scoring ||
-         preAnswered ||
-         !blockTimeGt((roundDeadline - disputeGraceSecs() - disputeGraceSecs()) as Uint<64>),
-         "playerMove: too late in the round to ask for a roll"
-         );
 
   // ---- reveal the roll this move acts on ------------------------------------------------
   //
@@ -2202,14 +2205,6 @@ export circuit resolveRoll(seat: Uint<8>,
   // key. It also keeps every key below `noAnswerKey()`.
   assert(s < seatCount, "resolveRoll: no such seat");
   assert(i < 3, "resolveRoll: a turn has three rolls");
-  // The ANSWER cut-off (see `disputeGraceSecs`): an answer must leave the player its grace to
-  // spend it, or answering late and eliminating at once is a penalty the player never had a
-  // chance to avoid. `roundDeadline` is not a constant, but no move writes it -- only the start
-  // and `closeRound`, which cannot run while a seat may still move -- so a merged fast turn's
-  // resolves still run first against an untouched state (the rule above `stageIdle`).
-  assert(!blockTimeGt((roundDeadline - disputeGraceSecs()) as Uint<64>),
-         "resolveRoll: too late in the round to answer"
-         );
 
   const b = disclose(blinded);
   const answer = disclose(response);
@@ -2230,6 +2225,88 @@ export circuit resolveRoll(seat: Uint<8>,
 // ===========================================================================================
 // closeRound
 // ===========================================================================================
+
+/**
+ * THE SEAT CLOCK (see `clockSlackSecs`): stop a seat's time while the operator owes it an answer
+ * it asked for on chain, and give that time back once the answer is in.
+ *
+ *   mark = true    the player, in the same transaction as its on-chain ask, AFTER the
+ *                  `playerMove`: records the ask and `now`. Refused if the ask is already
+ *                  answered (there is nothing to wait for) or a previous ask still waits.
+ *   mark = false   after the operator's answer: credits the wait. The operator places this LAST
+ *                  in its answer, after any held moves it lands with it, so none of them reads a
+ *                  `seatDeadline` it was not proven against. Permissionless: if the operator
+ *                  leaves it out, the player (or anyone) credits it, and `eliminate` refuses the
+ *                  seat until someone has. A call with nothing to credit does nothing.
+ *
+ * Either way a credit due is applied first, so a player's next on-chain move can carry
+ * [credit, move, mark] and never lose a wait the operator did not credit.
+ *
+ * THE CREDIT is the wait plus `clockSlackSecs()`. Both declared times may trail block time (by
+ * up to `timeSlackSecs()`, `pinTime`); the bonus offsets an operator that declares its answer
+ * early, and errs toward the player -- a short-changed credit is the operator's gain, a generous
+ * one only delays the round. It is CAPPED at `roundDeadline + tableTimeoutSecs`
+ * less `timeSlackSecs() * timeoutSlackFactor()` (the 240 s timeout floor), so a seat can never
+ * ask so late that the operator has less than that to answer before `abortTable`'s
+ * operator-stalled grace expires (security-audit-2026-09 Finding A stays closed).
+ */
+export circuit seatClock(seat: Uint<8>, now: Uint<64>, mark: Boolean): [] {
+  assert(phase == Phase.playing, "seatClock: table is not playing");
+
+  const s = disclose(seat);
+  const t = disclose(now);
+  const marking = disclose(mark);
+  assert(s < seatCount, "seatClock: no such seat");
+  const r = openRound;
+  assert(r < roundCount(), "seatClock: the game is over");
+
+  // Pinned like `join` and `closeRound` (`timeSlackSecs`): the window has to absorb a wallet's
+  // approval prompt between reading the chain's time and the mark landing.
+  pinTime(t);
+
+  // ---- credit a wait that is due ------------------------------------------------------------
+  const ask = seatAsk.lookup(s);
+  const due = ask.pending && ask.round == r;
+  const a = vrfAnswer.lookup(due ? answerKey(s, askedIndex(ask.stage)) : noAnswerKey());
+  const answeredNow = due && a.round == r && a.blinded == ask.blinded;
+  if (answeredNow) {
+    const wait = (t > ask.askedAt ? t - ask.askedAt : 0) as Uint<64>;
+    const credited = (seatDeadlineOf(s) + wait + clockSlackSecs()) as Uint<64>;
+    const cap = (roundDeadline + tableTimeoutSecs - timeSlackSecs() * timeoutSlackFactor())
+                  as Uint<64>;
+    seatDeadline.insert(s, SeatDeadline { round: r, deadline: credited < cap ? credited : cap });
+  }
+
+  // ---- mark a new ask -------------------------------------------------------------------------
+  if (marking) {
+    assert(!due || answeredNow, "seatClock: this seat's last ask is still waiting on the operator");
+    const pend = seatTurn.lookup(s);
+    assert(pend.round == r && pend.stage != stageIdle(), "seatClock: this seat has asked for nothing");
+    assert(!answered(s, pend), "seatClock: the operator has already answered this ask");
+    seatAsk.insert(s,
+                   SeatAsk { round: r,
+                             stage: pend.stage,
+                             blinded: pend.blinded,
+                             askedAt: t,
+                             pending: true, });
+  } else {
+    if (answeredNow) {
+      seatAsk.insert(s,
+                     SeatAsk { round: ask.round,
+                               stage: ask.stage,
+                               blinded: ask.blinded,
+                               askedAt: ask.askedAt,
+                               pending: false, });
+    }
+  }
+
+  // WHOLLY FALLIBLE, like `resolveRoll` (bugs-found #35/#36): the credit runs LAST in an
+  // escalation answer and the mark after the player's move, both behind fallible `playerMove`s,
+  // and a light call the ledger classes guaranteed may not follow a fallible one. The same ballast
+  // weighs it over the line; the builders assert the phase (`assertFallibleOnly`).
+  resolveBallast();
+  padTransaction();
+}
 
 /**
  * Advance the whole table one round: freeze a new digest, open the next round, restamp the
@@ -2415,7 +2492,8 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
 
   const r = openRound;
   assert(r < roundCount(), "eliminate: the game is over");
-  assert(vol || blockTimeGt(roundDeadline), "eliminate: the round deadline has not passed");
+  // The SEAT's deadline (the seat clock): a seat that waited on the operator keeps that time.
+  assert(vol || blockTimeGt(seatDeadlineOf(s)), "eliminate: the round deadline has not passed");
 
   const prog = seatProgress.lookup(s);
   assert(!prog.eliminated, "eliminate: this seat is already out");
@@ -2426,12 +2504,19 @@ export circuit eliminate(seat: Uint<8>, q: Uint<64>, rem: Uint<64>, voluntary: B
   // The owes-shield holds in BOTH modes. An asked-but-unanswered stage is the operator's silence
   // and eliminating it would punish the wrong party. On a fast table that stage exists on chain
   // only when the player put it there by landing its own open -- its remedy for an operator that
-  // went quiet off-chain -- and the ask cut-off guarantees the operator had `disputeGraceSecs()`
+  // went quiet off-chain -- and the seat clock gives it back the time the operator took
   // to answer it. (It was waived on fast tables until 2026-11-20, which let an operator that had
   // seen a seat's dice stop answering and collect the timeout penalty: popper-audit C009,
   // docs/fast-turn-dispute.md.)
   assert(vol || playerOwes(s, pend),
          "eliminate: this seat is waiting on the operator, not the other way round"
+         );
+  // AN ANSWERED ASK WHOSE WAIT IS NOT CREDITED YET is still the operator's to settle: without
+  // this, an operator could answer an escalated seat late, skip the credit, and eliminate it the
+  // next second -- the C009 move with one extra step. Anyone may credit it (`seatClock`), and the
+  // honest operator does so in its answer.
+  assert(vol || !creditDue(s, r),
+         "eliminate: this seat's wait on the operator has not been credited yet (seatClock)"
          );
 
   // Rounds are 0..12 here and 1..13 in the design note. See the doc comment. A RESIGNATION IS
@@ -3031,6 +3116,10 @@ export circuit abortTable(q: Uint<64>, rem: Uint<64>, now: Uint<64>): Uint<64> {
         seatCard.insert(i as Uint<8>, emptyScorecard());
         seatReceipt.insert(i as Uint<8>, default<Bytes<32>>);
         seatTurn.insert(i as Uint<8>, idleTurn());
+        // The seat clock's two cells, so its reads and `playerMove`'s are total. Round
+        // `noAnswerRound()` matches no real round, so neither counts until written.
+        seatAsk.insert(i as Uint<8>, noAsk());
+        seatDeadline.insert(i as Uint<8>, SeatDeadline { round: noAnswerRound(), deadline: 0 });
         // Not revealed yet. A cell to overwrite, so the final score's write costs the same
         // whatever the other seats have revealed by then (see `seatSecretRevealed`).
         seatSecretRevealed.insert(i as Uint<8>, noSecret());
@@ -3108,6 +3197,27 @@ circuit answered(s: Uint<8>, pend: SeatTurn): Boolean {
   const asked = pend.stage != stageIdle();
   const a = vrfAnswer.lookup(asked ? answerKey(s, askedIndex(pend.stage)) : noAnswerKey());
   return asked && a.round == pend.round && a.blinded == pend.blinded;
+}
+
+/** The seat clock's empty ask. */
+pure circuit noAsk(): SeatAsk {
+  return SeatAsk { round: noAnswerRound(),
+                   stage: 0,
+                   blinded: default<JubjubPoint>,
+                   askedAt: 0,
+                   pending: false, };
+}
+
+/** The deadline seat `s` must move by in the open round: the round's, or later if credited. */
+circuit seatDeadlineOf(s: Uint<8>): Uint<64> {
+  const d = seatDeadline.lookup(s);
+  return (d.round == openRound && d.deadline > roundDeadline) ? d.deadline : roundDeadline;
+}
+
+/** Has seat `s` an ask marked in round `r` whose wait is not credited yet? */
+circuit creditDue(s: Uint<8>, r: Uint<8>): Boolean {
+  const a = seatAsk.lookup(s);
+  return a.pending && a.round == r;
 }
 
 /** Is the PLAYER the one who owes the next move? See the state machine above `stageIdle`. */

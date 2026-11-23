@@ -1,7 +1,9 @@
 # Fast-turn disputes: whose silence is it?
 
 **Status:** implemented 2026-11-20 on branch `fast-dispute`, off `popper-audit`. This fixes
-popper-audit **C009**.
+popper-audit **C009**. **Revised 2026-11-23:** the cut-offs of section 4 are replaced by the
+**seat clock** (section 5). The first version's ask-cut-off exemption broke every fast settlement
+on chain, and its cut-offs took the round's last minute from a player whose operator went quiet.
 
 ## The problem
 
@@ -55,33 +57,58 @@ keeps the player's parts durably for this (`OperatorStore.recordPlayerPart`, wri
 transcript position). If it holds no move after roll 1, a plain `resolveRoll` is safe, since the
 player has committed nothing it could re-choose.
 
-**4. Three cut-offs, spaced by `disputeGraceSecs()` = 30 s**
+**4. (Superseded 2026-11-23) Three cut-offs, spaced by `disputeGraceSecs()` = 30 s.** The
+first version stopped unanswered asks at `roundDeadline - 60 s` and answers at `roundDeadline -
+30 s`, and exempted an ask whose answer was already in its cell. Two things were wrong with it:
 
-| Cut-off | Circuit                    | Rule                                                                               |
-| ------- | -------------------------- | ---------------------------------------------------------------------------------- |
-| ask     | `playerMove(open \| hold)` | not past `roundDeadline - 2g`, **unless the roll it asks for is already answered** |
-| answer  | `resolveRoll`              | not past `roundDeadline - g`                                                       |
-| finish  | `playerMove(*)`            | not past `roundDeadline` (Finding A)                                               |
+- **The exemption broke every fast settlement.** To know whether an ask was pre-answered,
+  `playerMove` read the answer cell for the roll it asks for. A fast move is PROVEN before the
+  operator answers, so its proof recorded that cell empty; in the merged settlement the operator's
+  resolves run FIRST and fill it, so the cell no longer held what the proof read and the chain
+  refused the move (`FailFallible`, the player's segments 4, 6, 8 and 10). Every fast turn failed
+  this way on the local devnet on 2026-11-23. The simulator runs circuits directly, without
+  replaying a proof against a changed ledger, so the 311 contract tests could not see it.
+- **The cut-offs charged the player for the operator's silence.** A player whose operator went
+  quiet for 100 s of a 241 s round escalated, was answered 5 s after the operator returned, and
+  had 7 s left to reroll before the ask cut-off. The page's clock still showed 1:15.
 
-Each closes the last-second trick of whichever party would otherwise move last:
+**The transcript rule this records** (pinned by `table.test.ts`, "THE FAST-TURN TRANSCRIPT RULE"):
+a player move may read only cells that nothing running ahead of it in a settlement writes. The
+resolves run first and write the answer cells; the one answer cell a move reads is the one it
+reveals, which its proof already saw filled.
 
-- **Operator answers late, then eliminates.** An answer at the deadline makes the seat the
-  player's to owe, with no time left to move. Answers stop `g` before the deadline, so an
-  answered seat always has `g` to spend it.
-- **Player asks late.** An ask at the deadline leaves the operator no time to answer, which turns
-  the player's own stall into the shield and eventually `abortTable`'s refund. Unanswered asks stop
-  `g` before answers do, so every ask can be answered.
+**5. The seat clock (2026-11-23).** A seat's time stops while the operator owes it an answer it
+asked for on chain, and the wait is added to that seat's own deadline. No cut-offs: the operator
+may answer whenever it likes, and the player keeps the time it had.
 
-The exemption for pre-answered asks costs one map lookup in `playerMove`. A merged transaction
-runs its resolves first (the rule above `stageIdle`), so every ask in a fast settlement, and every
-held hold in an escalation answer, finds its answer already in its cell and owes the operator
-nothing. Without the exemption, a player who escalated just before the ask cut-off would get its
-held holds refused. It would then be left to choose between scoring roll 1 and walking away,
-with roll 2 already seen. With the exemption, those holds land as committed.
+| Call                       | Who, when                                              | Effect                                                                                |
+| -------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| `seatClock(s, now, true)`  | the player, in the same transaction as an on-chain ask | records the ask and `now` (pinned like `join`)                                        |
+| `seatClock(s, now, false)` | the operator, last in its answer (or anyone, later)    | adds the wait + 60 s (`clockSlackSecs`) to `seatDeadline[s]`; no-op if nothing is due |
+| `playerMove` (finish)      | every move                                             | refused past the seat's deadline (Finding A)                                          |
+| `eliminate`                | anyone                                                 | past the seat's deadline, and **not while a credit is due**                           |
 
-The exemption is bound to the round and to the exact query the move commits. A stale answer from
-an earlier round, or an answer to a different hold, exempts nothing
-(`table.test.ts`, "an answer to a DIFFERENT hold exempts nothing").
+- **The credit is a separate cell from the mark.** `seatAsk` (the mark) is read by no move, and
+  `seatDeadline` (the credit) is written only by the credit, which the operator places last in an
+  escalation answer (segment 8, after the player's parts at 4..7). So every held move in that
+  answer reads the same `seatDeadline` it was proven against.
+- **An answer without its credit is not an elimination.** Otherwise an operator could answer late,
+  skip the credit and eliminate the next second. `eliminate` refuses a seat with a credit due;
+  anyone may send the credit, and the page sends it first with the player's next move.
+- **The 60 s bonus** offsets declared times that trail block time (`pinTime` allows 120 s). It errs
+  toward the player: a short credit is the operator's gain, a long one only delays the round.
+- **The cap.** A seat's deadline is never credited past `roundDeadline + tableTimeoutSecs - 240 s`,
+  so the operator always has at least the 240 s timeout floor to answer the last possible ask
+  before `abortTable`'s operator-stalled grace expires (Finding A stays closed).
+- **Phase.** `seatClock` carries `resolveBallast`, so the ledger classes it wholly fallible and it
+  may follow `playerMove`s in one transaction (bugs-found #35/#36). The builders assert it.
+- **Late asks are harmless now.** An ask in the last second shields the seat, but the operator can
+  always answer (no answer cut-off), and then the player has only the time it had left.
+- **Unmarked asks** (a page from before the clock) get the shield but no credit: an answer late in
+  the round leaves that player little time. Every current client marks.
+- **Gap:** a held hold whose roll the operator never revealed lands in the escalation answer and
+  asks for its roll there, unmarked. The operator answers it on its next tick (no cut-off), but that
+  wait is not credited.
 
 ## Circuit size (measured, full ZK compile, compactc 0.36.0)
 
@@ -95,14 +122,13 @@ Prover key size doubles with each step of k, so a near-identical key means no ci
 
 ## What it costs
 
-- **When everyone plays:** nothing extra. A fast turn must land by the answer cut-off
-  (`deadline - 30 s`) instead of the deadline, because its resolves carry the answer cut-off. The
-  channel stops admitting a turn 10 s before that (`ADMIT_MARGIN_SECS`).
+- **When everyone plays:** nothing extra. A fast turn must land by the seat's deadline; the channel
+  stops admitting one 10 s before it (`ADMIT_MARGIN_SECS`).
 - **Player walks away:** the same as before. The seat is idle on chain and is eliminated past the
   deadline.
-- **Player escalates:** one on-chain open (the player pays it), one operator transaction carrying
-  everything held, then the rest of the turn on chain at on-chain speed (about 8 s per
-  transaction).
+- **Player escalates:** one on-chain open with its mark (the player pays it), one operator
+  transaction carrying everything held and the credit, then the rest of the turn on chain at
+  on-chain speed (about 8 s per transaction), each ask marked and each answer credited.
 - **Operator gone:** the seat is shielded, and the stalled-operator abort refunds the table at
   `roundDeadline + tableTimeoutSecs`, as on an on-chain table.
 

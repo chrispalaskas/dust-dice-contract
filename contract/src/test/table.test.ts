@@ -153,10 +153,15 @@ const digestFor = (
 /** `noFinish()` -- the sentinel standing in for `rules.ts`'s `Infinity`. */
 const NO_FINISH = 65535n;
 /**
- * table.compact's `disputeGraceSecs()`: asks stop 2x this before the deadline, answers 1x. Not
- * an exported circuit, so mirrored here; the cut-off tests fail at their boundary if it drifts.
+ * table.compact's `clockSlackSecs()`: a declared clock time may trail block time by less than
+ * this, and every credit adds it. Not an exported circuit, so mirrored here; the seat-clock tests
+ * fail at their boundary if it drifts.
  */
-const DISPUTE_GRACE = 30;
+const CLOCK_SLACK = 60;
+/** table.compact `timeSlackSecs()`: how far a declared time may trail block time (`pinTime`). */
+const TIME_SLACK = 120;
+/** `timeSlackSecs() * timeoutSlackFactor()`: the floor the seat clock's cap keeps clear of. */
+const TIMEOUT_FLOOR = 240;
 
 /** Open a table and seat everyone. */
 async function seated(opts: TableOptions, plan: GamePlan = {}): Promise<GameDriver> {
@@ -207,12 +212,33 @@ describe('conflict-freedom', () => {
       'roundDigest', //   frozen for the round (closeRound-only); the open latches its mix from it
       'seatCard', //      this seat's own
       'seatCount', //     written only by the start, which leaves `filling`
+      'seatDeadline', //  this seat's own; written only by seatClock's credit (see below)
       'seatIdentity', //  this seat's own, written once by the start
       'seatProgress', //  this seat's own
       'seatTurn', //      this seat's own
       'tableId', //       sealed
       'vrfAnswer', //     this seat's own three answer cells, or the never-written sentinel
     ]);
+  });
+
+  it('THE FAST-TURN TRANSCRIPT RULE: no player move reads a cell an answer writes ahead of it', () => {
+    // A fast move is PROVEN before the operator answers and RUNS after the merged resolves (and,
+    // in an escalation answer, before the seat clock's credit). A Midnight transcript pins every
+    // value a circuit reads, so a move that read any cell those write would fail on chain -- C009's
+    // ask-cut-off exemption read the next answer cell and broke every fast settlement
+    // (2026-11-23). The answer cells a move reads are the one it REVEALS, which its proof already
+    // saw filled; that is a per-cell property this field-level check cannot express, so the
+    // fields that must never be read at all are pinned here instead.
+    assert.ok(!ledgerReads('playerMove').has('seatAsk'), 'playerMove must not read seatAsk');
+    // `seatDeadline` IS read (the finish check), so it may have exactly one writer: the credit,
+    // which the operator places after every move it lands.
+    for (const c of ['playerMove', 'resolveRoll', 'eliminate', 'closeRound', 'join']) {
+      assert.ok(!ledgerWrites(c).has('seatDeadline'), `${c} must not write seatDeadline`);
+    }
+    assert.ok(ledgerWrites('seatClock').has('seatDeadline'));
+    // And the resolve still touches nothing but its answer cell.
+    assert.ok(!ledgerWrites('resolveRoll').has('seatDeadline'));
+    assert.ok(!ledgerWrites('resolveRoll').has('seatAsk'));
   });
 
   it('lets two joins to different slots land together (section 9)', () => {
@@ -254,10 +280,7 @@ describe('conflict-freedom', () => {
     // them from `playerMove` would serialise the seats against each other -- which is exactly
     // what `stampTime`'s `lastActionAt` did in the cursor model, in seven of eight circuits.
     const moving = ['activeSeats', 'pot', 'roundDeadline', 'roundDigest', 'seatRedeemable'];
-    // `resolveRoll` has ONE exception, for the same reason as `playerMove`'s second: it reads
-    // `roundDeadline` to refuse an answer in the round's last grace (the answer cut-off,
-    // docs/fast-turn-dispute.md), and the deadline is frozen for the round.
-    for (const field of moving.filter((f) => f !== 'roundDeadline')) {
+    for (const field of moving) {
       assert.ok(!ledgerReads('resolveRoll').has(field), `resolveRoll must not read ${field}`);
     }
     // `playerMove` has TWO exceptions and both are deliberate: the open reads `roundDigest` to
@@ -281,12 +304,9 @@ describe('conflict-freedom', () => {
     // binds to the CELL, as the six-seat tests above rely on, and the cells in play are this
     // seat's own plus `noAnswerKey()` -- which nothing writes after the constructor. The reads
     // of that one cell are `resolveBallast`, weighing the call into the fallible phase.
-    // `roundDeadline` is the answer cut-off's: no move writes it (only the start and `closeRound`,
-    // which cannot run while a seat may still move), so the resolves still run first against an
-    // untouched state.
+    // (C009's answer cut-off made it read `roundDeadline` too; the seat clock removed that.)
     assert.deepEqual(sorted(ledgerReads('resolveRoll')), [
       'phase',
-      'roundDeadline',
       'seatCount',
       'vrfAnswer',
       'vrfPublicKey',
@@ -1969,7 +1989,7 @@ describe('abortTable', () => {
 
   it('accepts a score AT the deadline and refuses it one second later', async () => {
     // Strict, like eliminate's: the last second of the round still belongs to the player -- for a
-    // move that asks for nothing. Asks have their own, earlier cut-off (see 'the three cut-offs').
+    // move that asks for nothing.
     const g = await seated({ seats: 2 });
     await rolledOnce(g, 0);
     const deadline = Number(g.ledger().roundDeadline);
@@ -1980,7 +2000,8 @@ describe('abortTable', () => {
 
   it('a seat that asked in time and is never answered is a genuine operator stall', async () => {
     const g = await seated({ seats: 2 });
-    const askBy = Number(g.ledger().roundDeadline) - 2 * DISPUTE_GRACE;
+    // At the deadline itself: with no ask cut-off, the last second still counts.
+    const askBy = Number(g.ledger().roundDeadline);
     g.sim.asPlayer(g.players[0]!.sk);
     assert.equal(await g.sim.openTurn(0, g.entropyFor(0, 0), askBy), BigInt(STAGE.askedRoll1));
     const { q, rem } = perSeatRake(g.config.tier);
@@ -2556,59 +2577,15 @@ describe('the settle deadline bypass', () => {
 });
 
 // =========================================================================================
-describe('the three cut-offs (disputeGraceSecs)', () => {
-  // ask (open, hold) by deadline - 2g; answer (resolveRoll) by deadline - g; score by deadline.
-  // Each closes the last-second trick of the party that would otherwise move last
-  // (docs/fast-turn-dispute.md). Both modes: the late-answer trick is not a fast-table one.
+describe("the seat clock (seatClock): no cut-offs, and the operator's wait is given back", () => {
+  // docs/fast-turn-dispute.md. Both modes: an on-chain ask is an on-chain ask either way.
   for (const fastMode of [false, true]) {
     const label = fastMode ? 'fast' : 'on-chain';
 
-    it(`refuses an open past the ask cut-off and accepts one at it (${label})`, async () => {
+    it(`a whole turn may land in the round's last second: no cut-offs (${label})`, async () => {
+      // The merged fast turn shape (resolves first, pre-answering every ask), at the deadline.
       const g = await seated({ seats: 2, fastMode });
-      const askBy = Number(g.ledger().roundDeadline) - 2 * DISPUTE_GRACE;
-      g.sim.asPlayer(g.players[0]!.sk);
-      await assert.rejects(
-        () => g.sim.openTurn(0, g.entropyFor(0, 0), askBy + 1),
-        /too late in the round to ask for a roll/,
-      );
-      assert.equal(g.ledger().seatTurn.lookup(0n).stage, BigInt(STAGE.idle));
-      assert.equal(await g.sim.openTurn(0, g.entropyFor(0, 0), askBy), BigInt(STAGE.askedRoll1));
-    });
-
-    it(`refuses a hold past the ask cut-off, but the seat may still score (${label})`, async () => {
-      const g = await seated({ seats: 2, fastMode });
-      await rolledOnce(g, 0);
-      const askBy = Number(g.ledger().roundDeadline) - 2 * DISPUTE_GRACE;
-      g.sim.asPlayer(g.players[0]!.sk);
-      await assert.rejects(
-        () => g.sim.hold(0, maskOf(0), askBy + 1),
-        /too late in the round to ask for a roll/,
-      );
-      assert.equal(g.ledger().seatTurn.lookup(0n).stage, BigInt(STAGE.askedRoll1));
-      assert.equal(await g.sim.score(0, 0, askBy + 1), BigInt(STAGE.idle));
-    });
-
-    it(`refuses an answer past the answer cut-off and accepts one at it (${label})`, async () => {
-      const g = await seated({ seats: 2, fastMode });
-      const deadline = Number(g.ledger().roundDeadline);
-      g.sim.asPlayer(g.players[0]!.sk);
-      await g.sim.openTurn(0, g.entropyFor(0, 0), deadline - 2 * DISPUTE_GRACE);
-      g.sim.asOperator();
-      await assert.rejects(
-        () => g.sim.resolveRoll(0, deadline - DISPUTE_GRACE + 1),
-        /too late in the round to answer/,
-      );
-      await g.sim.resolveRoll(0, deadline - DISPUTE_GRACE);
-      // The player had its whole grace to spend the answer, and spends it in the last second.
-      g.sim.asPlayer(g.players[0]!.sk);
-      assert.equal(await g.sim.score(0, 0, deadline), BigInt(STAGE.idle));
-    });
-
-    it(`a PRE-ANSWERED ask lands past the ask cut-off, up to the answer cut-off (${label})`, async () => {
-      // The merged fast turn, and the operator's answer to an escalation: the resolves run first,
-      // so every ask in the transaction finds its answer already in its cell and owes nothing.
-      const g = await seated({ seats: 2, fastMode });
-      const T = Number(g.ledger().roundDeadline) - DISPUTE_GRACE;
+      const T = Number(g.ledger().roundDeadline);
       const player = g.players[0]!.sk;
       g.sim.asPlayer(player);
       const b1 = g.sim.queryFor(0, 0n, 0n, maskOf());
@@ -2624,35 +2601,139 @@ describe('the three cut-offs (disputeGraceSecs)', () => {
       assert.equal(await g.sim.score(0, 0, T), BigInt(STAGE.idle));
     });
 
-    it(`an answer to a DIFFERENT hold exempts nothing (${label})`, async () => {
+    it(`an operator may answer after the deadline; the credit gives the wait back (${label})`, async () => {
       const g = await seated({ seats: 2, fastMode });
-      await rolledOnce(g, 0);
-      const late = Number(g.ledger().roundDeadline) - 2 * DISPUTE_GRACE + 1;
-      const player = g.players[0]!.sk;
-      g.sim.asPlayer(player);
-      const other = g.sim.queryFor(0, 0n, 1n, maskOf(1));
+      const D = Number(g.ledger().roundDeadline);
+      const askAt = D - 100;
+      g.sim.asPlayer(g.players[0]!.sk);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), askAt);
+      await g.sim.seatClock(0, askAt, true);
+      const answerAt = D + 200;
       g.sim.asOperator();
-      await g.sim.resolveRollRaw(0, 1, 0n, other, late);
-      g.sim.asPlayer(player);
+      await g.sim.resolveRoll(0, answerAt);
+      await g.sim.seatClock(0, answerAt, false);
+      // Waited 300 s; credited 300 + the slack on top of the round's deadline.
+      const seatD = D + 300 + CLOCK_SLACK;
+      assert.equal(g.ledger().seatDeadline.lookup(0n).deadline, BigInt(seatD));
+      assert.equal(g.ledger().seatAsk.lookup(0n).pending, false);
+      const { q, rem } = penaltySplit(g.config.tier, 0);
       await assert.rejects(
-        () => g.sim.hold(0, maskOf(0), late),
-        /too late in the round to ask for a roll/,
+        () => g.sim.eliminate(0, q, rem, seatD),
+        /round deadline has not passed/,
+      );
+      g.sim.asPlayer(g.players[0]!.sk);
+      assert.equal(await g.sim.score(0, 0, seatD), BigInt(STAGE.idle));
+    });
+
+    it(`a seat past its credited deadline is eliminable as before (${label})`, async () => {
+      const g = await seated({ seats: 2, fastMode });
+      const D = Number(g.ledger().roundDeadline);
+      g.sim.asPlayer(g.players[0]!.sk);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), D - 100);
+      await g.sim.seatClock(0, D - 100, true);
+      g.sim.asOperator();
+      await g.sim.resolveRoll(0, D - 90);
+      await g.sim.seatClock(0, D - 90, false);
+      const seatD = D + 10 + CLOCK_SLACK;
+      g.sim.asPlayer(g.players[0]!.sk);
+      await assert.rejects(() => g.sim.score(0, 0, seatD + 1), /round deadline has passed/);
+      const { q, rem } = penaltySplit(g.config.tier, 0);
+      await g.sim.eliminate(0, q, rem, seatD + 1);
+      assert.equal(g.ledger().seatProgress.lookup(0n).eliminated, true);
+    });
+
+    it(`an answered ask whose wait is not credited cannot be eliminated (${label})`, async () => {
+      // THE C009 move with one more step: answer late, skip the credit, eliminate.
+      const g = await seated({ seats: 2, fastMode });
+      const D = Number(g.ledger().roundDeadline);
+      g.sim.asPlayer(g.players[0]!.sk);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), D - 100);
+      await g.sim.seatClock(0, D - 100, true);
+      g.sim.asOperator();
+      await g.sim.resolveRoll(0, D + 50);
+      const { q, rem } = penaltySplit(g.config.tier, 0);
+      await assert.rejects(() => g.sim.eliminate(0, q, rem, D + 51), /not been credited yet/);
+      // Anyone may credit it -- here the player, a while later, which only helps the player.
+      await g.sim.seatClock(0, D + 80, false);
+      await assert.rejects(
+        () => g.sim.eliminate(0, q, rem, D + 81),
+        /round deadline has not passed/,
       );
     });
 
-    it(`an operator cannot answer late and eliminate at once (${label})`, async () => {
-      // THE attack the answer cut-off closes: stall until past the deadline, then answer -- which
-      // makes the seat the player's to owe -- and eliminate in the same breath.
+    it(`an unanswered marked ask is the operator's to owe, past any deadline (${label})`, async () => {
       const g = await seated({ seats: 2, fastMode });
-      const deadline = Number(g.ledger().roundDeadline);
+      const D = Number(g.ledger().roundDeadline);
       g.sim.asPlayer(g.players[0]!.sk);
-      await g.sim.openTurn(0, g.entropyFor(0, 0), deadline - 2 * DISPUTE_GRACE);
-      g.sim.asOperator();
-      await assert.rejects(() => g.sim.resolveRoll(0, deadline + 1), /too late in the round/);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), D);
+      await g.sim.seatClock(0, D, true);
       const { q, rem } = penaltySplit(g.config.tier, 0);
       await assert.rejects(
-        () => g.sim.eliminate(0, q, rem, deadline + 1),
-        /waiting on the operator, not the other way round/,
+        () => g.sim.eliminate(0, q, rem, D + 500),
+        /waiting on the operator|not been credited/,
+      );
+      // A credit with nothing answered does nothing.
+      await g.sim.seatClock(0, D + 500, false);
+      assert.equal(g.ledger().seatAsk.lookup(0n).pending, true);
+      assert.equal(g.ledger().seatDeadline.lookup(0n).round, 255n);
+    });
+
+    it(`the mark refuses an idle seat, an answered ask, and a second open ask (${label})`, async () => {
+      const g = await seated({ seats: 2, fastMode });
+      const D = Number(g.ledger().roundDeadline);
+      g.sim.asPlayer(g.players[0]!.sk);
+      await assert.rejects(() => g.sim.seatClock(0, D - 200, true), /asked for nothing/);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), D - 200);
+      g.sim.asOperator();
+      await g.sim.resolveRoll(0, D - 190);
+      await assert.rejects(() => g.sim.seatClock(0, D - 190, true), /already answered/);
+      g.sim.asPlayer(g.players[0]!.sk);
+      await g.sim.hold(0, maskOf(0), D - 180);
+      await g.sim.seatClock(0, D - 180, true);
+      await assert.rejects(() => g.sim.seatClock(0, D - 170, true), /still waiting/);
+    });
+
+    it(`the declared time is pinned within the clock's slack (${label})`, async () => {
+      const g = await seated({ seats: 2, fastMode });
+      const D = Number(g.ledger().roundDeadline);
+      g.sim.asPlayer(g.players[0]!.sk);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), D - 200);
+      // `pinTime`, as `join` and `closeRound`: within `timeSlackSecs()` (120 s) behind block time.
+      await assert.rejects(() => g.sim.seatClock(0, D - 199, true, D - 200), /ahead of block time/);
+      await assert.rejects(
+        () => g.sim.seatClock(0, D - 200 - TIME_SLACK, true, D - 200),
+        /further behind block time/,
+      );
+      await g.sim.seatClock(0, D - 200 - TIME_SLACK + 1, true, D - 200);
+    });
+
+    it(`the credit is capped clear of the operator-stalled grace (${label})`, async () => {
+      const g = await seated({ seats: 2, fastMode });
+      const D = Number(g.ledger().roundDeadline);
+      const cap = D + Number(g.config.tableTimeoutSecs) - TIMEOUT_FLOOR;
+      g.sim.asPlayer(g.players[0]!.sk);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), D - 10);
+      await g.sim.seatClock(0, D - 10, true);
+      const late = D + Number(g.config.tableTimeoutSecs) - 1;
+      g.sim.asOperator();
+      await g.sim.resolveRoll(0, late);
+      await g.sim.seatClock(0, late, false);
+      assert.equal(g.ledger().seatDeadline.lookup(0n).deadline, BigInt(cap));
+    });
+
+    it(`the credit is the seat's alone: the other seat keeps the round's deadline (${label})`, async () => {
+      const g = await seated({ seats: 2, fastMode });
+      const D = Number(g.ledger().roundDeadline);
+      g.sim.asPlayer(g.players[0]!.sk);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), D - 100);
+      await g.sim.seatClock(0, D - 100, true);
+      g.sim.asOperator();
+      await g.sim.resolveRoll(0, D + 100);
+      await g.sim.seatClock(0, D + 100, false);
+      g.sim.asPlayer(g.players[1]!.sk);
+      await assert.rejects(
+        () => g.sim.openTurn(1, g.entropyFor(1, 0), D + 1),
+        /round deadline has passed/,
       );
     });
   }
