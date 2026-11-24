@@ -1,0 +1,1311 @@
+// Copyright (C) Shielded Technologies
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * The settlement verifier: replay a whole game from the chain and nothing else.
+ *
+ *   npm run verify -w cli -- <table-address>
+ *
+ * WHAT IT IS GIVEN: a contract address. Nothing else -- no seeds, no player secrets, no run
+ * state, no artefacts from the process that played the game. It talks to a public indexer.
+ * Anyone can run it against anyone's table.
+ *
+ * WHAT IT PROVES. Once `settle` has revealed the seed, every die of every roll is a
+ * deterministic function of public data, so the whole game can be recomputed and compared:
+ *
+ *   1. the revealed seed opens the commitment the table was deployed with -- which was made
+ *      before any player existed, so the operator could not have chosen it to suit the dice;
+ *   2. every roll of every turn, re-derived from (tableId, seed, mixed entropy, round, roll
+ *      index) through the same byte ladder the circuit uses, matches the dice the chain
+ *      published -- and every REROLL is re-derived under the hold mask the player actually sent,
+ *      merged left to right over the rerolled positions;
+ *   3. the ROUND DIGEST CHAIN reproduces exactly, from the genesis digest through every join and
+ *      every round close. This is the part that makes 2 worth anything: every seat in round r
+ *      hashes the digest as it stood when round r OPENED, so no roll can be checked without
+ *      having replayed every earlier round in order;
+ *   4. every score, recomputed from the dice with api/src/rules.ts -- the contract-canonical
+ *      rules engine, not the circuit -- matches the scorecard the chain holds, box by box,
+ *      including the upper bonus and the five-of-a-kind bonuses;
+ *   5. the winner the tie-break selects, among SURVIVORS, is the seat the chain paid;
+ *   6. the settle transaction spent ZERO user inputs and created exactly the two expected
+ *      outputs, to the addresses recorded at join and at construction.
+ *
+ * WHAT IT CANNOT PROVE, stated honestly: that each seat's published entropy really is
+ * `H(sk_s, tableId, round)` for the secret committed at join. That binding is what the
+ * `playerMove` circuit asserts in zero knowledge, and it is unverifiable from public data by
+ * construction -- if it were verifiable, `sk_s` would be public. The verifier confirms that the
+ * chain accepted a proof of it, which is the whole point of the proof existing.
+ *
+ * -------------------------------------------------------------------------------------------
+ * HOW IT READS A GAME THAT HAS NO CURSOR
+ * -------------------------------------------------------------------------------------------
+ *
+ * The indexer gives the table's whole action list -- one entry per transaction, with an entry
+ * point and a block height -- and the contract's public state can be read at any block. So the
+ * verifier walks the actions in order and reads the state each one produced.
+ *
+ * TWO THINGS ARE HARDER THAN THEY WERE, and both are solved by diffing state rather than by
+ * being told:
+ *
+ *   - `playerMove` is ONE entry point for THREE moves. Which one it was is recovered from the
+ *     seat's stage transition: idle -> awaitRoll1 is an open, rolled{1,2} -> awaitRoll{2,3} is a
+ *     hold, rolled{1,2,3} -> idle is a score. The verifier also has to work out WHICH SEAT
+ *     moved, which it does by finding the one seat whose entry changed.
+ *   - the CATEGORY a player chose is not stored in the ledger (it is a circuit argument), so it
+ *     is recovered by diffing the seat's scorecard across the score. That is a stronger check
+ *     than being told: the verifier finds the box that changed AND recomputes what belongs in
+ *     it.
+ *
+ * The HOLD MASKS, by contrast, are readable: `seatTurn.hold1` and `hold2` are ledger state, so
+ * the verifier reads the mask the player sent and re-derives the reroll under it. A mask that
+ * did not produce the published dice fails check 2.
+ */
+
+import {
+  applyScore,
+  CATEGORY_COUNT,
+  emptyScorecard,
+  grandTotal,
+  type Category,
+  type Dice as RefDice,
+  type Scorecard,
+} from '@dust-dice/api';
+import {
+  answerKey,
+  askedIndex,
+  blindQuery,
+  deriveBlinding,
+  eliminationRefundTs,
+  emptyRoundResult,
+  firstRollTs,
+  forfeitsTs,
+  genesisDigestTs,
+  mixEntropyTs,
+  packHoldMask,
+  rerollUnderMaskTs,
+  revealedSeatSecret,
+  rollDigestFor,
+  roundDigestTs,
+  type RoundResultTs,
+  samePoint,
+  startDigestTs,
+  tableStartOrder,
+  vrfPublicKeyOf,
+} from '@dust-dice/contract';
+
+import type { Report, Verdict } from './report.ts';
+import {
+  diceToArray,
+  effectiveStage,
+  FINAL_ROUND,
+  hex,
+  ROUND_COUNT,
+  STAGE,
+  Table,
+  type TableLedger,
+} from './game.ts';
+import {
+  ledgerHoldings,
+  netByOwner,
+  sumOut,
+  sumOutFor,
+  type LogGroup,
+  type YachtRecord,
+} from './record.ts';
+
+const same = (a: Uint8Array, b: Uint8Array): boolean => hex(a) === hex(b);
+const MAX_SEATS = 6;
+
+/** The calls a turn is made of, merged into one transaction or spread over several. */
+const TURN_CALLS = new Set(['playerMove', 'resolveRoll']);
+
+/** The key commitments the start should seat, in seat order, from the slots just before it. */
+function startOrder(prev: TableLedger): Uint8Array[] {
+  return tableStartOrder(prev).map((i) => prev.seatIdentity.lookup(BigInt(i)).keyCommit);
+}
+
+/**
+ * The seat whose EFFECTIVE stage changed between two states, or -1.
+ *
+ * Effective, not the ledger's: a resolve moves no `seatTurn` cell at all -- it posts into the
+ * answer map -- and shows only as "asked, unanswered" becoming "asked, answered". A move that
+ * changed nothing at all is not a move.
+ */
+function movedSeat(prev: TableLedger, led: TableLedger): number {
+  for (let s = 0; s < Number(led.seatCount); s++) {
+    if (effectiveStage(prev, s) !== effectiveStage(led, s)) return s;
+  }
+  return -1;
+}
+
+function seatCard(led: TableLedger, seat: number): Scorecard {
+  const c = led.seatCard.lookup(BigInt(seat));
+  return {
+    scores: c.filled.map((f, i) => (f ? Number(c.scores[i]) : null)),
+    fiveOfAKindBonuses: Number(c.fiveOfAKindBonuses),
+  };
+}
+
+function arrayEq(a: readonly number[], b: readonly number[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/** All six slots' contributions to a round digest, read at the block the round closed. */
+function roundResults(led: TableLedger): RoundResultTs[] {
+  return Array.from({ length: MAX_SEATS }, (_, s) => {
+    if (s >= Number(led.seatCount)) return emptyRoundResult();
+    const p = led.seatProgress.lookup(BigInt(s));
+    return { dice: diceToArray(p.dice), out: p.eliminated };
+  });
+}
+
+/** What the verifier is tracking for one seat as it replays. */
+interface SeatReplay {
+  card: Scorecard;
+  /** The mixed entropy of the turn in progress, latched at roll 1. */
+  mixed?: Uint8Array;
+  /** The dice as the replay believes them, after each resolved roll. */
+  roll: number[];
+  /** How many rolls the current turn has revealed. */
+  rolls: number;
+  eliminated: boolean;
+  finishedAtRound: number;
+  /**
+   * The seat's `sk_s`, as its final score revealed it -- `undefined` for a seat that never got
+   * there. Without it no roll of this seat can be re-derived: every roll is `x*P` and `P` is
+   * built from this secret. The DLEQs and the key still verify; the dice themselves do not.
+   */
+  secret?: Uint8Array;
+  /**
+   * The roll the operator has answered but the player has not yet revealed: its index in the
+   * turn and the hold it was taken under. Set by a resolve, consumed by the next playerMove.
+   */
+  pending?: { index: number; mask: boolean[] };
+  /** The query this seat committed with its last move, for checking the answer against. */
+  query?: { round: number; index: number; blinded: { x: bigint; y: bigint } };
+}
+
+/**
+ * Custody, transaction by transaction, for a table in ANY phase -- an aborted table's refunds are
+ * as much the chain's to show as a settled one's payouts.
+ */
+async function checkCustody(
+  c: Report,
+  record: YachtRecord,
+  final: TableLedger,
+  groups: LogGroup[],
+): Promise<void> {
+  const house = final.house.bytes;
+  const practice = !house.every((b) => b === 0);
+  // ---------------------------------------------------------------------- custody, on chain
+  // EVERY transaction, not only `settle` and `redeem` (popper re-review C013, 2026-11-23). The
+  // simulator can check what a circuit CLAIMS to send; only the chain shows what moved. Three
+  // checks, each against the chain's own record:
+  //
+  //   1. after every transaction the contract HOLDS what its ledger says it holds -- `tier` per
+  //      held slot while filling, `pot + SUM(redeemable)` after the start -- so no circuit moved
+  //      an amount its bookkeeping does not show (docs/table-interface.md section 6);
+  //   2. NIGHT that left the contract went only to addresses the table recorded: a seat's or a
+  //      slot's join-time address, the rake address, the house -- and, where the state before
+  //      the transaction is readable, exactly as much as left the contract;
+  //   3. a slot refunded before the game -- a leave, the start's refunds of slots it did not
+  //      seat, an abort of a table that never filled -- got exactly `tier`, at its own address.
+  c.section('custody, transaction by transaction');
+  const MONEY = new Set(['eliminate', 'abortTable', 'settle', 'redeem']);
+  const heldAt = (led: TableLedger, i: number): Uint8Array | null => {
+    const addr = led.seatIdentity.lookup(BigInt(i)).addr.bytes;
+    return addr.every((b) => b === 0) ? null : addr;
+  };
+  let custodyChecks = 0;
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i]!;
+    c.at(g);
+    const what = `custody (${g.entryPoints.join('+')})`;
+    const filling = g.led.phase === Table.Phase.filling;
+    const holds = ledgerHoldings(g.led, filling);
+    c.ok(
+      `${what}: the contract holds exactly what its ledger records`,
+      g.balance === holds,
+      `holds ${g.balance}, ledger says ${holds}`,
+    );
+    custodyChecks += 1;
+    if (!g.entryPoints.some((k) => MONEY.has(k))) continue;
+
+    const prev = i > 0 ? groups[i - 1]! : undefined;
+    const tx = await record.tx(g.txHash);
+    const net = netByOwner(tx);
+    const known = new Set<string>([hex(final.rakeAddress.bytes)]);
+    if (practice) known.add(hex(house));
+    for (const led of [prev?.led, g.led]) {
+      if (!led) continue;
+      for (let s = 0; s < MAX_SEATS; s++) {
+        const a = heldAt(led, s);
+        if (a) known.add(hex(a));
+      }
+    }
+    let received = 0n;
+    const strangers: string[] = [];
+    for (const [owner, amount] of net) {
+      if (amount <= 0n) continue;
+      if (known.has(owner)) received += amount;
+      else strangers.push(`${owner.slice(0, 16)}… got ${amount}`);
+    }
+    c.ok(
+      `${what}: NIGHT left the contract only for addresses the table recorded`,
+      strangers.length === 0,
+      strangers.join('; '),
+    );
+    if (!prev || g.sharesBlock) {
+      c.note(`${what}: shares its block, so the amount that left is not separable`);
+      continue;
+    }
+    c.ok(
+      `${what}: what left the contract is exactly what those addresses received`,
+      prev.balance - g.balance === received,
+      `contract down ${prev.balance - g.balance}, received ${received}`,
+    );
+    custodyChecks += 2;
+
+    // 3. The slot refunds of a table that has not started, or is starting.
+    if (prev.led.phase !== Table.Phase.filling || final.tier === 0n) continue;
+    const seated = new Set<string>();
+    if (g.led.phase !== Table.Phase.filling && g.led.phase !== Table.Phase.aborted) {
+      for (let s = 0; s < Number(g.led.seatCount); s++) {
+        seated.add(hex(g.led.seatIdentity.lookup(BigInt(s)).keyCommit));
+      }
+    }
+    const owed = new Map<string, bigint>();
+    for (let s = 0; s < MAX_SEATS; s++) {
+      const was = heldAt(prev.led, s);
+      if (!was) continue;
+      const keyCommit = hex(prev.led.seatIdentity.lookup(BigInt(s)).keyCommit);
+      const refunded = g.entryPoints.includes('eliminate')
+        ? heldAt(g.led, s) === null // a leave frees exactly the leaver's slot
+        : !seated.has(keyCommit) || g.led.phase === Table.Phase.aborted;
+      if (refunded) owed.set(hex(was), (owed.get(hex(was)) ?? 0n) + final.tier);
+    }
+    for (const [owner, amount] of owed) {
+      c.ok(
+        `${what}: the slot refunded before the game got exactly its stake, at its own address`,
+        (net.get(owner) ?? 0n) === amount,
+        `${owner.slice(0, 16)}… got ${net.get(owner) ?? 0n}, owed ${amount}`,
+      );
+      custodyChecks += 1;
+    }
+  }
+  c.at('summary');
+  c.note(`${custodyChecks} custody checks over ${groups.length} transactions`);
+}
+
+/**
+ * Check a Yacht table's whole public record, reporting through `c`: verified, failed (a check
+ * failed), unverifiable (force-settled: no key to replay from), unseparable (verified except
+ * calls that could not be separated), or not-settled.
+ */
+export async function verifyYacht(record: YachtRecord, c: Report): Promise<Verdict> {
+  const address = record.address;
+  c.at(undefined);
+  c.section('table, as deployed');
+
+  const final = await record.final();
+  const seatCount = Number(final.seatCount);
+  const tableId = final.tableId;
+
+  c.note(`Yacht table ${address}`);
+  c.note(`tableId        ${hex(tableId)}`);
+  c.note(`tier           ${final.tier}   seats ${final.seatLimit}`);
+  c.note(
+    `vrfPublicKey   (${final.vrfPublicKey.x.toString(16)}, ${final.vrfPublicKey.y.toString(16)})`,
+  );
+  c.note(`phase          ${Table.Phase[final.phase]}`);
+  // The mode changes what "verified" covers (docs/fast-turn-design.md): dice and payouts verify
+  // identically in both, but hold-before-reveal ORDERING is chain-proven only on an on-chain-mode
+  // table — a fast table's turn lands as one composed transaction, so its ordering is the
+  // operator's attestation.
+  c.note(
+    `mode           ${final.fastMode ? 'FAST (turn ordering operator-attested)' : 'on-chain (ordering chain-proven)'}`,
+  );
+  // A PRACTICE table (table.compact section 10) pays no winner: the house gets back exactly its
+  // own stakes and every other stake goes to the rake address. The payout checks below follow it.
+  const house = final.house.bytes;
+  const practice = !house.every((b) => b === 0);
+  if (practice) c.note(`practice       house ${hex(house)} (no winner is paid)`);
+
+  // A table that never settled is NOT a failed verification: an aborted or still-playing table
+  // has not revealed its seed, so there is nothing to replay yet. Saying "FAILED" here would
+  // read as an accusation about a game that simply is not over.
+  if (final.phase !== Table.Phase.settled) {
+    c.note(
+      `NOT VERIFIABLE YET: this table is ${Table.Phase[final.phase]}. Only a settled table ` +
+        'reveals its VRF key, and without the key no roll can be re-derived. Nothing here ' +
+        'says the game was dishonest.',
+    );
+    // What CAN be checked now is where the money went: every refund and payout so far.
+    await checkCustody(c, record, final, await record.history());
+    return c.failed > 0 ? 'failed' : 'not-settled';
+  }
+
+  // --------------------------------------------------------------- 1. the key matches the seal
+  c.section('the revealed VRF key');
+  const x = final.revealedVrfSecret;
+  c.note(`x ${x.toString(16)}`);
+
+  // Zero on a SETTLED table is not a missing field -- it is the contract's marker for a game
+  // force-settled past the table deadline with no valid key. The payout was still fully
+  // determined by public state and every roll was proven in its own transaction while the game
+  // was live, but the game cannot be REPLAYED offline, which is exactly what this tool does. Say
+  // so and stop, rather than reporting a failure that suggests the chain did something wrong.
+  if (x === 0n) {
+    c.note(
+      'This table was FORCE-SETTLED: the operator never revealed a valid key before the ' +
+        'table deadline, so `settle` paid the winner computed from public state and left ' +
+        '`revealedVrfSecret` at zero. The rolls cannot be re-derived offline. Nothing here is ' +
+        'wrong; this game is simply unverifiable after the fact.',
+    );
+    return 'unverifiable';
+  }
+
+  const pk = vrfPublicKeyOf(x);
+  c.ok(
+    'the revealed key is the one behind the public key the table was deployed with',
+    samePoint(pk, final.vrfPublicKey),
+    `x*G = (${pk.x.toString(16)}, ${pk.y.toString(16)})`,
+  );
+
+  // ------------------------------------------------------------------------- walk the public log
+  const groups = await record.history();
+  const callCount = groups.reduce((n, g) => n + g.entryPoints.length, 0);
+  c.section(`the public log: ${callCount} calls in ${groups.length} transaction(s)`);
+
+  let digest = genesisDigestTs(tableId);
+  const seats: SeatReplay[] = Array.from({ length: seatCount }, (_, s) => ({
+    card: emptyScorecard(),
+    roll: [1, 1, 1, 1, 1],
+    rolls: 0,
+    eliminated: false,
+    finishedAtRound: Number.POSITIVE_INFINITY,
+    secret: revealedSeatSecret(final, s),
+  }));
+  const unreplayable = seats.map((r, i) => (r.secret === undefined ? i : -1)).filter((i) => i >= 0);
+  if (unreplayable.length > 0) {
+    c.note(
+      `seat(s) ${unreplayable.join(', ')} never reached a final score and revealed no secret: ` +
+        'their answers are checked against the key, but their dice cannot be re-derived offline.',
+    );
+  }
+
+  /** Roll 1 is taken under no hold. */
+  const NO_HOLD: boolean[] = [false, false, false, false, false];
+  /**
+   * The 32 bytes ONE roll's dice come from -- what the seed used to be, per roll. It does not
+   * depend on the player's blinding, which cancels; that is exactly why a replay can recompute
+   * a roll knowing only the key, the seat's secret and the public position in the game.
+   */
+  const digestFor = (seat: number, round: number, rollIndex: number, mask: readonly boolean[]) =>
+    rollDigestFor({
+      secret: x,
+      tableId,
+      round: BigInt(round),
+      rollIndex: BigInt(rollIndex),
+      holdMask: packHoldMask(mask),
+      seatSecret: seats[seat]!.secret!,
+    });
+  const replayable = (seat: number): boolean => seats[seat]!.secret !== undefined;
+
+  /**
+   * Check the roll a player's move just revealed against the one the replay derives, then
+   * advance the seat's replay state. Called from the HOLD and the SCORE branches of playerMove,
+   * because that is where the dice land now -- a resolve publishes only the operator's answer.
+   */
+  const revealPending = (seat: number, round: number, r: SeatReplay, chainDice: number[]) => {
+    const pending = r.pending;
+    if (!pending) {
+      c.ok(`seat ${seat} r${round}: a move revealed a roll the operator had answered`, false);
+      return;
+    }
+    r.pending = undefined;
+    c.ok(
+      `seat ${seat} r${round}: dice are all in 1..6`,
+      chainDice.every((d) => d >= 1 && d <= 6),
+      chainDice.join(','),
+    );
+    if (!replayable(seat)) {
+      // Proven live, in the player's own transaction; not re-derivable here. Track the chain's
+      // dice so the score and the digest checks below still line up.
+      r.roll = chainDice;
+      r.rolls += 1;
+      return;
+    }
+    if (!r.mixed) {
+      c.ok(`seat ${seat} r${round}: roll ${pending.index + 1} has a latched mix`, false);
+      return;
+    }
+    const expected =
+      pending.index === 0
+        ? firstRollTs(tableId, digestFor(seat, round, 0, NO_HOLD), r.mixed, round)
+        : rerollUnderMaskTs(
+            tableId,
+            digestFor(seat, round, pending.index, pending.mask),
+            r.mixed,
+            round,
+            pending.index,
+            pending.mask,
+            r.roll,
+          );
+    const label =
+      pending.index === 0
+        ? `roll 1`
+        : `roll ${pending.index + 1} under mask ${pending.mask.map((b) => (b ? 1 : 0)).join('')}`;
+    c.ok(
+      `seat ${seat} r${round}: ${label}`,
+      arrayEq(chainDice, expected),
+      `chain ${chainDice} vs replay ${expected}`,
+    );
+    if (pending.index > 0) {
+      // A held die must be byte-identical across the reroll -- the property the mask exists
+      // for, checked independently of the derivation above.
+      for (let d = 0; d < 5; d++) {
+        if (pending.mask[d] === true) {
+          c.ok(
+            `seat ${seat} r${round}: held die ${d} survived roll ${pending.index + 1}`,
+            chainDice[d] === r.roll[d],
+            `${r.roll[d]} -> ${chainDice[d]}`,
+          );
+        }
+      }
+    }
+    r.roll = expected;
+    r.rolls += 1;
+    rollChecks += 1;
+  };
+  let joins = 0;
+  let starts = 0;
+  let opens = 0;
+  let holds = 0;
+  let scores = 0;
+  let rollChecks = 0;
+  let closes = 0;
+  let eliminations = 0;
+
+  /** State immediately before the group being examined -- the previous group's, or the deploy's. */
+  const before = (i: number): TableLedger | undefined => (i === 0 ? undefined : groups[i - 1]!.led);
+  /** Turn calls this replay could not separate. Non-empty means the verdict is not a clean one. */
+  const unseparable: string[] = [];
+  /** Seats whose redemption has already been accounted for, so a second one is not double-read. */
+  const redeemed = new Set<number>();
+
+  /**
+   * A whole turn in ONE transaction -- the fast path, and the shape every fast table has.
+   *
+   * The chain never stored a state between the calls, so there is no "before" to diff. It does
+   * not need one: everything the turn consumed is still on the ledger afterwards -- the seat's
+   * entropy, the mixed entropy latched at roll 1, both hold masks, the last roll (`SeatTurn`) --
+   * and how many rolls the turn took is the transaction's own call count (one `resolveRoll1`
+   * plus N `resolveReroll` is N+1 rolls, against N+2 `playerMove`s: open, N holds, score).
+   *
+   * The roll chain is a hash chain: roll 2 is derived from roll 1 under the player's mask, roll 3
+   * from roll 2. So if roll 1 or roll 2 were not what the operator claimed, the LAST roll could
+   * not match the one the chain stored. Checking the end of the chain checks all of it.
+   *
+   * Reading only this seat's fields is what makes it sound when two seats settle in the same
+   * block: their turns touch disjoint cells, and the digest this replay folds is its own.
+   */
+  /**
+   * One round closing. Also reached for a close FOLDED into the last seat's settlement (below),
+   * which is why it is a function: the check is identical, and it reads the state AFTER the
+   * transaction either way — `closeRound` only reads `seatProgress` and writes the digest, the
+   * round and the deadline, so the per-seat cells it folded are the same before and after it.
+   */
+  const verifyCloseRound = (g: LogGroup): void => {
+    const led = g.led;
+    // The round is the replay's own count of closes, so a close that landed without effect
+    // cannot shift the chain.
+    const round = closes;
+    if (Number(led.openRound) !== round + 1) {
+      c.note(
+        `(a closeRound in block ${g.blockHeight} left openRound at ${led.openRound} -- ` +
+          'it landed on chain without effect; nothing to replay)',
+      );
+      return;
+    }
+    // The ONE place the digest advances. All six slots, in SEAT ORDER, read at this block --
+    // which is what makes the replay independent of the order the chain saw the moves in.
+    digest = roundDigestTs(digest, round, seatCount, roundResults(led));
+    closes += 1;
+    c.ok(
+      `round ${round}: digest chain`,
+      same(led.roundDigest, digest),
+      `chain ${hex(led.roundDigest)} vs replay ${hex(digest)}`,
+    );
+    c.ok(
+      `round ${round}: openRound advanced`,
+      Number(led.openRound) === round + 1,
+      `chain ${led.openRound}`,
+    );
+  };
+
+  const verifyMergedTurn = (g: LogGroup): void => {
+    const led = g.led;
+    const moves = g.entryPoints.filter((k) => k === 'playerMove').length;
+    const rolls = g.entryPoints.filter((k) => k === 'resolveRoll').length;
+    const rerolls = rolls - 1;
+    const where = `tx ${g.txHash.slice(0, 10)}… (block ${g.blockHeight})`;
+    if (rolls < 1 || rolls > 3 || moves !== rolls + 1) {
+      c.ok(
+        `${where}: reads as one turn`,
+        false,
+        `${moves} playerMove + ${rolls} resolveRoll is not open/(hold,resolve)*/score`,
+      );
+      return;
+    }
+
+    // WHICH SEAT. The candidates are the seats whose chain card holds a box this replay has not
+    // applied yet. With one candidate there is nothing to choose; with two (two seats settling
+    // in the same block) the roll derivation itself decides, since a wrong pairing cannot
+    // reproduce the stored roll.
+    const filled = (card: Scorecard): number => card.scores.filter((x) => x !== null).length;
+    const candidates: number[] = [];
+    for (let s = 0; s < seatCount; s++) {
+      if (filled(seatCard(led, s)) > filled(seats[s]!.card)) candidates.push(s);
+    }
+    if (candidates.length === 0) {
+      c.ok(`${where}: a seat's card gained a box`, false, 'no seat advanced');
+      return;
+    }
+
+    /** Re-derive the whole roll chain for one candidate; returns the final dice, or null. */
+    const deriveFor = (
+      seat: number,
+    ): { round: number; mixed: Uint8Array; dice: number[] } | null => {
+      if (!replayable(seat)) return null;
+      const turn = led.seatTurn.lookup(BigInt(seat));
+      const round = Number(turn.round);
+      const mixed = mixEntropyTs(turn.entropy, digest);
+      let dice = firstRollTs(tableId, digestFor(seat, round, 0, NO_HOLD), mixed, round);
+      for (let step = 1; step <= rerolls; step++) {
+        const mask = [...(step === 1 ? turn.hold1 : turn.hold2).bits];
+        dice = rerollUnderMaskTs(
+          tableId,
+          digestFor(seat, round, step, mask),
+          mixed,
+          round,
+          step,
+          mask,
+          dice,
+        );
+      }
+      return arrayEq(diceToArray(turn.roll), dice) ? { round, mixed, dice } : null;
+    };
+
+    let seat = candidates[0]!;
+    let derived = deriveFor(seat);
+    if (derived === null && candidates.length > 1) {
+      for (const alt of candidates.slice(1)) {
+        const d = deriveFor(alt);
+        if (d !== null) {
+          seat = alt;
+          derived = d;
+          break;
+        }
+      }
+    }
+    const turn = led.seatTurn.lookup(BigInt(seat));
+    const round = Number(turn.round);
+    const r = seats[seat]!;
+    opens += 1;
+    holds += rolls - 1;
+    rollChecks += rolls;
+
+    c.ok(
+      `seat ${seat} r${round}: mixed entropy folds the frozen round digest`,
+      same(turn.mixed, mixEntropyTs(turn.entropy, digest)),
+      `chain ${hex(turn.mixed)}`,
+    );
+    // A SEAT WHOSE SECRET WAS NEVER REVEALED -- the game ended before its final score, by a
+    // walkover or an abandonment -- cannot have its dice re-derived offline, exactly as on the
+    // on-chain path. They were proven live in this transaction; the score is still checked
+    // against them below. (Before 2026-11-23 this path tried the derivation anyway, failed it,
+    // and so never counted the turn: every fast game that ended early failed verification --
+    // devnet d00fb583, a walkover in round 1.)
+    const unrevealed = !replayable(seat);
+    if (unrevealed) {
+      derived = { round, mixed: turn.mixed, dice: diceToArray(turn.roll) };
+      c.ok(
+        `seat ${seat} r${round}: dice are all in 1..6 (secret unrevealed: not re-derivable)`,
+        derived.dice.every((d) => d >= 1 && d <= 6),
+        derived.dice.join(','),
+      );
+    } else {
+      c.ok(
+        `seat ${seat} r${round}: all ${rolls} roll(s) re-derive, chained under the player's masks`,
+        derived !== null,
+        derived === null
+          ? `chain stored ${diceToArray(turn.roll)} after ${rolls} roll(s); no derivation matches`
+          : '',
+      );
+    }
+    if (derived === null) return;
+    r.roll = derived.dice;
+    r.rolls = rolls;
+    r.mixed = derived.mixed;
+
+    // THE OPERATOR'S ANSWERS, one cell per roll. The three resolves of a merged turn run before
+    // its moves (bugs-found #35), so they could not check the query they answered against the
+    // seat's turn -- the moves did, one call later, and the turn settled, so they passed. Here
+    // the replay does it directly: with the seat's secret the query for each roll is
+    // re-derived, and with the key so is the answer.
+    for (let k = 0; !unrevealed && k < rolls; k++) {
+      const mask = k === 0 ? NO_HOLD : [...(k === 1 ? turn.hold1 : turn.hold2).bits];
+      const cell = led.vrfAnswer.lookup(answerKey(seat, k));
+      const expectedQuery = blindQuery({
+        tableId,
+        round: BigInt(round),
+        rollIndex: BigInt(k),
+        holdMask: packHoldMask(mask),
+        seatSecret: r.secret!,
+        blinding: deriveBlinding({
+          seatSecret: r.secret!,
+          tableId,
+          round: BigInt(round),
+          rollIndex: BigInt(k),
+          holdMask: packHoldMask(mask),
+        }),
+      }).blinded;
+      c.ok(
+        `seat ${seat} r${round}: answer ${k + 1} is to this seat's query for this round`,
+        Number(cell.round) === round && samePoint(cell.blinded, expectedQuery),
+        `cell round ${cell.round}`,
+      );
+      c.ok(
+        `seat ${seat} r${round}: answer ${k + 1} is the table key applied to that query`,
+        samePoint(cell.response, Table.pureCircuits.vrfScalarMul(expectedQuery, x)),
+      );
+    }
+
+    // SCORE. The category is whichever box the chain filled that this replay had not, and the
+    // placement is recomputed with the contract-canonical rules engine from the DERIVED dice.
+    const chainAfter = seatCard(led, seat);
+    const category = chainAfter.scores.findIndex((x, k) => x !== null && r.card.scores[k] === null);
+    c.ok(
+      `seat ${seat} r${round}: score filled exactly one new category`,
+      category >= 0 && filled(chainAfter) === filled(r.card) + 1,
+      `category index ${category}`,
+    );
+    if (category >= 0) {
+      scores += 1;
+      r.card = applyScore(r.card, category as Category, derived.dice as unknown as RefDice);
+      for (let k = 0; k < CATEGORY_COUNT; k++) {
+        c.ok(
+          `seat ${seat} r${round}: box ${k}`,
+          r.card.scores[k] === chainAfter.scores[k],
+          `replay ${r.card.scores[k]} vs chain ${chainAfter.scores[k]}`,
+        );
+      }
+      c.ok(
+        `seat ${seat} r${round}: running total`,
+        BigInt(grandTotal(r.card)) === led.seatProgress.lookup(BigInt(seat)).total,
+        `replay ${grandTotal(r.card)} vs chain ${led.seatProgress.lookup(BigInt(seat)).total}`,
+      );
+      c.ok(
+        `seat ${seat} r${round}: the dice the chain stored are the ones replayed`,
+        arrayEq(diceToArray(led.seatProgress.lookup(BigInt(seat)).dice), derived.dice),
+        `chain ${diceToArray(led.seatProgress.lookup(BigInt(seat)).dice)} vs replay ${derived.dice}`,
+      );
+      c.ok(
+        `seat ${seat} r${round}: score advances the seat past the round`,
+        Number(led.seatProgress.lookup(BigInt(seat)).round) === round + 1,
+      );
+      if (round === FINAL_ROUND) r.finishedAtRound = round;
+    }
+  };
+
+  for (let i = 0; i < groups.length; i++) {
+    // THE SEAT CLOCK (table.compact `seatClock`) moves no dice, score, money or round: it only
+    // times a seat's wait on the operator. A transaction may carry it around a move -- the
+    // operator's escalation answer with the credit last, or the page's mark or credit on its own --
+    // so it is set aside here and the rest of the transaction is checked as if it were alone.
+    const whole = groups[i]!;
+    c.at(whole);
+    const clocks = whole.entryPoints.filter((k) => k === 'seatClock').length;
+    const g =
+      clocks === 0
+        ? whole
+        : { ...whole, entryPoints: whole.entryPoints.filter((k) => k !== 'seatClock') };
+    if (clocks > 0) c.note(`(${clocks} seat clock call(s) in block ${g.blockHeight})`);
+    if (g.entryPoints.length === 0) continue;
+    const led = g.led;
+    const prev = before(i);
+    const isTurn = g.entryPoints.every((k) => TURN_CALLS.has(k));
+
+    // A turn merged into one transaction: checked against the state it produced.
+    if (isTurn && g.entryPoints.length > 1) {
+      verifyMergedTurn(g);
+      continue;
+    }
+    // A merged turn that also CLOSED THE ROUND: the operator folds `closeRound` into the last
+    // seat's settlement so the round ends in the block the score lands in. The turn is checked
+    // as any merged turn -- it reads the seat's own cells and the replay's frozen digest, neither
+    // of which the close touches -- and then the close is checked against the same after-state.
+    {
+      const turnCalls = g.entryPoints.filter((k) => TURN_CALLS.has(k));
+      const extras = g.entryPoints.filter((k) => !TURN_CALLS.has(k));
+      if (turnCalls.length > 1 && extras.length > 0 && extras.every((k) => k === 'closeRound')) {
+        verifyMergedTurn({ ...g, entryPoints: turnCalls });
+        for (let k = 0; k < extras.length; k++) verifyCloseRound(g);
+        continue;
+      }
+    }
+    // A SINGLE turn call sharing its block with another transaction. The per-call replay below
+    // needs the state before the call, and in a shared block the previous group's state is the
+    // state after both. Recording that is honest; checking against the wrong state is not.
+    if (isTurn && g.sharesBlock) {
+      unseparable.push(`${g.entryPoints[0]} in block ${g.blockHeight}`);
+      continue;
+    }
+
+    switch (g.entryPoints[0]) {
+      case 'join': {
+        // A join claims a SLOT (table.compact section 9) and moves nothing shared: no seat, no
+        // pot, no digest. The start is where those are checked. A join that landed and did
+        // nothing (its fallible section failed) is simply one more of these.
+        joins += 1;
+        c.note(`(a join in block ${g.blockHeight}: a slot claimed while filling)`);
+        break;
+      }
+
+      case 'playerMove': {
+        if (!prev) break;
+        const seat = movedSeat(prev, led);
+        if (seat < 0) {
+          c.ok('playerMove changed exactly one seat', false, 'no seat changed stage');
+          break;
+        }
+        const round = Number(prev.openRound);
+        // EFFECTIVE stages (0..6), like `STAGE` -- the ledger's own 0..3 says nothing about
+        // whether the roll was answered, and an open happens to read 0 -> 1 in both numberings,
+        // which is how a raw read here passed the opens and misread every hold (2026-09-21).
+        const wasStage = effectiveStage(prev, seat);
+        const nowStage = effectiveStage(led, seat);
+        const r = seats[seat]!;
+
+        if (wasStage === STAGE.idle && nowStage === STAGE.awaitRoll1) {
+          // OPEN. It latches the turn's mixed entropy: the entropy the player declared against
+          // the digest FROZEN AT ROUND OPEN -- which is the digest the replay is holding right
+          // now, because it only advances at a closeRound. Getting that ordering wrong is the
+          // easiest way to make an unverifiable game, so the latched value is checked.
+          opens += 1;
+          r.rolls = 0;
+          const opened = led.seatTurn.lookup(BigInt(seat));
+          const mixed = mixEntropyTs(opened.entropy, digest);
+          r.mixed = mixed;
+          c.ok(
+            `seat ${seat} r${round}: mixed entropy`,
+            same(opened.mixed, mixed),
+            `chain ${hex(opened.mixed)} vs replay ${hex(mixed)}`,
+          );
+          c.ok(
+            `seat ${seat} r${round}: open records the round`,
+            Number(led.seatTurn.lookup(BigInt(seat)).round) === round,
+          );
+          c.ok(
+            `seat ${seat} r${round}: open clears both hold masks`,
+            led.seatTurn.lookup(BigInt(seat)).hold1.bits.every((b) => !b) &&
+              led.seatTurn.lookup(BigInt(seat)).hold2.bits.every((b) => !b),
+          );
+        } else if (nowStage === STAGE.awaitRoll2 || nowStage === STAGE.awaitRoll3) {
+          // HOLD. The mask is ledger state, so it is read rather than guessed -- and the reroll
+          // it produces is checked against it when the resolve lands.
+          holds += 1;
+          const which = nowStage === STAGE.awaitRoll2 ? 'hold1' : 'hold2';
+          const mask = led.seatTurn.lookup(BigInt(seat))[which].bits;
+          c.ok(
+            `seat ${seat} r${round}: ${which} landed in its own cell`,
+            mask.length === 5,
+            `mask ${mask.map((b) => (b ? 1 : 0)).join('')}`,
+          );
+          // THE HOLD REVEALS THE ROLL it was chosen on. The operator's answer carried no dice;
+          // they appear here, in the player's transaction, and this is where they are checked.
+          revealPending(seat, round, r, diceToArray(led.seatTurn.lookup(BigInt(seat)).roll));
+        } else if (nowStage === STAGE.idle) {
+          // SCORE. The category is recovered by diffing the card, then recomputed.
+          scores += 1;
+          const chainBefore = seatCard(prev, seat);
+          const chainAfter = seatCard(led, seat);
+          const category = chainAfter.scores.findIndex(
+            (s, k) => s !== null && chainBefore.scores[k] === null,
+          );
+          c.ok(
+            `seat ${seat} r${round}: score filled exactly one new category`,
+            category >= 0 &&
+              chainAfter.scores.filter((s) => s !== null).length ===
+                chainBefore.scores.filter((s) => s !== null).length + 1,
+            `category index ${category}`,
+          );
+          // THE SCORE REVEALS THE LAST ROLL, into the progress record the digest folds.
+          revealPending(seat, round, r, diceToArray(led.seatProgress.lookup(BigInt(seat)).dice));
+          if (category >= 0) {
+            // The dice scored are the ones the replay derived for this turn -- NOT read from the
+            // chain. That is what makes this a check of the dice rather than of the bookkeeping.
+            const dice = r.roll;
+            // Recompute the placement with the CONTRACT-CANONICAL rules engine. If the chain and
+            // api/src/rules.ts ever disagree about a box, one of them is wrong -- and the rules
+            // engine is the specification.
+            r.card = applyScore(r.card, category as Category, dice as unknown as RefDice);
+            for (let k = 0; k < CATEGORY_COUNT; k++) {
+              c.ok(
+                `seat ${seat} r${round}: box ${k}`,
+                r.card.scores[k] === chainAfter.scores[k],
+                `replay ${r.card.scores[k]} vs chain ${chainAfter.scores[k]}`,
+              );
+            }
+            c.ok(
+              `seat ${seat} r${round}: running total`,
+              BigInt(grandTotal(r.card)) === led.seatProgress.lookup(BigInt(seat)).total,
+              `replay ${grandTotal(r.card)} vs chain ${led.seatProgress.lookup(BigInt(seat)).total}`,
+            );
+            c.ok(
+              `seat ${seat} r${round}: the dice the chain stored are the ones replayed`,
+              arrayEq(diceToArray(led.seatProgress.lookup(BigInt(seat)).dice), dice),
+              `chain ${diceToArray(led.seatProgress.lookup(BigInt(seat)).dice)} vs replay ${dice}`,
+            );
+          }
+          c.ok(
+            `seat ${seat} r${round}: score advances the seat past the round`,
+            Number(led.seatProgress.lookup(BigInt(seat)).round) === round + 1,
+          );
+          if (round === FINAL_ROUND) r.finishedAtRound = round;
+        } else {
+          c.ok(
+            `seat ${seat} r${round}: recognised playerMove`,
+            false,
+            `stage ${wasStage} -> ${nowStage}`,
+          );
+        }
+        break;
+      }
+
+      case 'resolveRoll': {
+        if (!prev) break;
+        const seat = movedSeat(prev, led);
+        if (seat < 0) {
+          // The resolve checks only the DLEQ; an answer to nothing any seat was asking -- wrong
+          // round, wrong query, wrong cell -- lands on chain and unlocks nothing.
+          c.note(
+            `(a resolveRoll in block ${g.blockHeight} answered nothing any seat was asking ` +
+              '-- it landed on chain without effect; nothing to replay)',
+          );
+          break;
+        }
+        const round = Number(prev.openRound);
+        const r = seats[seat]!;
+        const before = prev.seatTurn.lookup(BigInt(seat));
+        const turn = led.seatTurn.lookup(BigInt(seat));
+        const index = askedIndex(before.stage);
+        const cell = led.vrfAnswer.lookup(answerKey(seat, index));
+
+        // THE OPERATOR'S TRANSACTION CONTAINS NO DICE AND TOUCHES NO TURN. It posts `S = x*B`
+        // into the seat's answer cell for this roll, and the contract checked its DLEQ against
+        // the sealed key. With `x` now public the replay does something stronger than re-checking
+        // that proof: it recomputes `S` itself. A response that is not `x*B` is an operator that
+        // did not use the table's key -- which the DLEQ would also have caught, but this says so
+        // directly. And the cell must answer THIS seat's committed query for THIS round: the
+        // resolve could not check that (it reads nothing a move writes); the move that spent the
+        // answer did, and so does this.
+        c.ok(
+          `seat ${seat} r${round}: the answer is to this seat's query for this round`,
+          Number(cell.round) === round && samePoint(cell.blinded, before.blinded),
+          `cell round ${cell.round}`,
+        );
+        const expectedResponse = Table.pureCircuits.vrfScalarMul(before.blinded, x);
+        c.ok(
+          `seat ${seat} r${round}: the operator's answer is the table key applied to the query`,
+          samePoint(cell.response, expectedResponse),
+          `S = (${cell.response.x.toString(16).slice(0, 12)}…)`,
+        );
+        c.ok(
+          `seat ${seat} r${round}: a resolve reveals no dice`,
+          arrayEq(diceToArray(turn.roll), diceToArray(before.roll)),
+          'the roll cell must not move until the player unblinds',
+        );
+        c.ok(
+          `seat ${seat} r${round}: a resolve leaves the turn itself untouched`,
+          turn.stage === before.stage &&
+            samePoint(turn.blinded, before.blinded) &&
+            same(turn.mixed, before.mixed),
+          `stage ${before.stage} -> ${turn.stage}`,
+        );
+        // WHICH roll this answered comes from the seat's stage before the call -- the same place
+        // the move that spends it reads it -- and the hold it was taken under from the cell that
+        // hold landed in.
+        const mask = index === 0 ? NO_HOLD : [...(index === 1 ? before.hold1 : before.hold2).bits];
+        r.pending = { index, mask };
+        c.ok(
+          `seat ${seat} r${round}: no resolve moved the round digest`,
+          same(led.roundDigest, digest),
+          'only closeRound advances it',
+        );
+        rollChecks += 1;
+        break;
+      }
+
+      case 'closeRound': {
+        verifyCloseRound(g);
+        break;
+      }
+
+      case 'eliminate': {
+        // From the AFTER state, per seat: the seat this call took out is one the chain marks
+        // eliminated that the replay has not marked yet. The alternative — diffing against the
+        // previous group — is wrong the moment two seats are eliminated in one block, which is
+        // exactly what a table nobody is playing does.
+        let seat = -1;
+        for (let s = 0; s < seatCount; s++) {
+          if (!seats[s]!.eliminated && led.seatProgress.lookup(BigInt(s)).eliminated) {
+            seat = s;
+            break;
+          }
+        }
+        if (seat < 0) {
+          c.note(
+            led.phase === Table.Phase.filling
+              ? `(a player left the filling table in block ${g.blockHeight}: its stake went ` +
+                  'straight back to its own address -- at a practice table too, since no game ' +
+                  'means no fee -- ' +
+                  'and its slot was freed)'
+              : `(an eliminate in block ${g.blockHeight} marked no new seat -- it landed on ` +
+                  'chain without effect, or the replay had already accounted for it)',
+          );
+          break;
+        }
+        // The round the seat owed when it was taken out. NOT `seatProgress.round`, which an
+        // elimination sets to `roundCount()` to mean "finished", and not the chain's `openRound`,
+        // which a closeRound in the same block would already have advanced. The replay's own
+        // count of closed rounds is the open round by construction.
+        const round = closes;
+        eliminations += 1;
+        seats[seat]!.eliminated = true;
+        seats[seat]!.finishedAtRound = Number.POSITIVE_INFINITY;
+
+        // The penalty rule, recomputed rather than read. A timeout charges round + 1; a
+        // voluntary resignation is charged one round less — the open round does not count
+        // (`voluntary` is a public circuit argument, but the cheapest verification is the money
+        // itself: exactly one of the two schedules matches the redeemable delta, and which one
+        // tells us how the seat left).
+        const timeoutPenalty = (final.tier * BigInt(round + 1)) / 13n;
+        const resignPenalty = (final.tier * BigInt(round)) / 13n;
+        const delta = led.seatRedeemable.lookup(BigInt(seat));
+        const penalty = delta === final.tier - resignPenalty ? resignPenalty : timeoutPenalty;
+        // At a practice table the schedule does not apply (table.compact section 10): the house
+        // keeps its whole stake and anyone else keeps nothing, however the seat left -- so the
+        // money cannot say how, and is not asked to.
+        const addr = final.seatIdentity.lookup(BigInt(seat)).addr.bytes;
+        const how = practice
+          ? forfeitsTs(addr, house)
+            ? 'forfeited the fee'
+            : 'the house, kept whole'
+          : penalty === resignPenalty && resignPenalty !== timeoutPenalty
+            ? 'resigned'
+            : 'timed out';
+        const refund = eliminationRefundTs(final.tier, penalty, addr, house);
+        c.ok(
+          `seat ${seat}: eliminated at round ${round} keeps ` +
+            (practice ? 'its stake if the house, else nothing' : 'tier - penalty'),
+          delta === refund,
+          `expected +${refund} (${practice ? '' : `penalty ${penalty}, `}${how})`,
+        );
+        // The pot delta needs the state before this one call, so it is only checked where that
+        // state is readable — one transaction in the block. Where it is not, nothing is lost:
+        // the custody invariant below runs after every transaction and already pins the pot to
+        // `tier x seats` minus everything owed and paid, which is the claim that matters.
+        if (prev !== undefined && !g.sharesBlock) {
+          c.ok(
+            `seat ${seat}: the penalty stayed in the pot`,
+            led.pot === prev.pot - refund,
+            `pot ${prev.pot} -> ${led.pot}, expected -${refund}`,
+          );
+        }
+        c.ok(
+          `seat ${seat}: carries the never-finished sentinel`,
+          led.seatProgress.lookup(BigInt(seat)).finishedAtRound === 65535n,
+        );
+        c.note(
+          `(seat ${seat} ${how} at round ${round}: ` +
+            `${practice ? `keeps ${refund}` : `penalty ${penalty}`})`,
+        );
+        break;
+      }
+
+      case 'abortTable': {
+        // THE START (section 9) is this circuit on a filling table: the joiners take seats
+        // 0..n-1 in join order, and the digest absorbs every seat in one hash. A terminal abort
+        // is handled below, against the final state and the transaction.
+        if (led.phase !== Table.Phase.playing || (prev && prev.phase !== Table.Phase.filling))
+          break;
+        starts += 1;
+        const n = Number(led.seatCount);
+        const ids = Array.from({ length: n }, (_, s) => {
+          const id = led.seatIdentity.lookup(BigInt(s));
+          return { addr: id.addr.bytes, keyCommit: id.keyCommit };
+        });
+        digest = startDigestTs(digest, n, ids);
+        c.ok(
+          `the start: digest over its ${n} seats`,
+          same(led.roundDigest, digest),
+          `chain ${hex(led.roundDigest)} vs replay ${hex(digest)}`,
+        );
+        c.ok(
+          'the start: the pot is exactly the seated stakes',
+          led.pot === final.tier * BigInt(n) && led.activeSeats === BigInt(n),
+          `pot ${led.pot}, active ${led.activeSeats}`,
+        );
+        // Who was seated, and in what order, from the slots just before -- readable only where
+        // the start had its block to itself.
+        if (prev && !g.sharesBlock) {
+          const want = startOrder(prev);
+          c.ok(
+            'the start seated the earliest joiners, in join order, one seat per key',
+            want.length === n && want.every((k, s) => same(k, ids[s]!.keyCommit)),
+            `${want.length} expected, ${n} seated`,
+          );
+        }
+        break;
+      }
+
+      case 'settle':
+      case 'redeem':
+        // Handled below, against the final state and the transaction.
+        break;
+
+      default:
+        c.note(`(unrecognised entry point '${g.entryPoints[0] ?? '?'}' -- ignored)`);
+    }
+
+    // The custody invariant, at every single step: while the table holds the money, every atom
+    // it ever received is either in the pot or owed to a seat. The contract asserts this
+    // in-circuit at three points; this checks it after every transaction, from public state.
+    if (led.phase === Table.Phase.filling || led.phase === Table.Phase.playing) {
+      let owed = 0n;
+      let paid = 0n;
+      for (let s = 0; s < MAX_SEATS; s++) {
+        owed += led.seatRedeemable.lookup(BigInt(s));
+        paid += led.seatPaid.lookup(BigInt(s));
+      }
+      c.ok(
+        `tx ${i} (${g.entryPoints.join('+')}): custody invariant`,
+        led.pot + owed + paid === final.tier * led.seatCount,
+        `pot ${led.pot} + owed ${owed} + paid ${paid} != tier x ${led.seatCount}`,
+      );
+    }
+  }
+
+  c.at('summary');
+  c.section(
+    `replayed ${joins} joins, ${opens} opens, ${holds} holds, ${scores} scores, ` +
+      `${rollChecks} rolls, ${closes} round closes, ${eliminations} eliminations`,
+  );
+  c.ok(
+    'the table started once, seating every seat',
+    starts === 1 && joins >= seatCount,
+    `${starts} start(s), ${joins} join(s) for ${seatCount} seats`,
+  );
+  // On a walkover the survivor's in-flight turn is legitimately cut off by the settle: opened,
+  // dice possibly delivered, never scored. At most ONE such dangling open, and only theirs.
+  const danglingAllowed = seats.filter((s) => !s.eliminated).length === 1 ? 1 : 0;
+  c.ok(
+    'every live seat scored in every round',
+    opens - scores <= danglingAllowed && opens >= scores,
+    `${opens} turns opened, ${scores} scored (walkover allows ${danglingAllowed} dangling)`,
+  );
+  // A settled table need not have closed all thirteen rounds any more: the walkover (settle's
+  // `activeSeats == 1` disjunct) legitimately ends a game the moment one active seat remains.
+  // What must still hold is that the game either ran to the end or ended as a walkover — anything
+  // shorter with two or more survivors is a settle the contract should have refused.
+  const survivors = seats.filter((s) => !s.eliminated).length;
+  c.ok(
+    'the game ran to completion or ended as a walkover',
+    closes === ROUND_COUNT || survivors === 1,
+    `${closes} rounds closed of ${ROUND_COUNT}, ${survivors} non-eliminated seat(s)`,
+  );
+  c.ok(
+    'the final digest matches the chain',
+    same(final.roundDigest, digest),
+    `chain ${hex(final.roundDigest)} vs replay ${hex(digest)}`,
+  );
+
+  // -------------------------------------------------------------------------------- the winner
+  c.section('the winner');
+  const totals = seats.map((s) => grandTotal(s.card));
+  for (let seat = 0; seat < seatCount; seat++) {
+    const chainTotal = final.seatProgress.lookup(BigInt(seat)).total;
+    c.note(
+      `seat ${seat}: replay total ${totals[seat]}, chain total ${chainTotal}` +
+        `${seats[seat]!.eliminated ? ' (eliminated)' : ''}`,
+    );
+    c.ok(
+      `seat ${seat}: final total`,
+      BigInt(totals[seat]!) === chainTotal,
+      `replay ${totals[seat]} vs chain ${chainTotal}`,
+    );
+  }
+
+  // ELIMINATED SEATS CANNOT WIN. They have already been handed back `tier - penalty`; paying
+  // one the pot as well would pay it twice. Among survivors the order is highest total, then a
+  // completer over a non-completer, then the lowest seat -- and since every survivor completes
+  // at the same round, in practice it is total then seat index.
+  let expectedWinner = -1;
+  for (let seat = 0; seat < seatCount; seat++) {
+    if (seats[seat]!.eliminated) continue;
+    if (expectedWinner < 0) {
+      expectedWinner = seat;
+      continue;
+    }
+    const better =
+      totals[seat]! > totals[expectedWinner]! ||
+      (totals[seat] === totals[expectedWinner] &&
+        seats[seat]!.finishedAtRound < seats[expectedWinner]!.finishedAtRound);
+    if (better) expectedWinner = seat;
+  }
+  c.ok(
+    'the chain paid the seat the tie-break selects among survivors',
+    BigInt(expectedWinner) === final.winnerSeatIndex,
+    `replay ${expectedWinner} vs chain ${final.winnerSeatIndex}`,
+  );
+
+  // -------------------------------------------------------------------------------- the payout
+  c.section('the payout');
+  const settleGroup = groups.find((gr) => gr.entryPoints.includes('settle'));
+  if (settleGroup) c.at(settleGroup);
+  if (!settleGroup) {
+    c.ok('the settle transaction is in the log', false);
+  } else {
+    const tx = await record.tx(settleGroup.txHash);
+    const winnerAddr = final.seatIdentity.lookup(final.winnerSeatIndex).addr.bytes;
+    const rakeAddr = final.rakeAddress.bytes;
+    // `settle` pays out exactly the POT, which is the stakes minus whatever left it as an
+    // eliminated seat's refund. Read from the state just before the settle rather than assumed
+    // to be tier x seatCount, because an elimination moves money out of the pot.
+    const settleAt = groups.indexOf(settleGroup);
+    const potBefore = groups[settleAt - 1]!.led.pot;
+    const q = potBefore / 100n;
+
+    const spentByUsers = sumOut(tx.spent);
+    const created = sumOut(tx.created);
+    c.note(`settle tx ${tx.hash} in block ${tx.blockHeight}`);
+    for (const u of tx.created) {
+      c.note(`  created ${u.value} to ${u.owner.slice(0, 24)}…`);
+    }
+
+    // THE decisive row, and the same one that made Gate 0's `payOut` conclusive: a transaction
+    // that spends no user inputs while creating real native NIGHT can only be paying out of the
+    // contract's own balance. That is custody, demonstrated rather than asserted.
+    c.ok('settle spent ZERO user inputs', spentByUsers === 0n, `${spentByUsers} spent by users`);
+    c.ok(
+      'settle created exactly the pot',
+      created === potBefore,
+      `created ${created}, pot ${potBefore}`,
+    );
+    if (final.tier === 0n) {
+      // A free table (table.compact section 11): no stake, so nothing to pay anyone.
+      c.ok(
+        'free table: the pot was 0 and settle created nothing',
+        potBefore === 0n && created === 0n,
+      );
+    } else if (practice) {
+      // No winner is paid. Every house seat still in the game takes its `tier` back; the rest of
+      // the pot -- every other stake, and the people's stakes eliminated seats left in it -- is
+      // the rake's. (A house seat eliminated earlier holds its `tier` as a redeem, below.)
+      let houseSeats = 0n;
+      for (let s = 0; s < seatCount; s++) {
+        const id = final.seatIdentity.lookup(BigInt(s)).addr.bytes;
+        if (!final.seatProgress.lookup(BigInt(s)).eliminated && !forfeitsTs(id, house))
+          houseSeats += 1n;
+      }
+      const homeStakes = final.tier * houseSeats;
+      c.ok(
+        'practice: the house got back exactly its stakes still in the game',
+        sumOutFor(tx.created, house) === homeStakes,
+        `expected ${homeStakes}`,
+      );
+      c.ok(
+        'practice: the rake took the rest of the pot, whole -- no winner was paid',
+        sumOutFor(tx.created, rakeAddr) === potBefore - homeStakes,
+        `expected ${potBefore - homeStakes}`,
+      );
+    } else {
+      c.ok(
+        'the winner was paid pot - q, at the address recorded at join',
+        sumOutFor(tx.created, winnerAddr) === potBefore - q,
+        `expected ${potBefore - q}`,
+      );
+      c.ok(
+        'the rake was paid q, at the address sealed at construction',
+        sumOutFor(tx.created, rakeAddr) === q,
+        `expected ${q}`,
+      );
+    }
+    c.ok('the pot is empty afterwards', final.pot === 0n, `pot field ${final.pot}`);
+  }
+
+  // ------------------------------------------------------------------------------- redemptions
+  const redeems = groups.filter((gr) => gr.entryPoints.includes('redeem'));
+  if (redeems.length > 0) {
+    c.section(`${redeems.length} redemption(s)`);
+    for (const gr of redeems) {
+      c.at(gr);
+      // The seat and the amount both come from the state AFTER the redeem: `seatPaid` is what
+      // the contract recorded paying, and it is per seat. Reading "what it was owed" from the
+      // previous group instead would be wrong the moment two seats redeem in one block, which
+      // is exactly what an aborted table does.
+      let seat = -1;
+      for (let s = 0; s < seatCount; s++) {
+        if (
+          !redeemed.has(s) &&
+          gr.led.seatPaid.lookup(BigInt(s)) > 0n &&
+          gr.led.seatRedeemable.lookup(BigInt(s)) === 0n
+        ) {
+          seat = s;
+          break;
+        }
+      }
+      if (seat < 0) {
+        c.ok('a redeem zeroed exactly one seat', false);
+        continue;
+      }
+      redeemed.add(seat);
+      const owed = gr.led.seatPaid.lookup(BigInt(seat));
+      const tx = await record.tx(gr.txHash);
+      const addr = final.seatIdentity.lookup(BigInt(seat)).addr.bytes;
+      c.note(`seat ${seat} redeemed ${owed}`);
+      c.ok(
+        `redeem seat ${seat}: paid exactly what it was owed, to its join-time address`,
+        sumOutFor(tx.created, addr) === owed,
+        `expected ${owed}`,
+      );
+      // RECORDED, NOT ASSERTED, and the asymmetry with `settle` above is deliberate. The
+      // decisive custody claim is the amount and the recipient, which are asserted. Whether the
+      // CALLER also spent native inputs depends on how its wallet happened to fund the fee --
+      // `settle` was measured at zero in the previous E2E run while `abortTable`, called by the
+      // same wallet, was not. Asserting zero here would make the verifier fail for a reason that
+      // says nothing about the contract.
+      c.note(`  (caller spent ${sumOut(tx.spent)} of its own inputs)`);
+    }
+  }
+
+  await checkCustody(c, record, final, groups);
+
+  // Steps this method genuinely could not separate. Not a failure of the game and not a pass
+  // either: an on-chain table whose seats moved in the same block leaves those individual calls
+  // unattributable, and saying so beats both a false alarm and a false clean bill.
+  if (unseparable.length > 0) {
+    c.at('summary');
+    c.section(`${unseparable.length} call(s) this replay could not separate`);
+    for (const u of unseparable) c.note(u);
+    c.note(
+      'Each shared its block with another transaction, so the state before it is not ' +
+        'readable. Everything else above was checked. A FAST table never lands here: its ' +
+        'whole turn is one transaction and is verified as a unit.',
+    );
+  }
+  if (c.failed > 0) return 'failed';
+  return unseparable.length > 0 ? 'unseparable' : 'verified';
+}
