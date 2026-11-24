@@ -77,6 +77,7 @@ import {
   TableSimulator,
   userAddress,
   type TableConfig,
+  type TableModule,
   type UserAddress,
 } from './simulator.ts';
 
@@ -161,6 +162,8 @@ export type TableOptions = {
   inviteHash?: Uint8Array;
   /** Make it a practice table with this house (table.compact section 10). Defaults to ordinary. */
   house?: UserAddress;
+  /** Another build of the table (a mutant: custody-mutants.test.ts). Defaults to src/managed. */
+  contract?: TableModule;
 };
 
 export function tableConfig(opts: TableOptions): TableConfig {
@@ -467,7 +470,7 @@ export class GameDriver {
   ): Promise<GameDriver> {
     const config = tableConfig(opts);
     const players = makePlayers(opts.seats);
-    const sim = await TableSimulator.create(config, startAt);
+    const sim = await TableSimulator.create(config, startAt, opts.contract);
     return new GameDriver(sim, config, players, startAt, plan);
   }
 

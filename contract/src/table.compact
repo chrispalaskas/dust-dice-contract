@@ -532,7 +532,7 @@ pure circuit timeoutSlackFactor(): Uint<64> {
  * THE SEAT CLOCK (docs/fast-turn-dispute.md, 2026-11-23). A seat's time stops while the operator
  * owes it an answer it asked for ON CHAIN, and the wait is added to that seat's own deadline.
  *
- *   mark     seatClock(s, now, true)   in the same transaction as the player's on-chain ask
+ *   mark     seatClock(s, now, true)   the player's next transaction after its on-chain ask
  *                                      (an escalated open, or a hold played on chain): records
  *                                      `now`, pinned within `timeSlackSecs()` of block time
  *   credit   seatClock(s, now, false)  after the operator's answer, by the operator in its answer
@@ -558,8 +558,18 @@ pure circuit timeoutSlackFactor(): Uint<64> {
  * than `timeSlackSecs() * timeoutSlackFactor()` before `abortTable`'s operator-stalled grace
  * expires: the operator always has that long to answer the last possible ask.
  */
+/**
+ * EQUAL TO `timeSlackSecs()`, AND DEFINED AS IT, ON PURPOSE (popper re-review C043, 2026-11-23).
+ * Both declared times may trail block time by up to `timeSlackSecs()` (`pinTime`). Whoever sends
+ * the credit -- normally the operator, whose wait it is -- can therefore declare its `now` that
+ * much early and shorten the measured wait by as much. A bonus of the same size cancels the
+ * largest such understatement, so a seat is never credited less than it actually waited. (At
+ * 60 s, an operator could keep 59 s of a player's wait.) The price is the other direction: a
+ * credit sent honestly, or a mark backdated by the player, over-credits by up to this much --
+ * which only lengthens the round, within the cap.
+ */
 pure circuit clockSlackSecs(): Uint<64> {
-  return 60;
+  return timeSlackSecs();
 }
 
 /** Rake denominator. 1% -- `scoring-core.compact`'s `rakeIsValid` hard-codes the 100. */
@@ -2230,22 +2240,24 @@ export circuit resolveRoll(seat: Uint<8>,
  * THE SEAT CLOCK (see `clockSlackSecs`): stop a seat's time while the operator owes it an answer
  * it asked for on chain, and give that time back once the answer is in.
  *
- *   mark = true    the player, in the same transaction as its on-chain ask, AFTER the
- *                  `playerMove`: records the ask and `now`. Refused if the ask is already
- *                  answered (there is nothing to wait for) or a previous ask still waits.
+ *   mark = true    the player, in its own transaction right after its on-chain ask lands
+ *                  (midnight-js runs the calls of one scoped transaction in random segment
+ *                  order, so the two cannot share one): records the ask and `now`. Refused if
+ *                  the ask is already answered (there is nothing to wait for) or a previous ask
+ *                  still waits. Permissionless, like the credit: marking an ask early only helps
+ *                  the seat that made it.
  *   mark = false   after the operator's answer: credits the wait. The operator places this LAST
  *                  in its answer, after any held moves it lands with it, so none of them reads a
  *                  `seatDeadline` it was not proven against. Permissionless: if the operator
  *                  leaves it out, the player (or anyone) credits it, and `eliminate` refuses the
  *                  seat until someone has. A call with nothing to credit does nothing.
  *
- * Either way a credit due is applied first, so a player's next on-chain move can carry
- * [credit, move, mark] and never lose a wait the operator did not credit.
+ * Either way a credit due is applied first, so a mark never discards a wait nobody credited.
  *
  * THE CREDIT is the wait plus `clockSlackSecs()`. Both declared times may trail block time (by
- * up to `timeSlackSecs()`, `pinTime`); the bonus offsets an operator that declares its answer
- * early, and errs toward the player -- a short-changed credit is the operator's gain, a generous
- * one only delays the round. It is CAPPED at `roundDeadline + tableTimeoutSecs`
+ * up to `timeSlackSecs()`, `pinTime`); the bonus is exactly that slack, so an operator that
+ * declares its answer as early as the pin allows still credits the whole wait (see
+ * `clockSlackSecs`), and an honest credit errs toward the player -- which only delays the round. It is CAPPED at `roundDeadline + tableTimeoutSecs`
  * less `timeSlackSecs() * timeoutSlackFactor()` (the 240 s timeout floor), so a seat can never
  * ask so late that the operator has less than that to answer before `abortTable`'s
  * operator-stalled grace expires (security-audit-2026-09 Finding A stays closed).

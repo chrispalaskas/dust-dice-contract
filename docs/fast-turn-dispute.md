@@ -81,12 +81,12 @@ reveals, which its proof already saw filled.
 asked for on chain, and the wait is added to that seat's own deadline. No cut-offs: the operator
 may answer whenever it likes, and the player keeps the time it had.
 
-| Call                       | Who, when                                              | Effect                                                                                |
-| -------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------- |
-| `seatClock(s, now, true)`  | the player, in the same transaction as an on-chain ask | records the ask and `now` (pinned like `join`)                                        |
-| `seatClock(s, now, false)` | the operator, last in its answer (or anyone, later)    | adds the wait + 60 s (`clockSlackSecs`) to `seatDeadline[s]`; no-op if nothing is due |
-| `playerMove` (finish)      | every move                                             | refused past the seat's deadline (Finding A)                                          |
-| `eliminate`                | anyone                                                 | past the seat's deadline, and **not while a credit is due**                           |
+| Call                       | Who, when                                                | Effect                                                                                 |
+| -------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `seatClock(s, now, true)`  | the player, in its own transaction after an on-chain ask | records the ask and `now` (pinned like `join`)                                         |
+| `seatClock(s, now, false)` | the operator, last in its answer (or anyone, later)      | adds the wait + 120 s (`clockSlackSecs`) to `seatDeadline[s]`; no-op if nothing is due |
+| `playerMove` (finish)      | every move                                               | refused past the seat's deadline (Finding A)                                           |
+| `eliminate`                | anyone                                                   | past the seat's deadline, and **not while a credit is due**                            |
 
 - **The credit is a separate cell from the mark.** `seatAsk` (the mark) is read by no move, and
   `seatDeadline` (the credit) is written only by the credit, which the operator places last in an
@@ -94,9 +94,14 @@ may answer whenever it likes, and the player keeps the time it had.
   answer reads the same `seatDeadline` it was proven against.
 - **An answer without its credit is not an elimination.** Otherwise an operator could answer late,
   skip the credit and eliminate the next second. `eliminate` refuses a seat with a credit due;
-  anyone may send the credit, and the page sends it first with the player's next move.
-- **The 60 s bonus** offsets declared times that trail block time (`pinTime` allows 120 s). It errs
-  toward the player: a short credit is the operator's gain, a long one only delays the round.
+  anyone may send the credit: the page sends it before the player's next move when the seat's
+  uncredited deadline is under 45 s away, and the rescue panel offers it (`nextRescueStep`
+  `credit`) when the operator answered and went quiet.
+- **The 120 s bonus** is `timeSlackSecs()`, the most a declared time may trail block time
+  (`pinTime`). Whoever sends the credit can shorten the measured wait by up to that much, so the
+  bonus cancels it: a seat is never credited less than it waited. (At 60 s, an operator could keep
+  59 s of a player's wait: popper re-review C043.) An honest credit over-credits by up to 120 s,
+  which only lengthens the round. The wait is measured to the credit, not to the answer.
 - **The cap.** A seat's deadline is never credited past `roundDeadline + tableTimeoutSecs - 240 s`,
   so the operator always has at least the 240 s timeout floor to answer the last possible ask
   before `abortTable`'s operator-stalled grace expires (Finding A stays closed).
@@ -122,8 +127,11 @@ Prover key size doubles with each step of k, so a near-identical key means no ci
 
 ## What it costs
 
-- **When everyone plays:** nothing extra. A fast turn must land by the seat's deadline; the channel
-  stops admitting one 10 s before it (`ADMIT_MARGIN_SECS`).
+- **When everyone plays, fast table:** nothing extra. A fast turn must land by the seat's
+  deadline; the channel stops admitting one 10 s before it (`ADMIT_MARGIN_SECS`).
+- **When everyone plays, on-chain table:** two extra transactions per roll asked for -- the
+  player's mark (a second wallet prompt) and the operator's credit. A three-roll turn is 13
+  transactions where it was 7. The mark runs alongside the answer and the credit after it.
 - **Player walks away:** the same as before. The seat is idle on chain and is eliminated past the
   deadline.
 - **Player escalates:** one on-chain open with its mark (the player pays it), one operator
@@ -132,12 +140,18 @@ Prover key size doubles with each step of k, so a near-identical key means no ci
 - **Operator gone:** the seat is shielded, and the stalled-operator abort refunds the table at
   `roundDeadline + tableTimeoutSecs`, as on an on-chain table.
 
-## Not done yet
+## Done on the devnet (2026-11-23)
 
-- **On-devnet check:** the escalation answer (a bundle without its open, with resolves rebuilt on
-  the live state) is unit-tested against a fake chain only.
-- **Guaranteed-phase class:** `resolveRoll` grew by 17 instructions, and its prover key is the same
-  size, so its k is unchanged. That it is still small enough to run in the guaranteed phase of a
-  merged fast turn (bugs-found #35) needs the devnet run to confirm.
+- **Escalation answer:** an escalated ask with the operator stopped for 90 s was answered, and the
+  credit moved the seat's deadline 14:33:13 -> 14:35:43 (then with the 60 s bonus).
+- **Guaranteed-phase class:** a scripted 13-round fast game settled 26 turns with no failure, so
+  `resolveRoll` still runs where the merged turn needs it.
+
+## Accepted, not fixed
+
+- **The wait before escalating is not given back.** The clock starts at the on-chain mark. Time a
+  fast player spends waiting on the operator's channel before the page offers to escalate (up to
+  three 30 s request timeouts, or never on a refusal) is not credited. Choosing a fast table is
+  choosing to rely on the operator for that much (decision 2026-11-23, popper re-review C045).
 - **Bot client:** `cli/src/player/yacht-fast-turn.ts` does not escalate. A bot whose operator
   stops is eliminated as before; that only affects practice tables.

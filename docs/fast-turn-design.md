@@ -48,6 +48,13 @@ on-chain, using the existing seven k≤15 circuits unchanged:
 
 ### Why this adds no new trust
 
+> **Corrected 2026-11-23 (popper re-review C038).** This section is the September design's
+> reasoning, written when dice came from an operator seed. With the blind VRF it is not true as
+> stated: on a fast table the operator holds a player's proven moves, and the dice they reveal,
+> BEFORE the turn lands, so it can go quiet after a roll it dislikes. That is new trust, and the
+> remedy is the player's: play the rest of the turn on chain, where the seat cannot be eliminated
+> while it waits and its clock stops (`docs/fast-turn-dispute.md`).
+
 - The operator already knows the seed, and once the player's entropy is public it can compute
   the player's entire game tree. "The operator does not leak the tree" is ALREADY v1's trust
   assumption; off-chain reveals gated on signed holds add nothing to it.
@@ -64,6 +71,11 @@ path — the transcript settlement is the only way the turn can end. Consequence
 the operator vanishes mid-fast-turn, the seat parks until the existing operator-stall abort
 refunds the table. Safe, mildly griefable (a fast-opened seat that vanishes drags the table to
 the abort deadline), economically blunted by the resignation discount.
+
+> **Superseded 2026-11-20.** A seat no longer parks: the player escalates, landing the same open
+> on chain from its own wallet, and the operator must answer there with every move it holds
+> (`docs/fast-turn-dispute.md`). The defection hazard stays closed because the escalated open is
+> the same forced open, and holds the operator already has land as they were sent.
 
 ## The platform evidence (source-verified 2026-09-02)
 

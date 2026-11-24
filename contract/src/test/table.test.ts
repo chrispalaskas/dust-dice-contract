@@ -153,11 +153,12 @@ const digestFor = (
 /** `noFinish()` -- the sentinel standing in for `rules.ts`'s `Infinity`. */
 const NO_FINISH = 65535n;
 /**
- * table.compact's `clockSlackSecs()`: a declared clock time may trail block time by less than
- * this, and every credit adds it. Not an exported circuit, so mirrored here; the seat-clock tests
- * fail at their boundary if it drifts.
+ * table.compact's `clockSlackSecs()`, which every credit adds: defined as `timeSlackSecs()` (how
+ * far a declared time may trail block time), so the earliest declarable credit still covers the
+ * whole wait. Not an exported circuit, so mirrored here; the seat-clock tests fail at their
+ * boundary if it drifts.
  */
-const CLOCK_SLACK = 60;
+const CLOCK_SLACK = 120;
 /** table.compact `timeSlackSecs()`: how far a declared time may trail block time (`pinTime`). */
 const TIME_SLACK = 120;
 /** `timeSlackSecs() * timeoutSlackFactor()`: the floor the seat clock's cap keeps clear of. */
@@ -2623,6 +2624,29 @@ describe("the seat clock (seatClock): no cut-offs, and the operator's wait is gi
       );
       g.sim.asPlayer(g.players[0]!.sk);
       assert.equal(await g.sim.score(0, 0, seatD), BigInt(STAGE.idle));
+    });
+
+    it(`a credit declared as early as the pin allows still covers the whole wait (${label})`, async () => {
+      // popper re-review C043: whoever sends the credit may declare its time up to
+      // TIME_SLACK - 1 s behind block time, shortening the measured wait by as much. The bonus
+      // must cover it: the seat is never credited less than it waited.
+      const g = await seated({ seats: 2, fastMode });
+      const D = Number(g.ledger().roundDeadline);
+      g.sim.asPlayer(g.players[0]!.sk);
+      await g.sim.openTurn(0, g.entropyFor(0, 0), D - 100);
+      await g.sim.seatClock(0, D - 100, true);
+      const answerAt = D + 200; // waited 300 s
+      g.sim.asOperator();
+      await g.sim.resolveRoll(0, answerAt);
+      await g.sim.seatClock(0, answerAt - TIME_SLACK + 1, false, answerAt);
+      const credited = Number(g.ledger().seatDeadline.lookup(0n).deadline);
+      assert.ok(
+        credited >= D + 300,
+        `credited ${credited - D} s past the round deadline for a 300 s wait`,
+      );
+      // And the player's move at the last second of the whole wait is still taken.
+      g.sim.asPlayer(g.players[0]!.sk);
+      assert.equal(await g.sim.score(0, 0, D + 300), BigInt(STAGE.idle));
     });
 
     it(`a seat past its credited deadline is eliminable as before (${label})`, async () => {

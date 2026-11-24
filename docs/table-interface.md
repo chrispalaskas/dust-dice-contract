@@ -179,12 +179,17 @@ All-true is legal but pointless — score instead.
 
 The seat clock (`docs/fast-turn-dispute.md` section 5). `now` is pinned like `join`'s
 (`pinTime`). A credit due -- a marked ask of this round, now answered -- is applied first: the
-wait (`now - askedAt`) plus `clockSlackSecs()` (60 s) is added to `seatDeadline[seat]`, capped at
-`roundDeadline + tableTimeoutSecs - 240`. Then, with `mark`, the seat's current ask (it must be
-asking, unanswered, and no earlier ask may still wait) is recorded in `seatAsk[seat]` with `now`.
-Without `mark` and with nothing due it does nothing. Wholly fallible (`resolveBallast`), so it may
-follow a `playerMove` in one transaction. The page sends `[credit if due, playerMove, mark for an
-ask]`; the operator sends the credit after its answer, last in an escalation answer.
+wait (`now - askedAt`) plus `clockSlackSecs()` is added to `seatDeadline[seat]`, capped at
+`roundDeadline + tableTimeoutSecs - 240`. `clockSlackSecs()` is `timeSlackSecs()` (120 s), so a
+credit declared as early as the pin allows still covers the whole wait. Then, with `mark`, the
+seat's current ask (it must be asking, unanswered, and no earlier ask may still wait) is recorded
+in `seatAsk[seat]` with `now`. Without `mark` and with nothing due it does nothing. Wholly
+fallible (`resolveBallast`), so it may follow `playerMove`s in one transaction built with explicit
+segments. The page sends the move and then the mark as TWO transactions (midnight-js runs the
+calls of one scoped transaction in random segment order), and its own credit only when one is due
+within 45 s of the seat's deadline; the operator sends the credit after its answer, last in an
+escalation answer. The wait is measured to the credit, not to the answer, so a late credit (the
+rescue panel's) gives a little more than the wait -- never past the cap.
 
 ### `resolveRoll(seat, rollIndex, round, blinded, response, dleqA1, dleqA2, dleqZ): []` — operator
 

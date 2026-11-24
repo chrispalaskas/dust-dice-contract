@@ -56,6 +56,41 @@ describe('rescuing a stuck table: what to offer, and does the chain accept it', 
     assert.equal(g.ledger().seatProgress.lookup(0n).eliminated, true);
   });
 
+  it('an answered ask the operator never credited: CREDIT it, then eliminate (popper C047)', async () => {
+    // The operator answered a marked on-chain ask and stopped before crediting the wait (the
+    // CLI sends the two as separate transactions). `eliminate` refuses an uncredited seat, so
+    // without a credit step the planner had nothing to offer and the table sat there.
+    const g = await seated(2);
+    const D = Number(g.ledger().roundDeadline);
+    g.sim.asPlayer(g.players[0]!.sk);
+    await g.sim.openTurn(0, g.entropyFor(0, 0), D - 100);
+    await g.sim.seatClock(0, D - 100, true);
+    g.sim.asOperator();
+    await g.sim.resolveRoll(0, D - 90);
+    await g.playTurn(1, 0); // seat 2 finishes the round; seat 1 then walks away
+
+    const now = BigInt(D + 1000);
+    const step = nextRescueStep(g.ledger(), now);
+    assert.equal(step.kind, 'credit', step.why);
+    assert.equal(step.kind === 'credit' && step.seat, 0);
+    // The call the panel submits, accepted: `mark=false`, any caller.
+    await g.sim.seatClock(0, Number(now), false);
+    assert.equal(g.ledger().seatAsk.lookup(0n).pending, false);
+
+    // Then the ordinary path resumes, against the CREDITED deadline. The wait is measured to the
+    // credit, not to the answer (the answer carries no time), so a late credit gives the seat
+    // more than it waited -- never past the cap.
+    const credited = g.ledger().seatDeadline.lookup(0n).deadline;
+    assert.ok(credited >= now, 'a late credit still leaves the seat its time');
+    assert.equal(nextRescueStep(g.ledger(), credited).kind, 'none');
+    const later = credited + 1n;
+    const next = nextRescueStep(g.ledger(), later);
+    assert.equal(next.kind, 'eliminate', next.why);
+    const { q, rem } = penaltySplit(g.config.tier, 0);
+    await g.sim.eliminate(0, q, rem, Number(later));
+    assert.equal(g.ledger().seatProgress.lookup(0n).eliminated, true);
+  });
+
   it('walks a two-seat table all the way to redeemable, one accepted call at a time', async () => {
     const g = await seated(2);
     const tier = g.config.tier;

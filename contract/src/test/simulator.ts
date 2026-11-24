@@ -90,6 +90,17 @@ import * as vrf from '../vrf.ts';
 
 export type { Scorecard, ScoreOutcome, TurnOutcome, TableLedgerType, UserAddress };
 
+/**
+ * A compiled table: the generated `Contract` class and its `ledger` decoder. The default is the
+ * one under `src/managed/table`; a test may hand in another build of the same source -- a mutant
+ * compiled to a temporary directory (custody-mutants.test.ts) -- and drive it identically.
+ */
+export type TableModule = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  Contract: new (witnesses: any) => TableContract<TablePrivateState>;
+  ledger: typeof tableLedger;
+};
+
 const COIN_PUBLIC_KEY = '0'.repeat(64);
 
 /**
@@ -186,6 +197,13 @@ export class BaseSimulator<PS> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   lastEffects: any;
 
+  /**
+   * Called after every circuit this simulator runs, with the circuit's id, once its state and
+   * effects are committed. A test records a game's public history through it -- what the
+   * verifier would read off the indexer (verifier.test.ts).
+   */
+  onRun?: (circuitId: string) => void;
+
   /** Run a generated circuit and commit its resulting ledger and private state. */
   async run<R>(
     circuitId: string,
@@ -201,6 +219,7 @@ export class BaseSimulator<PS> {
     if (res.context.callContext.currentPrivateState !== undefined) {
       this.privateState = res.context.callContext.currentPrivateState;
     }
+    this.onRun?.(circuitId);
     return res.result;
   }
 }
@@ -496,19 +515,25 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   table: TableContract<TablePrivateState>;
   config: TableConfig;
 
-  constructor(config: TableConfig) {
+  readonly #ledgerOf: TableModule['ledger'];
+
+  constructor(config: TableConfig, mod?: TableModule) {
     // The constructor is the operator's transaction, and it now needs NO secret at all: the
     // VRF public key is a public argument and the operator holds `x` outside the contract.
     super(createTablePrivateState({}));
-    this.table = new TableContract<TablePrivateState>(tableWitnesses);
+    this.table = mod
+      ? new mod.Contract(tableWitnesses)
+      : new TableContract<TablePrivateState>(tableWitnesses);
+    this.#ledgerOf = mod?.ledger ?? tableLedger;
     this.config = config;
   }
 
   static async create(
     config: TableConfig,
     blockTime = DEFAULT_BLOCK_TIME,
+    mod?: TableModule,
   ): Promise<TableSimulator> {
-    const sim = new TableSimulator(config);
+    const sim = new TableSimulator(config, mod);
     sim.blockTime = blockTime;
     await sim.adopt(
       sim.table.initialState(
@@ -530,7 +555,7 @@ export class TableSimulator extends BaseSimulator<TablePrivateState> {
   }
 
   getLedger(): TableLedgerType {
-    return tableLedger(this.state);
+    return this.#ledgerOf(this.state);
   }
 
   /** Act as the operator: the seed is available, no player secret is. */

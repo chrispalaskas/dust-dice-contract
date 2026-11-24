@@ -72,6 +72,13 @@ export type RescueStep =
   | { readonly kind: 'none'; readonly why: string }
   /** `eliminate(seat, q, rem, voluntary=false)` — enforce a missed deadline. */
   | { readonly kind: 'eliminate'; readonly seat: number; readonly why: string }
+  /**
+   * `seatClock(seat, now, mark=false)` — credit an answered ask's wait to the seat's deadline.
+   * `eliminate` refuses a seat until its wait is credited; the operator normally credits right
+   * after answering, so this is the step for an operator that answered and then went quiet.
+   * Permissionless, and it only ever gives the seat time.
+   */
+  | { readonly kind: 'credit'; readonly seat: number; readonly why: string }
   /** `abortTable(q, rem, now)` — finish a table that cannot finish itself. */
   | { readonly kind: 'abort'; readonly why: string }
   /** `abortTable` again, but on a filling table this STARTS the game rather than ending it. */
@@ -171,7 +178,22 @@ export function nextRescueStep(led: TableLedger, nowSecs: bigint): RescueStep {
     if (progress.eliminated || progress.round !== led.openRound) continue;
     if (!playerOwes(led, seat)) continue; // the operator owes this one, not the player
     const clock = seatClockOf(led, seat);
-    if (clock.creditDue || !past(clock.deadline)) continue;
+    // ANSWERED BUT NOT CREDITED: the operator answered this seat's marked ask and has not added
+    // the wait to its deadline. Nobody can eliminate the seat until someone does, so a table
+    // whose operator stopped between its answer and its credit would otherwise sit here, with
+    // nothing on offer (popper re-review C047). Crediting first is safe: it only gives the seat
+    // the time it waited, and the next pass judges it against that.
+    if (clock.creditDue) {
+      return {
+        kind: 'credit',
+        seat,
+        why:
+          `Seat ${seat + 1} waited on the operator for a roll, which has been answered, but the ` +
+          'wait has not been added to its clock yet, and until it is the seat cannot be timed ' +
+          'out. Crediting it is safe for everyone: it only gives that seat back the time it waited.',
+      };
+    }
+    if (!past(clock.deadline)) continue;
     return {
       kind: 'eliminate',
       seat,
